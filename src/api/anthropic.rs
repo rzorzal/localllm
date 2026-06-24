@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::common::{
-    ChatMessage, ChatRequest, ChatResult, ContentPart, FinishReason, Role, ToolCall, ToolResult,
-    ToolSpec,
+    ChatMessage, ChatRequest, ChatResult, ContentPart, FinishReason, Role, StreamDelta, ToolCall,
+    ToolResult, ToolSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -215,6 +215,106 @@ pub fn to_internal(req: AnthRequest) -> Result<ChatRequest, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Streaming: SSE event renderer (Anthropic protocol)
+// ---------------------------------------------------------------------------
+
+/// Render a `StreamDelta` as one or more Anthropic SSE event strings.
+///
+/// Each returned string is one complete SSE event: `event: <type>\ndata: {json}\n`
+/// (without the trailing blank line; the caller adds `\n` to delimit frames).
+///
+/// Protocol summary:
+/// - First chunk (`!started`): prepend `message_start` + `content_block_start`
+///   events so the client can initialize its state machine.
+/// - Text chunks: emit a `content_block_delta` with `type:"text_delta"`.
+/// - Terminal chunk (`done=true`): emit `content_block_stop` + `message_delta`
+///   + `message_stop`.
+///
+/// Tool-call streaming is MVP: tool calls are not incrementally streamed; they
+/// are expected to be emitted in the final delta chunk's text field (buffered
+/// in the engine). Clients that need incremental tool-call deltas should use
+/// the non-streaming path.
+pub fn stream_events(delta: &StreamDelta, started: bool) -> Vec<String> {
+    let mut events: Vec<String> = Vec::new();
+
+    // On the very first chunk, send the session-opener events.
+    if !started {
+        let msg_start = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": format!("msg_{}", uuid::Uuid::new_v4()),
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "",
+                "stop_reason": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        });
+        events.push(format!(
+            "event: message_start\ndata: {}",
+            serde_json::to_string(&msg_start).unwrap()
+        ));
+
+        let block_start = serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        });
+        events.push(format!(
+            "event: content_block_start\ndata: {}",
+            serde_json::to_string(&block_start).unwrap()
+        ));
+    }
+
+    // Emit text delta if present.
+    if let Some(ref text) = delta.text {
+        let block_delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        });
+        events.push(format!(
+            "event: content_block_delta\ndata: {}",
+            serde_json::to_string(&block_delta).unwrap()
+        ));
+    }
+
+    // On the terminal chunk, close out the stream.
+    if delta.done {
+        let block_stop = serde_json::json!({"type": "content_block_stop", "index": 0});
+        events.push(format!(
+            "event: content_block_stop\ndata: {}",
+            serde_json::to_string(&block_stop).unwrap()
+        ));
+
+        let stop_reason = delta.finish_reason.as_ref().map(|r| match r {
+            FinishReason::Stop => "end_turn",
+            FinishReason::Length => "max_tokens",
+            FinishReason::ToolCalls => "tool_use",
+        }).unwrap_or("end_turn");
+
+        let msg_delta = serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+            "usage": {"output_tokens": 0}
+        });
+        events.push(format!(
+            "event: message_delta\ndata: {}",
+            serde_json::to_string(&msg_delta).unwrap()
+        ));
+
+        let msg_stop = serde_json::json!({"type": "message_stop"});
+        events.push(format!(
+            "event: message_stop\ndata: {}",
+            serde_json::to_string(&msg_stop).unwrap()
+        ));
+    }
+
+    events
+}
+
 fn parse_role(s: &str) -> Result<Role, String> {
     match s {
         "system" => Ok(Role::System),
@@ -320,5 +420,35 @@ mod tests {
         let internal = to_internal(req).unwrap();
         assert_eq!(internal.messages[0].role, Role::Tool);
         assert_eq!(internal.messages[0].tool_result.as_ref().unwrap().content, "sunny");
+    }
+
+    // --- Streaming renderer tests ---
+
+    #[test]
+    fn anthropic_emits_content_block_delta() {
+        let d = StreamDelta { text: Some("hi".into()), done: false, finish_reason: None };
+        let evs = stream_events(&d, /*started=*/true);
+        assert!(evs.iter().any(|e| e.contains("content_block_delta")));
+    }
+
+    #[test]
+    fn anthropic_done_produces_message_stop() {
+        let d = StreamDelta {
+            text: None,
+            done: true,
+            finish_reason: Some(FinishReason::Stop),
+        };
+        let evs = stream_events(&d, /*started=*/true);
+        assert!(evs.iter().any(|e| e.contains("message_stop")));
+        assert!(evs.iter().any(|e| e.contains("content_block_stop")));
+    }
+
+    #[test]
+    fn anthropic_first_chunk_includes_message_start() {
+        let d = StreamDelta { text: Some("hello".into()), done: false, finish_reason: None };
+        let evs = stream_events(&d, /*started=*/false);
+        assert!(evs.iter().any(|e| e.contains("message_start")));
+        assert!(evs.iter().any(|e| e.contains("content_block_start")));
+        assert!(evs.iter().any(|e| e.contains("content_block_delta")));
     }
 }

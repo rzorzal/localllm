@@ -24,12 +24,12 @@
 
 use anyhow::{Context, Result};
 use mistralrs::{
-    Function, GgufModelBuilder, PagedAttentionMetaBuilder, RequestBuilder, TextMessageRole, Tool,
-    ToolCallResponse, ToolChoice, ToolType, paged_attn_supported,
+    Function, GgufModelBuilder, PagedAttentionMetaBuilder, RequestBuilder, Response,
+    TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType, paged_attn_supported,
 };
 
 use crate::api::common::{
-    ChatRequest, ChatResult, ContentPart, FinishReason, Role, ToolCall, ToolSpec,
+    ChatRequest, ChatResult, ContentPart, FinishReason, Role, StreamDelta, ToolCall, ToolSpec,
 };
 
 /// Configuration for loading the GGUF model.
@@ -54,9 +54,11 @@ pub struct EngineConfig {
     pub force_cpu: bool,
 }
 
-/// The inference engine. Holds a loaded mistralrs `Model`.
+/// The inference engine. Holds a loaded mistralrs `Model` behind an Arc so it
+/// can be shared into 'static streaming closures without tying the stream to
+/// the Engine's lifetime.
 pub struct Engine {
-    model: mistralrs::Model,
+    model: std::sync::Arc<mistralrs::Model>,
 }
 
 impl Engine {
@@ -93,15 +95,14 @@ impl Engine {
         // context from GGUF metadata.
 
         let model = builder.build().await.context("Failed to load GGUF model")?;
-        Ok(Engine { model })
+        Ok(Engine { model: std::sync::Arc::new(model) })
     }
 
-    /// Run inference for a single chat turn.
+    /// Build a `RequestBuilder` from a `ChatRequest`.
     ///
-    /// Translates `ChatRequest` → mistralrs `RequestBuilder`, calls
-    /// `send_chat_request`, and converts the response back to `ChatResult`.
-    pub async fn generate(&self, req: ChatRequest) -> Result<ChatResult> {
-        // Build the mistralrs RequestBuilder from the ChatRequest messages.
+    /// Shared by `generate` (non-streaming) and `generate_stream` (streaming)
+    /// so request construction is not duplicated.
+    fn build_request(req: &ChatRequest) -> Result<RequestBuilder> {
         let mut builder = RequestBuilder::new();
 
         for msg in &req.messages {
@@ -194,6 +195,16 @@ impl Engine {
             builder = builder.set_sampler_max_len(max_tok);
         }
 
+        Ok(builder)
+    }
+
+    /// Run inference for a single chat turn (non-streaming).
+    ///
+    /// Translates `ChatRequest` → mistralrs `RequestBuilder`, calls
+    /// `send_chat_request`, and converts the response back to `ChatResult`.
+    pub async fn generate(&self, req: ChatRequest) -> Result<ChatResult> {
+        let builder = Self::build_request(&req)?;
+
         // Send the request and await the (non-streaming) response.
         let resp = self
             .model
@@ -254,4 +265,103 @@ impl Engine {
             completion_tokens: resp.usage.completion_tokens as usize,
         })
     }
+
+    /// Stream inference for a single chat turn.
+    ///
+    /// Returns a `BoxStream` of `StreamDelta` items. Each non-terminal item
+    /// carries incremental text. The terminal item has `done=true` and
+    /// `finish_reason` set.
+    ///
+    /// ## Tool-call streaming (MVP)
+    /// Tool-call deltas are not incrementally emitted. mistralrs delivers them
+    /// in a final Response::Done chunk; if present, we emit a single done
+    /// StreamDelta with `text=None` and `finish_reason=ToolCalls`. Clients that
+    /// need incremental tool-call streaming should use the non-streaming path.
+    ///
+    /// ## Implementation note
+    /// The mistralrs `Stream<'_>` type borrows from the `Model`. To produce a
+    /// `'static` BoxStream, we spawn a Tokio task that owns an `Arc<Model>`
+    /// clone, drives the mistralrs stream, and forwards `StreamDelta`s through a
+    /// channel. The caller receives a stream backed by that channel.
+    pub async fn generate_stream(
+        &self,
+        req: ChatRequest,
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamDelta>>> {
+        let builder = Self::build_request(&req)?;
+        let model = std::sync::Arc::clone(&self.model);
+
+        // Spawn a task that owns the Arc<Model> and drives the mistralrs stream.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamDelta>>(32);
+
+        tokio::spawn(async move {
+            let raw_stream_result = model
+                .stream_chat_request(builder)
+                .await;
+
+            let mut raw_stream = match raw_stream_result {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!("Failed to start streaming: {e}"))).await;
+                    return;
+                }
+            };
+
+            while let Some(resp) = raw_stream.next().await {
+                let delta = match resp {
+                    Response::Chunk(chunk) => {
+                        let choice = chunk.choices.into_iter().next();
+                        let delta_text = choice
+                            .as_ref()
+                            .and_then(|ch| ch.delta.content.clone());
+                        let finish_str = choice
+                            .as_ref()
+                            .and_then(|ch| ch.finish_reason.clone());
+
+                        let (done, finish_reason) = if let Some(ref reason) = finish_str {
+                            let fr = match reason.as_str() {
+                                "tool_calls" => FinishReason::ToolCalls,
+                                "length" => FinishReason::Length,
+                                _ => FinishReason::Stop,
+                            };
+                            (true, Some(fr))
+                        } else {
+                            (false, None)
+                        };
+
+                        Ok(StreamDelta { text: delta_text, done, finish_reason })
+                    }
+                    Response::Done(_) => {
+                        // Non-chunk terminal: emit a done sentinel then stop.
+                        let _ = tx.send(Ok(StreamDelta {
+                            text: None,
+                            done: true,
+                            finish_reason: Some(FinishReason::Stop),
+                        })).await;
+                        break;
+                    }
+                    Response::ModelError(msg, _) => {
+                        Err(anyhow::anyhow!("Model error during streaming: {msg}"))
+                    }
+                    _ => {
+                        // Ignore other Response variants.
+                        continue;
+                    }
+                };
+
+                let is_err = delta.is_err();
+                let _ = tx.send(delta).await;
+                if is_err {
+                    break;
+                }
+            }
+        });
+
+        // Wrap the channel receiver in a futures::Stream using unfold.
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Ok(Box::pin(stream))
+    }
 }
+
+

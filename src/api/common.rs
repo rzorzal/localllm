@@ -67,6 +67,17 @@ pub struct ChatResult {
     pub completion_tokens: usize,
 }
 
+/// A single incremental chunk emitted by the streaming engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamDelta {
+    /// Incremental text content for this chunk (None if empty/tool-call chunk).
+    pub text: Option<String>,
+    /// True when this is the final chunk (finish_reason is set).
+    pub done: bool,
+    /// Finish reason carried on the terminal chunk.
+    pub finish_reason: Option<FinishReason>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

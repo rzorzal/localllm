@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::api::common::{
-    ChatMessage, ChatRequest, ChatResult, ContentPart, FinishReason, Role, ToolCall, ToolResult,
-    ToolSpec,
+    ChatMessage, ChatRequest, ChatResult, ContentPart, FinishReason, Role, StreamDelta, ToolCall,
+    ToolResult, ToolSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -297,6 +297,45 @@ pub fn from_internal(res: ChatResult, model: &str) -> OaiChatResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming: SSE chunk renderer
+// ---------------------------------------------------------------------------
+
+/// Render one `StreamDelta` as a single `data: {json}` SSE line (no trailing newline).
+/// The caller is responsible for appending `\n\n` to form a valid SSE frame,
+/// and for emitting `data: [DONE]\n\n` when the stream ends.
+pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str) -> String {
+    use crate::api::common::FinishReason;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let finish_reason_str: Option<&str> = delta.finish_reason.as_ref().map(|r| match r {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
+    });
+
+    let chunk = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": delta.text
+            },
+            "finish_reason": finish_reason_str
+        }]
+    });
+
+    format!("data: {}", serde_json::to_string(&chunk).unwrap())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -338,5 +377,29 @@ mod tests {
         let internal = to_internal(req).unwrap();
         assert_eq!(internal.messages[0].role, Role::Tool);
         assert_eq!(internal.messages[0].tool_result.as_ref().unwrap().content, "sunny");
+    }
+
+    // --- Streaming renderer tests ---
+
+    #[test]
+    fn openai_chunk_has_delta_content() {
+        let d = StreamDelta { text: Some("hi".into()), done: false, finish_reason: None };
+        let line = stream_chunk(&d, "chatcmpl-1", "m");
+        assert!(line.starts_with("data: "));
+        assert!(line.contains("\"content\":\"hi\""));
+    }
+
+    #[test]
+    fn openai_chunk_with_finish_reason_sets_finish_reason() {
+        let d = StreamDelta {
+            text: None,
+            done: true,
+            finish_reason: Some(FinishReason::Stop),
+        };
+        let line = stream_chunk(&d, "chatcmpl-2", "m");
+        assert!(line.starts_with("data: "));
+        let json_str = line.strip_prefix("data: ").unwrap();
+        let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
     }
 }
