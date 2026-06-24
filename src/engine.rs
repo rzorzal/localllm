@@ -24,7 +24,8 @@
 
 use anyhow::{Context, Result};
 use mistralrs::{
-    Function, GgufModelBuilder, PagedAttentionMetaBuilder, RequestBuilder, Response,
+    AutoDeviceMapParams, DeviceMapSetting, Function, GgufModelBuilder,
+    PagedAttentionMetaBuilder, RequestBuilder, Response,
     TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType, paged_attn_supported,
 };
 
@@ -90,9 +91,18 @@ impl Engine {
                 .with_paged_attn(PagedAttentionMetaBuilder::default().build()?);
         }
 
-        // NOTE: ctx_len from cfg is NOT applied. GgufModelBuilder has no
-        // context-length setter (NOTES §10). The model uses its built-in 32k
-        // context from GGUF metadata.
+        // Use a compact max_seq_len for the auto device-map memory estimator.
+        // The default is 4096, which causes the KV-cache estimate to push the
+        // model over the available RAM budget on this machine.  512 is enough
+        // for the estimator; the model still generates at its full runtime
+        // context length — this setting only governs how much KV-cache headroom
+        // the estimator reserves when deciding which layers fit on which device.
+        builder = builder.with_device_mapping(DeviceMapSetting::Auto(
+            AutoDeviceMapParams::Text {
+                max_seq_len: 512,
+                max_batch_size: 1,
+            },
+        ));
 
         let model = builder.build().await.context("Failed to load GGUF model")?;
         Ok(Engine { model: std::sync::Arc::new(model) })
