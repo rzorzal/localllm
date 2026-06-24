@@ -97,6 +97,11 @@ impl Engine {
         // for the estimator; the model still generates at its full runtime
         // context length — this setting only governs how much KV-cache headroom
         // the estimator reserves when deciding which layers fit on which device.
+        // Verified against mistralrs-core 0.8.1
+        // src/pipeline/loaders/auto_device_map.rs: max_seq_len feeds the
+        // placement memory estimate (~max_seq_len * max_batch_size cache budget),
+        // it is NOT a runtime context cap. On force_cpu all layers are on CPU
+        // anyway, so the estimate is inert and the KV-cache grows as needed.
         builder = builder.with_device_mapping(DeviceMapSetting::Auto(
             AutoDeviceMapParams::Text {
                 max_seq_len: 512,
