@@ -1,9 +1,9 @@
 //! CLI configuration parsed with clap.
 //!
 //! `Config` is the single source of truth for all runtime parameters.
-//! `force_cpu` defaults to `true` because the Metal shader toolchain is
-//! broken on this machine and GPU load fails; CPU is the only working path.
-//! A user with a working Metal toolchain can pass `--force-cpu false`.
+//! `force_cpu` defaults to `false`: the Metal toolchain is installed and
+//! shaders compile, so the model runs on the Apple GPU. Pass
+//! `--force-cpu true` to force CPU (e.g. if the Metal toolchain breaks again).
 
 /// All runtime configuration, parsed from command-line arguments.
 #[derive(clap::Parser, Debug)]
@@ -34,9 +34,9 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub no_paged_attn: bool,
 
-    /// Force CPU execution (sidesteps broken Metal toolchain on this machine).
-    /// Defaults to true because GPU load fails on this hardware.
-    #[arg(long, default_value_t = true)]
+    /// Force CPU execution. Defaults to false (use the Apple GPU via Metal).
+    /// Set to true to fall back to CPU.
+    #[arg(long, default_value_t = false)]
     pub force_cpu: bool,
 }
 

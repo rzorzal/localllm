@@ -11,6 +11,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     Json, Router,
@@ -25,6 +26,18 @@ use serde_json::json;
 use crate::api::common::{ChatRequest, ChatResult, StreamDelta};
 use crate::api::openai::{OaiChatRequest, OaiModelInfo, OaiModelList};
 use crate::api::anthropic::AnthRequest;
+
+/// Generate a short per-request id (e.g. `req-1a2b3c4d`) used to correlate the
+/// start/finish log lines of a single prompt when several run concurrently.
+fn new_request_id() -> String {
+    let u = uuid::Uuid::new_v4();
+    format!("req-{}", &u.simple().to_string()[..8])
+}
+
+/// Summarize an internal request for the start log line.
+fn request_summary(req: &ChatRequest) -> (usize, usize) {
+    (req.messages.len(), req.tools.len())
+}
 
 // ---------------------------------------------------------------------------
 // Generator trait — decouples HTTP handlers from the real Engine
@@ -101,12 +114,14 @@ async fn handle_oai_chat(
     use futures::StreamExt;
     use uuid::Uuid;
 
+    let rid = new_request_id();
     let model = req.model.clone();
     let stream_flag = req.stream.unwrap_or(false);
 
     let internal = match crate::api::openai::to_internal(req) {
         Ok(r) => r,
         Err(e) => {
+            tracing::warn!(target: "localllm::req", "{rid} [openai] 400 bad request: {e}");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": e})),
@@ -114,15 +129,47 @@ async fn handle_oai_chat(
         }
     };
 
+    let (n_msgs, n_tools) = request_summary(&internal);
+    tracing::info!(target: "localllm::req", "{rid} [openai] start: model={model} msgs={n_msgs} tools={n_tools} stream={stream_flag}");
+    let started_at = Instant::now();
+
+    if stream_flag && n_tools > 0 {
+        // Buffered streaming: tool-bearing requests are generated fully (reusing
+        // the tested non-streaming tool-call path) then replayed as SSE chunks.
+        // Incremental streaming cannot frame tool_calls safely.
+        let id = format!("chatcmpl-{}", Uuid::new_v4());
+        let result = match state.gen.generate(internal).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "localllm::req", "{rid} [openai] 500 generate (buffered stream): {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            }
+        };
+        let secs = started_at.elapsed().as_secs_f64();
+        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        tracing::info!(target: "localllm::req", "{rid} [openai] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
+        let mut lines = crate::api::openai::stream_chunks_from_result(&result, &id, &model);
+        lines.push("[DONE]".to_string());
+        let sse_stream = futures::stream::iter(
+            lines.into_iter().map(|l| {
+                let data = l.strip_prefix("data: ").unwrap_or(&l).to_string();
+                Ok::<Event, Infallible>(Event::default().data(data))
+            }),
+        );
+        return Sse::new(sse_stream).into_response();
+    }
+
     if stream_flag {
         // Streaming path: return SSE
         let id = format!("chatcmpl-{}", Uuid::new_v4());
         let id_clone = id.clone();
         let model_clone = model.clone();
+        let rid_stream = rid.clone();
 
         let delta_stream = match state.gen.generate_stream(internal).await {
             Ok(s) => s,
             Err(e) => {
+                tracing::error!(target: "localllm::req", "{rid} [openai] 500 stream init: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
@@ -137,6 +184,10 @@ async fn handle_oai_chat(
                 let was_started = *started;
                 let event: Result<Event, Infallible> = match result {
                     Ok(delta) => {
+                        if delta.done {
+                            let secs = started_at.elapsed().as_secs_f64();
+                            tracing::info!(target: "localllm::req", "{rid_stream} [openai] done (stream): {secs:.1}s");
+                        }
                         let line = crate::api::openai::stream_chunk(&delta, &id_clone, &model_clone, was_started);
                         *started = true;
                         // line is "data: {json}", strip the "data: " prefix for Event::default().data()
@@ -144,6 +195,7 @@ async fn handle_oai_chat(
                         Ok(Event::default().data(data.to_string()))
                     }
                     Err(e) => {
+                        tracing::error!(target: "localllm::req", "{rid_stream} [openai] stream error: {e}");
                         // Emit an error event; client will see it.
                         Ok(Event::default().data(format!("[ERROR] {e}")))
                     }
@@ -161,12 +213,16 @@ async fn handle_oai_chat(
         let result = match state.gen.generate(internal).await {
             Ok(r) => r,
             Err(e) => {
+                tracing::error!(target: "localllm::req", "{rid} [openai] 500 generate: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
                 ).into_response();
             }
         };
+        let secs = started_at.elapsed().as_secs_f64();
+        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        tracing::info!(target: "localllm::req", "{rid} [openai] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
         let resp = crate::api::openai::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }
@@ -180,12 +236,14 @@ async fn handle_anth_messages(
     use axum::response::IntoResponse;
     use futures::StreamExt;
 
+    let rid = new_request_id();
     let model = req.model.clone();
     let stream_flag = req.stream.unwrap_or(false);
 
     let internal = match crate::api::anthropic::to_internal(req) {
         Ok(r) => r,
         Err(e) => {
+            tracing::warn!(target: "localllm::req", "{rid} [anthropic] 400 bad request: {e}");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": e})),
@@ -193,11 +251,41 @@ async fn handle_anth_messages(
         }
     };
 
+    let (n_msgs, n_tools) = request_summary(&internal);
+    tracing::info!(target: "localllm::req", "{rid} [anthropic] start: model={model} msgs={n_msgs} tools={n_tools} stream={stream_flag}");
+    let started_at = Instant::now();
+
+    if stream_flag && n_tools > 0 {
+        // Buffered streaming: tool-bearing requests (e.g. every Claude Code turn)
+        // are generated fully then replayed as a correct tool_use/text SSE
+        // sequence. Incremental streaming cannot frame tool_use blocks safely.
+        let result = match state.gen.generate(internal).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "localllm::req", "{rid} [anthropic] 500 generate (buffered stream): {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            }
+        };
+        let secs = started_at.elapsed().as_secs_f64();
+        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        tracing::info!(target: "localllm::req", "{rid} [anthropic] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
+        let events = crate::api::anthropic::stream_events_from_result(&result, &model);
+        let sse_stream = futures::stream::iter(events.into_iter().map(|e_str| {
+            let mut lines = e_str.splitn(2, '\n');
+            let event_type = lines.next().unwrap_or("").strip_prefix("event: ").unwrap_or("").to_string();
+            let data = lines.next().unwrap_or("").strip_prefix("data: ").unwrap_or("").to_string();
+            Ok::<Event, Infallible>(Event::default().event(event_type).data(data))
+        }));
+        return Sse::new(sse_stream).into_response();
+    }
+
     if stream_flag {
         // Streaming path: return Anthropic SSE protocol
+        let rid_stream = rid.clone();
         let delta_stream = match state.gen.generate_stream(internal).await {
             Ok(s) => s,
             Err(e) => {
+                tracing::error!(target: "localllm::req", "{rid} [anthropic] 500 stream init: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
@@ -208,10 +296,14 @@ async fn handle_anth_messages(
         // Collect all events, tracking whether the first chunk was sent.
         // We use scan to thread `started` state through the stream.
         let sse_stream = delta_stream
-            .scan(false, |started, result| {
+            .scan(false, move |started, result| {
                 let was_started = *started;
                 let events: Vec<Result<Event, Infallible>> = match result {
                     Ok(delta) => {
+                        if delta.done {
+                            let secs = started_at.elapsed().as_secs_f64();
+                            tracing::info!(target: "localllm::req", "{rid_stream} [anthropic] done (stream): {secs:.1}s");
+                        }
                         let event_strs = crate::api::anthropic::stream_events(&delta, was_started);
                         *started = true;
                         event_strs
@@ -229,6 +321,7 @@ async fn handle_anth_messages(
                             .collect()
                     }
                     Err(e) => {
+                        tracing::error!(target: "localllm::req", "{rid_stream} [anthropic] stream error: {e}");
                         vec![Ok(Event::default().data(format!("[ERROR] {e}")))]
                     }
                 };
@@ -242,12 +335,16 @@ async fn handle_anth_messages(
         let result = match state.gen.generate(internal).await {
             Ok(r) => r,
             Err(e) => {
+                tracing::error!(target: "localllm::req", "{rid} [anthropic] 500 generate: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
                 ).into_response();
             }
         };
+        let secs = started_at.elapsed().as_secs_f64();
+        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        tracing::info!(target: "localllm::req", "{rid} [anthropic] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
         let resp = crate::api::anthropic::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }

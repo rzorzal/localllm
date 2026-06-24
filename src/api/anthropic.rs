@@ -332,6 +332,76 @@ pub fn stream_events(delta: &StreamDelta, started: bool) -> Vec<String> {
     events
 }
 
+/// Render a COMPLETE `ChatResult` as the full Anthropic SSE event sequence
+/// (message_start → content blocks → message_delta → message_stop).
+///
+/// Used for "buffered streaming": when a streaming request carries tools, the
+/// engine generates the full result non-streaming (reusing the tested tool-call
+/// path) and we replay it here as correctly-framed `tool_use` / `text` content
+/// blocks. Claude Code requires streaming + tool calls together; incremental
+/// streaming cannot frame `tool_use` blocks safely, so this path handles it.
+pub fn stream_events_from_result(result: &ChatResult, model: &str) -> Vec<String> {
+    let mut events: Vec<String> = Vec::new();
+
+    let msg_start = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": format!("msg_{}", uuid::Uuid::new_v4()),
+            "type": "message", "role": "assistant", "content": [], "model": model,
+            "stop_reason": null,
+            "usage": {"input_tokens": result.prompt_tokens, "output_tokens": 0}
+        }
+    });
+    events.push(format!("event: message_start\ndata: {}", serde_json::to_string(&msg_start).unwrap()));
+
+    for (index, part) in result.content.iter().enumerate() {
+        match part {
+            ContentPart::Text(text) => {
+                let start = serde_json::json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                });
+                events.push(format!("event: content_block_start\ndata: {}", serde_json::to_string(&start).unwrap()));
+                let d = serde_json::json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "text_delta", "text": text}
+                });
+                events.push(format!("event: content_block_delta\ndata: {}", serde_json::to_string(&d).unwrap()));
+            }
+            ContentPart::Call(tc) => {
+                let start = serde_json::json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "tool_use", "id": tc.id, "name": tc.name, "input": {}}
+                });
+                events.push(format!("event: content_block_start\ndata: {}", serde_json::to_string(&start).unwrap()));
+                // Stream the arguments JSON string as one input_json_delta.
+                let d = serde_json::json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": tc.arguments}
+                });
+                events.push(format!("event: content_block_delta\ndata: {}", serde_json::to_string(&d).unwrap()));
+            }
+        }
+        let stop = serde_json::json!({"type": "content_block_stop", "index": index});
+        events.push(format!("event: content_block_stop\ndata: {}", serde_json::to_string(&stop).unwrap()));
+    }
+
+    let stop_reason = match result.finish_reason {
+        FinishReason::Stop => "end_turn",
+        FinishReason::Length => "max_tokens",
+        FinishReason::ToolCalls => "tool_use",
+    };
+    let msg_delta = serde_json::json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+        "usage": {"output_tokens": result.completion_tokens}
+    });
+    events.push(format!("event: message_delta\ndata: {}", serde_json::to_string(&msg_delta).unwrap()));
+    events.push(format!("event: message_stop\ndata: {}", serde_json::to_string(&serde_json::json!({"type": "message_stop"})).unwrap()));
+
+    events
+}
+
 fn parse_role(s: &str) -> Result<Role, String> {
     match s {
         "system" => Ok(Role::System),
@@ -408,6 +478,27 @@ mod tests {
         assert_eq!(internal.messages[0].role, Role::System);
         assert_eq!(internal.messages[0].text.as_deref(), Some("be terse"));
         assert_eq!(internal.tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn buffered_stream_emits_tool_use_sequence() {
+        let result = ChatResult {
+            content: vec![ContentPart::Call(ToolCall {
+                id: "toolu_1".into(), name: "get_weather".into(),
+                arguments: r#"{"location":"Recife"}"#.into(),
+            })],
+            finish_reason: FinishReason::ToolCalls,
+            prompt_tokens: 5, completion_tokens: 3,
+        };
+        let evs = stream_events_from_result(&result, "m");
+        let joined = evs.join("\n");
+        assert!(joined.contains("message_start"));
+        assert!(joined.contains("\"type\":\"tool_use\""));
+        assert!(joined.contains("get_weather"));
+        assert!(joined.contains("input_json_delta"));
+        assert!(joined.contains("Recife"));
+        assert!(joined.contains("\"stop_reason\":\"tool_use\""));
+        assert!(joined.contains("message_stop"));
     }
 
     #[test]

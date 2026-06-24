@@ -287,12 +287,14 @@ impl Engine {
     /// carries incremental text. The terminal item has `done=true` and
     /// `finish_reason` set.
     ///
-    /// ## Tool-call streaming (MVP — NOT supported)
-    /// Streaming does NOT support tool calls. If the model emits a tool call
-    /// while streaming (i.e. the chunk's `finish_reason` is `"tool_calls"`),
-    /// `delta.tool_calls` is not forwarded; instead an explicit error is sent
-    /// through the stream channel and streaming stops. Clients needing tool
-    /// calls MUST use non-streaming requests (`stream: false`).
+    /// ## Tool-call streaming
+    /// This incremental path streams TEXT only. Tool-bearing streaming requests
+    /// are routed by the HTTP layer (`server.rs`) to a "buffered streaming" path
+    /// that calls `generate` (non-streaming) and replays the complete result as
+    /// SSE — so this function is normally only reached for tool-less requests.
+    /// As a defensive guard, if a `"tool_calls"` finish_reason still appears
+    /// here, an explicit error is sent through the channel rather than silently
+    /// dropping the tool call.
     ///
     /// ## Implementation note
     /// The mistralrs `Stream<'_>` type borrows from the `Model`. To produce a

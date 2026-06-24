@@ -350,6 +350,65 @@ pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str, started: bool) -
     format!("data: {}", serde_json::to_string(&chunk).unwrap())
 }
 
+/// Render a COMPLETE `ChatResult` as a sequence of OpenAI streaming `data:`
+/// lines (the caller appends the terminating `data: [DONE]`).
+///
+/// Used for "buffered streaming": when a streaming request carries tools, the
+/// engine generates the full result non-streaming (reusing the tested tool-call
+/// path) and we replay it here as SSE chunks. This guarantees correct
+/// `tool_calls` framing that incremental streaming does not support.
+pub fn stream_chunks_from_result(result: &ChatResult, id: &str, model: &str) -> Vec<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // First chunk: role + content + any tool_calls.
+    let mut delta_obj = serde_json::Map::new();
+    delta_obj.insert("role".into(), "assistant".into());
+
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for (i, part) in result.content.iter().enumerate() {
+        match part {
+            ContentPart::Text(t) => text.push_str(t),
+            ContentPart::Call(tc) => tool_calls.push(serde_json::json!({
+                "index": i,
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": tc.arguments}
+            })),
+        }
+    }
+    if !text.is_empty() {
+        delta_obj.insert("content".into(), serde_json::Value::String(text));
+    }
+    if !tool_calls.is_empty() {
+        delta_obj.insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
+    }
+
+    let finish = match result.finish_reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
+    };
+
+    let content_chunk = serde_json::json!({
+        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"index": 0, "delta": delta_obj, "finish_reason": null}]
+    });
+    let final_chunk = serde_json::json!({
+        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
+    });
+
+    vec![
+        format!("data: {}", serde_json::to_string(&content_chunk).unwrap()),
+        format!("data: {}", serde_json::to_string(&final_chunk).unwrap()),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -358,6 +417,26 @@ pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str, started: bool) -
 mod tests {
     use super::*;
     use crate::api::common::*;
+
+    #[test]
+    fn buffered_stream_emits_tool_calls_then_finish() {
+        let result = ChatResult {
+            content: vec![ContentPart::Call(ToolCall {
+                id: "call_1".into(), name: "get_weather".into(),
+                arguments: r#"{"location":"Recife"}"#.into(),
+            })],
+            finish_reason: FinishReason::ToolCalls,
+            prompt_tokens: 5, completion_tokens: 3,
+        };
+        let lines = stream_chunks_from_result(&result, "chatcmpl-x", "m");
+        assert_eq!(lines.len(), 2);
+        // First chunk carries the tool call.
+        assert!(lines[0].contains("\"tool_calls\""));
+        assert!(lines[0].contains("get_weather"));
+        assert!(lines[0].contains("Recife"));
+        // Final chunk carries the finish reason.
+        assert!(lines[1].contains("\"finish_reason\":\"tool_calls\""));
+    }
 
     #[test]
     fn parses_user_message_and_tool() {
