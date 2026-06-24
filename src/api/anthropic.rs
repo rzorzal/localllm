@@ -81,8 +81,10 @@ pub struct AnthRequest {
     #[serde(default)]
     pub tools: Vec<AnthTool>,
     pub max_tokens: usize,
+    /// System prompt. Anthropic allows either a plain string or an array of
+    /// text content blocks; Claude Code sends the array form. Accept both.
     #[serde(default)]
-    pub system: Option<String>,
+    pub(crate) system: Option<StringOrBlocks>,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -111,14 +113,29 @@ pub struct AnthResponse {
 pub fn to_internal(req: AnthRequest) -> Result<ChatRequest, String> {
     let mut messages: Vec<ChatMessage> = Vec::new();
 
-    // Hoist top-level `system` field as the first message
-    if let Some(system_text) = req.system {
-        messages.push(ChatMessage {
-            role: Role::System,
-            text: Some(system_text),
-            tool_calls: vec![],
-            tool_result: None,
-        });
+    // Hoist top-level `system` field as the first message. `system` may be a
+    // plain string or an array of text blocks (Claude Code sends the array
+    // form); flatten the array's text into a single system message.
+    if let Some(system) = req.system {
+        let system_text = match system {
+            StringOrBlocks::Str(s) => s,
+            StringOrBlocks::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    AnthContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        if !system_text.is_empty() {
+            messages.push(ChatMessage {
+                role: Role::System,
+                text: Some(system_text),
+                tool_calls: vec![],
+                tool_result: None,
+            });
+        }
     }
 
     for msg in req.messages {
@@ -391,6 +408,18 @@ mod tests {
         assert_eq!(internal.messages[0].role, Role::System);
         assert_eq!(internal.messages[0].text.as_deref(), Some("be terse"));
         assert_eq!(internal.tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn hoists_system_when_sent_as_block_array() {
+        // Claude Code sends `system` as an array of text blocks, not a string.
+        let json = r#"{"model":"m","max_tokens":256,
+            "system":[{"type":"text","text":"be terse"},{"type":"text","text":"and kind"}],
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let req: AnthRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages[0].role, Role::System);
+        assert_eq!(internal.messages[0].text.as_deref(), Some("be terse\nand kind"));
     }
 
     #[test]
