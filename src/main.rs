@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("loading model {} (force_cpu={})…", cfg.model_id, cfg.force_cpu);
 
     let engine: Arc<dyn Generator> = Arc::new(Engine::load(&cfg.engine_config()).await?);
-    let app = router(engine);
+    let app = router(engine, cfg.model_id.clone());
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");

@@ -35,17 +35,17 @@ use crate::api::common::{
 
 /// Configuration for loading the GGUF model.
 ///
-/// `ctx_len` is carried here for Task 7's CLI but is currently informational
-/// — GgufModelBuilder has no context-length setter. Context length is read from
-/// GGUF metadata (Qwen2.5-7B is 32k). See NOTES-mistralrs-api.md §10 for the
-/// complete method list.
+/// `ctx_len` is currently informational — GgufModelBuilder has no
+/// context-length setter. Context length is read from GGUF metadata
+/// (Qwen2.5-7B is 32k). See NOTES-mistralrs-api.md §10 for the complete
+/// method list.
 pub struct EngineConfig {
     /// HuggingFace repo ID, e.g. "Qwen/Qwen2.5-7B-Instruct-GGUF".
     pub model_id: String,
     /// One or more GGUF shard filenames within the repo.
     pub gguf_files: Vec<String>,
-    /// Informational: desired context length. Not applied — model uses built-in
-    /// context from GGUF metadata. Retained for Task 7's CLI config struct.
+    /// Informational: desired context length. Not applied — model uses its
+    /// native context from GGUF metadata. Retained for future use.
     pub ctx_len: usize,
     /// Whether to request paged attention. Guarded by `paged_attn_supported()`
     /// at runtime; inert on this machine and skipped when `force_cpu` is true.
@@ -287,11 +287,12 @@ impl Engine {
     /// carries incremental text. The terminal item has `done=true` and
     /// `finish_reason` set.
     ///
-    /// ## Tool-call streaming (MVP)
-    /// Tool-call deltas are not incrementally emitted. mistralrs delivers them
-    /// in a final Response::Done chunk; if present, we emit a single done
-    /// StreamDelta with `text=None` and `finish_reason=ToolCalls`. Clients that
-    /// need incremental tool-call streaming should use the non-streaming path.
+    /// ## Tool-call streaming (MVP — NOT supported)
+    /// Streaming does NOT support tool calls. If the model emits a tool call
+    /// while streaming (i.e. the chunk's `finish_reason` is `"tool_calls"`),
+    /// `delta.tool_calls` is not forwarded; instead an explicit error is sent
+    /// through the stream channel and streaming stops. Clients needing tool
+    /// calls MUST use non-streaming requests (`stream: false`).
     ///
     /// ## Implementation note
     /// The mistralrs `Stream<'_>` type borrows from the `Model`. To produce a
@@ -332,25 +333,33 @@ impl Engine {
                             .as_ref()
                             .and_then(|ch| ch.finish_reason.clone());
 
-                        let (done, finish_reason) = if let Some(ref reason) = finish_str {
-                            let fr = match reason.as_str() {
-                                "tool_calls" => FinishReason::ToolCalls,
-                                "length" => FinishReason::Length,
-                                _ => FinishReason::Stop,
-                            };
-                            (true, Some(fr))
+                        // Check finish_reason BEFORE constructing the delta.
+                        // "tool_calls" is not supported in the streaming path;
+                        // surface an explicit error instead of silently dropping
+                        // the tool-call data.
+                        if finish_str.as_deref() == Some("tool_calls") {
+                            Err(anyhow::anyhow!(
+                                "streaming tool calls are not supported; retry with stream:false"
+                            ))
                         } else {
-                            (false, None)
-                        };
-
-                        Ok(StreamDelta { text: delta_text, done, finish_reason })
+                            let (done, finish_reason) = if let Some(ref reason) = finish_str {
+                                let fr = match reason.as_str() {
+                                    "length" => FinishReason::Length,
+                                    _ => FinishReason::Stop,
+                                };
+                                (true, Some(fr))
+                            } else {
+                                (false, None)
+                            };
+                            Ok(StreamDelta { text: delta_text, done, finish_reason })
+                        }
                     }
                     Response::Done(_) => {
                         // Response::Done is the non-streaming terminal variant and is NOT
-                        // expected on the streaming path (see NOTES §8). This arm is a
-                        // defensive guard: if mistralrs ever emits Done instead of a final
-                        // Chunk on a streaming request, we still emit a clean done sentinel
-                        // rather than silently dropping the stream.
+                        // expected here (streaming requests terminate via a final Chunk).
+                        // This arm is a defensive guard: if mistralrs ever emits Done on
+                        // a streaming request, we emit a clean done sentinel rather than
+                        // silently dropping the stream.
                         let _ = tx.send(Ok(StreamDelta {
                             text: None,
                             done: true,

@@ -48,9 +48,9 @@ impl Generator for FakeGen {
     }
 }
 
-/// Build a test router wired to `FakeGen`.
+/// Build a test router wired to `FakeGen` and a fixed model id.
 pub fn router_for_test() -> Router {
-    crate::server::router(Arc::new(FakeGen))
+    crate::server::router(Arc::new(FakeGen), "test-model".to_string())
 }
 
 /// Send a POST with a JSON body to `path` on `app` and return the parsed
@@ -89,6 +89,23 @@ pub async fn axum_test_get(app: Router, path: &str) -> serde_json::Value {
     let response = app.oneshot(request).await.unwrap();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Send a POST with a JSON body to `path` on `app` and return the HTTP status
+/// code as a `u16`. Used to assert error-path responses without parsing the body.
+pub async fn axum_test_request_status(app: Router, path: &str, body: &str) -> u16 {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    response.status().as_u16()
 }
 
 /// Send a POST with a JSON body to `path` on `app` and return the raw

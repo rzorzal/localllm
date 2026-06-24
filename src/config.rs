@@ -23,7 +23,10 @@ pub struct Config {
     ])]
     pub gguf_files: Vec<String>,
 
-    /// KV-cache context length.
+    /// Desired context length (informational only).
+    /// GgufModelBuilder has no context-length setter; the model uses its
+    /// native context length from GGUF metadata. This field is retained for
+    /// future use when a setter becomes available.
     #[arg(long, default_value_t = 16384)]
     pub ctx_len: usize,
 

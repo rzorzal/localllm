@@ -1,4 +1,4 @@
-// tests/http.rs — integration tests for Task 6/8 HTTP handlers
+// tests/http.rs — integration tests for HTTP handlers
 
 #[tokio::test]
 async fn openai_endpoint_returns_tool_call() {
@@ -27,7 +27,17 @@ async fn anthropic_endpoint_returns_tool_use() {
     assert_eq!(resp["content"][0]["type"], "tool_use");
 }
 
-/// SSE streaming tests (Task 8) — use FakeGen which emits two text deltas + done.
+/// Error-path test: unknown role in messages must return HTTP 400.
+#[tokio::test]
+async fn openai_unknown_role_returns_400() {
+    let app = localllm::router_for_test();
+    // "invalid_role" is not handled by to_internal and must produce a 400 response.
+    let body = r#"{"model":"m","messages":[{"role":"invalid_role","content":"hi"}]}"#;
+    let status = localllm::axum_test_request_status(app, "/v1/chat/completions", body).await;
+    assert_eq!(status, 400, "expected HTTP 400 for unknown role, got {status}");
+}
+
+/// SSE streaming tests — use FakeGen which emits two text deltas + done.
 
 #[tokio::test]
 async fn openai_stream_returns_sse_chunks_and_done() {

@@ -1,4 +1,4 @@
-// OpenAI HTTP translation layer (Task 3)
+// OpenAI HTTP translation layer
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -303,7 +303,12 @@ pub fn from_internal(res: ChatResult, model: &str) -> OaiChatResponse {
 /// Render one `StreamDelta` as a single `data: {json}` SSE line (no trailing newline).
 /// The caller is responsible for appending `\n\n` to form a valid SSE frame,
 /// and for emitting `data: [DONE]\n\n` when the stream ends.
-pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str) -> String {
+///
+/// `started` indicates whether any chunk has been sent yet for this response.
+/// When `started` is `false` (first chunk), `{"role":"assistant"}` is included
+/// in the delta object per the OpenAI streaming spec. Set `started` to `true`
+/// for every subsequent chunk.
+pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str, started: bool) -> String {
     use crate::api::common::FinishReason;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -321,7 +326,11 @@ pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str) -> String {
     // Build the delta object: include "content" key ONLY when text is Some.
     // The OpenAI spec requires an empty object {} on the final (done) chunk
     // rather than {"content": null}.
+    // On the first chunk (!started), include "role":"assistant" per spec.
     let mut delta_obj = serde_json::Map::new();
+    if !started {
+        delta_obj.insert("role".to_string(), serde_json::Value::String("assistant".to_string()));
+    }
     if let Some(ref text) = delta.text {
         delta_obj.insert("content".to_string(), serde_json::Value::String(text.clone()));
     }
@@ -389,10 +398,30 @@ mod tests {
 
     #[test]
     fn openai_chunk_has_delta_content() {
+        // started=true: subsequent chunk — no role, has content
         let d = StreamDelta { text: Some("hi".into()), done: false, finish_reason: None };
-        let line = stream_chunk(&d, "chatcmpl-1", "m");
+        let line = stream_chunk(&d, "chatcmpl-1", "m", true);
         assert!(line.starts_with("data: "));
         assert!(line.contains("\"content\":\"hi\""));
+        // role should NOT appear on subsequent chunks
+        let json_str = line.strip_prefix("data: ").unwrap();
+        let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert!(
+            !v["choices"][0]["delta"].as_object().unwrap().contains_key("role"),
+            "subsequent chunk must not carry role"
+        );
+    }
+
+    #[test]
+    fn openai_first_chunk_includes_role_assistant() {
+        // started=false: first chunk — must include "role":"assistant" in delta
+        let d = StreamDelta { text: Some("Hi".into()), done: false, finish_reason: None };
+        let line = stream_chunk(&d, "chatcmpl-0", "m", false);
+        let json_str = line.strip_prefix("data: ").unwrap();
+        let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(v["choices"][0]["delta"]["role"], "assistant",
+            "first chunk delta must carry role:assistant");
+        assert_eq!(v["choices"][0]["delta"]["content"], "Hi");
     }
 
     #[test]
@@ -402,7 +431,7 @@ mod tests {
             done: true,
             finish_reason: Some(FinishReason::Stop),
         };
-        let line = stream_chunk(&d, "chatcmpl-2", "m");
+        let line = stream_chunk(&d, "chatcmpl-2", "m", true);
         assert!(line.starts_with("data: "));
         let json_str = line.strip_prefix("data: ").unwrap();
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
@@ -413,8 +442,9 @@ mod tests {
     fn openai_done_chunk_delta_omits_content_key() {
         // When text is None (terminal/done chunk), the OpenAI spec requires the
         // delta object to be {} — the "content" key must be ABSENT, not null.
+        // started=true so role is also absent.
         let d = StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) };
-        let line = stream_chunk(&d, "chatcmpl-3", "m");
+        let line = stream_chunk(&d, "chatcmpl-3", "m", true);
         let json_str = line.strip_prefix("data: ").unwrap();
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
         // The delta object must be empty — no "content" key at all.

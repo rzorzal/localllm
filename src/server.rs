@@ -1,9 +1,9 @@
-//! HTTP router and handlers for Task 6/8.
+//! HTTP router and handlers.
 //!
 //! Exposes four endpoints:
 //!   POST /v1/chat/completions  — OpenAI Chat Completions API (streaming + non-streaming)
 //!   POST /v1/messages          — Anthropic Messages API (streaming + non-streaming)
-//!   GET  /v1/models            — OpenAI model list (static)
+//!   GET  /v1/models            — OpenAI model list (reports the configured model id)
 //!   GET  /health               — liveness probe
 //!
 //! When `stream: true` is set in the request body, the handler returns a
@@ -26,10 +26,6 @@ use crate::api::common::{ChatRequest, ChatResult, StreamDelta};
 use crate::api::openai::{OaiChatRequest, OaiModelInfo, OaiModelList};
 use crate::api::anthropic::AnthRequest;
 
-/// The fixed model id returned by GET /v1/models.
-/// Task 7 will make this configurable; a const is sufficient here.
-pub const MODEL_ID: &str = "qwen2.5-7b-instruct";
-
 // ---------------------------------------------------------------------------
 // Generator trait — decouples HTTP handlers from the real Engine
 // ---------------------------------------------------------------------------
@@ -46,6 +42,19 @@ pub trait Generator: Send + Sync {
         &self,
         req: ChatRequest,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>>;
+}
+
+// ---------------------------------------------------------------------------
+// Router state — bundles the generator with the configured model id
+// ---------------------------------------------------------------------------
+
+/// Shared state injected into every handler via axum's `State` extractor.
+#[derive(Clone)]
+pub struct AppState {
+    /// The inference backend (real Engine or FakeGen in tests).
+    pub gen: Arc<dyn Generator>,
+    /// The model identifier reported by `GET /v1/models` and used in responses.
+    pub model_id: String,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -67,8 +76,10 @@ impl Generator for crate::engine::Engine {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the axum Router with all four endpoints wired to the given generator.
-pub fn router(state: Arc<dyn Generator>) -> Router {
+/// Build the axum Router with all four endpoints wired to the given generator
+/// and the configured model id (reported by `GET /v1/models`).
+pub fn router(gen: Arc<dyn Generator>, model_id: String) -> Router {
+    let state = Arc::new(AppState { gen, model_id });
     Router::new()
         .route("/v1/chat/completions", post(handle_oai_chat))
         .route("/v1/messages", post(handle_anth_messages))
@@ -83,7 +94,7 @@ pub fn router(state: Arc<dyn Generator>) -> Router {
 
 /// POST /v1/chat/completions
 async fn handle_oai_chat(
-    State(gen): State<Arc<dyn Generator>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<OaiChatRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -109,7 +120,7 @@ async fn handle_oai_chat(
         let id_clone = id.clone();
         let model_clone = model.clone();
 
-        let delta_stream = match gen.generate_stream(internal).await {
+        let delta_stream = match state.gen.generate_stream(internal).await {
             Ok(s) => s,
             Err(e) => {
                 return (
@@ -119,20 +130,25 @@ async fn handle_oai_chat(
             }
         };
 
+        // Thread the `started` flag so the first chunk includes "role":"assistant"
+        // per the OpenAI streaming spec.
         let sse_stream = delta_stream
-            .map(move |result| -> Result<Event, Infallible> {
-                match result {
+            .scan(false, move |started, result| {
+                let was_started = *started;
+                let event: Result<Event, Infallible> = match result {
                     Ok(delta) => {
-                        let line = crate::api::openai::stream_chunk(&delta, &id_clone, &model_clone);
+                        let line = crate::api::openai::stream_chunk(&delta, &id_clone, &model_clone, was_started);
+                        *started = true;
                         // line is "data: {json}", strip the "data: " prefix for Event::default().data()
                         let data = line.strip_prefix("data: ").unwrap_or(&line);
                         Ok(Event::default().data(data.to_string()))
                     }
                     Err(e) => {
-                        // Emit an error event and keep stream alive; client will see it.
+                        // Emit an error event; client will see it.
                         Ok(Event::default().data(format!("[ERROR] {e}")))
                     }
-                }
+                };
+                futures::future::ready(Some(event))
             })
             // Append the [DONE] sentinel after all deltas
             .chain(futures::stream::once(async {
@@ -141,8 +157,8 @@ async fn handle_oai_chat(
 
         Sse::new(sse_stream).into_response()
     } else {
-        // Non-streaming path (unchanged from Task 6)
-        let result = match gen.generate(internal).await {
+        // Non-streaming path
+        let result = match state.gen.generate(internal).await {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -158,7 +174,7 @@ async fn handle_oai_chat(
 
 /// POST /v1/messages
 async fn handle_anth_messages(
-    State(gen): State<Arc<dyn Generator>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<AnthRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -179,7 +195,7 @@ async fn handle_anth_messages(
 
     if stream_flag {
         // Streaming path: return Anthropic SSE protocol
-        let delta_stream = match gen.generate_stream(internal).await {
+        let delta_stream = match state.gen.generate_stream(internal).await {
             Ok(s) => s,
             Err(e) => {
                 return (
@@ -222,8 +238,8 @@ async fn handle_anth_messages(
 
         Sse::new(sse_stream).into_response()
     } else {
-        // Non-streaming path (unchanged from Task 6)
-        let result = match gen.generate(internal).await {
+        // Non-streaming path
+        let result = match state.gen.generate(internal).await {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -237,12 +253,12 @@ async fn handle_anth_messages(
     }
 }
 
-/// GET /v1/models
-async fn handle_models() -> Json<OaiModelList> {
+/// GET /v1/models — reports the configured model id.
+async fn handle_models(State(state): State<Arc<AppState>>) -> Json<OaiModelList> {
     Json(OaiModelList {
         object: "list".to_string(),
         data: vec![OaiModelInfo {
-            id: MODEL_ID.to_string(),
+            id: state.model_id.clone(),
             object: "model".to_string(),
             owned_by: "localllm".to_string(),
         }],
