@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result};
 use mistralrs::{
-    AutoDeviceMapParams, DeviceMapSetting, Function, GgufModelBuilder,
+    AutoDeviceMapParams, DeviceMapSetting, Function, GgufModelBuilder, MemoryGpuConfig,
     PagedAttentionMetaBuilder, RequestBuilder, Response,
     TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType, paged_attn_supported,
 };
@@ -87,8 +87,13 @@ impl Engine {
         // Skipped on force_cpu because paged attention is a GPU-only feature.
         // (NOTES-mistralrs-api.md §3)
         if cfg.paged_attn && !cfg.force_cpu && paged_attn_supported() {
-            builder = builder
-                .with_paged_attn(PagedAttentionMetaBuilder::default().build()?);
+            // Default PagedAttention reserves only ContextSize(4096); raise it to
+            // ctx_len so the usable GPU context matches the configured window.
+            builder = builder.with_paged_attn(
+                PagedAttentionMetaBuilder::default()
+                    .with_gpu_memory(MemoryGpuConfig::ContextSize(cfg.ctx_len))
+                    .build()?,
+            );
         }
 
         // `max_seq_len` sizes the device-map memory estimate AND, on GPU with
