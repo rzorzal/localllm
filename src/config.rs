@@ -23,10 +23,9 @@ pub struct Config {
     ])]
     pub gguf_files: Vec<String>,
 
-    /// Desired context length (informational only).
-    /// GgufModelBuilder has no context-length setter; the model uses its
-    /// native context length from GGUF metadata. This field is retained for
-    /// future use when a setter becomes available.
+    /// Context window in tokens. On GPU (PagedAttention) this sizes the KV
+    /// cache and is the usable context length. Larger = more GPU memory
+    /// (~55 KB/token). Lower it if the model + KV cache don't fit in RAM.
     #[arg(long, default_value_t = 16384)]
     pub ctx_len: usize,
 

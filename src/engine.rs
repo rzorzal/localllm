@@ -91,20 +91,17 @@ impl Engine {
                 .with_paged_attn(PagedAttentionMetaBuilder::default().build()?);
         }
 
-        // Use a compact max_seq_len for the auto device-map memory estimator.
-        // The default is 4096, which causes the KV-cache estimate to push the
-        // model over the available RAM budget on this machine.  512 is enough
-        // for the estimator; the model still generates at its full runtime
-        // context length — this setting only governs how much KV-cache headroom
-        // the estimator reserves when deciding which layers fit on which device.
-        // Verified against mistralrs-core 0.8.1
-        // src/pipeline/loaders/auto_device_map.rs: max_seq_len feeds the
-        // placement memory estimate (~max_seq_len * max_batch_size cache budget),
-        // it is NOT a runtime context cap. On force_cpu all layers are on CPU
-        // anyway, so the estimate is inert and the KV-cache grows as needed.
+        // `max_seq_len` sizes the device-map memory estimate AND, on GPU with
+        // PagedAttention, the actual KV-cache / usable context window. We set it
+        // to `ctx_len` so the configured context is genuinely available (Claude
+        // Code sends large system+tool prompts). KV cache scales ~linearly:
+        // ~55 KB/token → 16384 tokens ≈ 0.9 GB on the GPU, which fits in the 16 GB
+        // unified memory alongside the ~4.5 GB model. On force_cpu, PagedAttention
+        // is off and this only feeds the (inert, single-device) placement estimate.
+        // Verified against mistralrs-core 0.8.1 src/pipeline/loaders/auto_device_map.rs.
         builder = builder.with_device_mapping(DeviceMapSetting::Auto(
             AutoDeviceMapParams::Text {
-                max_seq_len: 512,
+                max_seq_len: cfg.ctx_len,
                 max_batch_size: 1,
             },
         ));
