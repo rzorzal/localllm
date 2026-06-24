@@ -318,6 +318,14 @@ pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str) -> String {
         FinishReason::ToolCalls => "tool_calls",
     });
 
+    // Build the delta object: include "content" key ONLY when text is Some.
+    // The OpenAI spec requires an empty object {} on the final (done) chunk
+    // rather than {"content": null}.
+    let mut delta_obj = serde_json::Map::new();
+    if let Some(ref text) = delta.text {
+        delta_obj.insert("content".to_string(), serde_json::Value::String(text.clone()));
+    }
+
     let chunk = serde_json::json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -325,9 +333,7 @@ pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str) -> String {
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": {
-                "content": delta.text
-            },
+            "delta": delta_obj,
             "finish_reason": finish_reason_str
         }]
     });
@@ -401,5 +407,21 @@ mod tests {
         let json_str = line.strip_prefix("data: ").unwrap();
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn openai_done_chunk_delta_omits_content_key() {
+        // When text is None (terminal/done chunk), the OpenAI spec requires the
+        // delta object to be {} — the "content" key must be ABSENT, not null.
+        let d = StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) };
+        let line = stream_chunk(&d, "chatcmpl-3", "m");
+        let json_str = line.strip_prefix("data: ").unwrap();
+        let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        // The delta object must be empty — no "content" key at all.
+        let delta = &v["choices"][0]["delta"];
+        assert!(
+            delta.as_object().map(|o| !o.contains_key("content")).unwrap_or(false),
+            "expected delta to be empty {{}}, got: {delta}"
+        );
     }
 }

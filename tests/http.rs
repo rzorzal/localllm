@@ -40,10 +40,11 @@ async fn openai_stream_returns_sse_chunks_and_done() {
         raw.contains("chat.completion.chunk"),
         "expected chat.completion.chunk in SSE body, got: {raw}"
     );
-    // Must contain the text content from FakeGen ("Hello" and " world")
+    // Must contain BOTH text deltas from FakeGen ("Hello" and " world").
+    // Using && so a regression where only one delta arrives is caught.
     assert!(
-        raw.contains("Hello") || raw.contains("world"),
-        "expected streamed text content in SSE body, got: {raw}"
+        raw.contains("Hello") && raw.contains("world"),
+        "expected both streamed text deltas in SSE body, got: {raw}"
     );
     // Must end with the [DONE] sentinel
     assert!(

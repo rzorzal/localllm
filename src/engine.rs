@@ -331,7 +331,11 @@ impl Engine {
                         Ok(StreamDelta { text: delta_text, done, finish_reason })
                     }
                     Response::Done(_) => {
-                        // Non-chunk terminal: emit a done sentinel then stop.
+                        // Response::Done is the non-streaming terminal variant and is NOT
+                        // expected on the streaming path (see NOTES §8). This arm is a
+                        // defensive guard: if mistralrs ever emits Done instead of a final
+                        // Chunk on a streaming request, we still emit a clean done sentinel
+                        // rather than silently dropping the stream.
                         let _ = tx.send(Ok(StreamDelta {
                             text: None,
                             done: true,
