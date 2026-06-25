@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod download;
 pub mod engine;
+pub mod engine_llama;
 pub mod server;
 
 // ---------------------------------------------------------------------------
