@@ -8,6 +8,13 @@
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 use axum::response::Response;
+use std::sync::OnceLock;
+
+static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn shared_client() -> &'static reqwest::Client {
+    CLIENT.get_or_init(reqwest::Client::new)
+}
 
 /// Cloud provider, inferred from the endpoint the client hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +66,7 @@ pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> Re
         }
     }
 
-    let client = reqwest::Client::new();
-    let upstream = match client.post(&url).headers(fwd).body(body).send().await {
+    let upstream = match shared_client().post(&url).headers(fwd).body(body).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "localllm::req", "cloud forward error: {e}");
@@ -76,27 +82,22 @@ pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> Re
     };
 
     let status = upstream.status();
-    let ctype = upstream
-        .headers()
-        .get("content-type")
-        .cloned()
-        .unwrap_or_else(|| "application/json".parse().unwrap());
-
+    let mut resp_headers = axum::http::HeaderMap::new();
+    for (name, value) in upstream.headers().iter() {
+        if !is_skipped_header(name.as_str()) {
+            resp_headers.insert(name.clone(), value.clone());
+        }
+    }
     let stream = upstream.bytes_stream();
-    let mut builder = Response::builder().status(status);
-    builder
-        .headers_mut()
-        .unwrap()
-        .insert("content-type", ctype);
-    builder
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap()
+    let mut builder = axum::response::Response::builder().status(status);
+    *builder.headers_mut().unwrap() = resp_headers;
+    builder.body(axum::body::Body::from_stream(stream)).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -104,6 +105,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-test"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/json")
