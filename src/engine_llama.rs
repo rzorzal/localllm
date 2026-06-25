@@ -62,10 +62,12 @@ use llama_cpp_2::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
-    context::params::LlamaContextParams,
+    context::params::{KvCacheType, LlamaContextParams},
     sampling::LlamaSampler,
     token::LlamaToken,
 };
+// Raw sys constants needed for flash attention type (not re-exported at the high level)
+use llama_cpp_sys_2;
 use uuid::Uuid;
 
 use crate::api::common::{
@@ -118,7 +120,13 @@ impl LlamaEngine {
     /// `model_id` – HF repo ID, e.g. `"Qwen/Qwen2.5-3B-Instruct-GGUF"`.
     /// `gguf_files` – GGUF filename(s) within the repo.
     /// `ctx_len` – context window in tokens.
-    pub async fn load(model_id: &str, gguf_files: &[String], ctx_len: usize) -> Result<Self> {
+    /// `kv_cache_type` – KV cache quantization type (e.g. `KvCacheType::Q8_0`).
+    pub async fn load(
+        model_id: &str,
+        gguf_files: &[String],
+        ctx_len: usize,
+        kv_cache_type: KvCacheType,
+    ) -> Result<Self> {
         // Download (or skip if cached) and get local paths.
         let paths: Vec<PathBuf> =
             crate::download::ensure_model(model_id, gguf_files)
@@ -141,7 +149,7 @@ impl LlamaEngine {
 
         // Spawn the persistent worker thread. It owns backend + model + context.
         std::thread::spawn(move || {
-            worker_thread(path, ctx_len_u32, rx, load_tx);
+            worker_thread(path, ctx_len_u32, kv_cache_type, rx, load_tx);
         });
 
         // Wait for the worker to signal successful model load (or an error).
@@ -164,6 +172,7 @@ impl LlamaEngine {
 fn worker_thread(
     model_path: PathBuf,
     ctx_len: u32,
+    kv_cache_type: KvCacheType,
     rx: std_mpsc::Receiver<Job>,
     load_tx: tokio::sync::oneshot::Sender<Result<()>>,
 ) {
@@ -187,9 +196,29 @@ fn worker_thread(
     // can be prefilled in a single decode call without hitting the
     // "n_tokens_all <= cparams.n_batch" assertion. Without this, the default
     // n_batch of 512 rejects any prefill batch larger than 512 tokens.
+    //
+    // KV cache quantization: Q8_0 or Q4_0 reduce KV-cache RAM significantly.
+    // On Metal, quantized KV types (non-F16) require Flash Attention to be
+    // enabled; without it llama.cpp will error at context creation time.
+    // We enable LLAMA_FLASH_ATTN_TYPE_ENABLED whenever kv_cache_type != F16.
+    let use_flash_attn = kv_cache_type != KvCacheType::F16;
+    let flash_attn_policy = if use_flash_attn {
+        llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED
+    } else {
+        llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO
+    };
+    tracing::info!(
+        target: "localllm::llama",
+        "KV cache type: {:?}, flash attention: {}",
+        kv_cache_type,
+        if use_flash_attn { "enabled" } else { "auto" },
+    );
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(ctx_len))
-        .with_n_batch(ctx_len);
+        .with_n_batch(ctx_len)
+        .with_type_k(kv_cache_type)
+        .with_type_v(kv_cache_type)
+        .with_flash_attention_policy(flash_attn_policy);
     let mut ctx = match model.new_context(&backend, ctx_params)
         .context("new_context failed")
     {
@@ -673,6 +702,7 @@ pub async fn run_smoke_test() -> Result<()> {
         "Qwen/Qwen2.5-3B-Instruct-GGUF",
         &["qwen2.5-3b-instruct-q4_k_m.gguf".to_string()],
         4096,
+        KvCacheType::Q8_0,
     )
     .await?;
 

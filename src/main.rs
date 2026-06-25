@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use localllm::{config::Config, engine::Engine, server::router};
+use localllm::{config::{Backend, Config}, engine::Engine, engine_llama::LlamaEngine, server::router};
 use localllm::server::Generator;
 
 #[derive(clap::Parser, Debug)]
@@ -31,9 +31,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = args.config;
-    tracing::info!("loading model {} (force_cpu={})…", cfg.model_id, cfg.force_cpu);
+    tracing::info!("loading model {} (backend={:?})…", cfg.model_id, cfg.backend);
 
-    let engine: Arc<dyn Generator> = Arc::new(Engine::load(&cfg.engine_config()).await?);
+    let engine: Arc<dyn Generator> = match cfg.backend {
+        Backend::Llama => {
+            let kv_cache_type = cfg.llama_kv_cache_type();
+            tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
+            Arc::new(LlamaEngine::load(&cfg.model_id, &cfg.gguf_files, cfg.ctx_len, kv_cache_type).await?)
+        }
+        Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
+    };
     let app = router(engine, cfg.model_id.clone());
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
