@@ -480,6 +480,18 @@ fn run_decode_loop(
     let prompt_len = new_tokens.len();
     tracing::debug!(target: "localllm::llama", "prompt tokens: {prompt_len}");
 
+    // Guard: a prompt that does not fit the context window would make llama.cpp
+    // abort the WHOLE process (SIGABRT, uncatchable by catch_unwind). Reject it
+    // with a clean error instead. Reserve a small margin for generated tokens.
+    let n_ctx = ctx.n_ctx() as usize;
+    if prompt_len + 16 >= n_ctx {
+        anyhow::bail!(
+            "prompt is {prompt_len} tokens but the context window is {n_ctx}. \
+             Start the server with a larger --ctx-len (e.g. --ctx-len {}).",
+            (prompt_len + 512).next_power_of_two()
+        );
+    }
+
     // --- Compute longest common prefix for KV reuse ---
     // Cap at new_tokens.len()-1 so there is always at least one token to decode
     // and produce fresh logits.
