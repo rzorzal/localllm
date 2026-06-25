@@ -66,12 +66,21 @@ impl Engine {
     /// Load the GGUF model from HuggingFace (or local cache) and return a
     /// ready-to-use `Engine`.
     pub async fn load(cfg: &EngineConfig) -> Result<Engine> {
+        // Derive the tokenizer repo from the GGUF repo by stripping the
+        // "-GGUF"/"-gguf" suffix (e.g. "Qwen/Qwen2.5-3B-Instruct-GGUF" →
+        // "Qwen/Qwen2.5-3B-Instruct"). Recommended for Qwen GGUF (NOTES §1).
+        let tok_repo = cfg
+            .model_id
+            .strip_suffix("-GGUF")
+            .or_else(|| cfg.model_id.strip_suffix("-gguf"))
+            .unwrap_or(&cfg.model_id)
+            .to_string();
+
         let mut builder = GgufModelBuilder::new(
             cfg.model_id.clone(),
             cfg.gguf_files.clone(),
         )
-        // Explicit tokenizer repo for Qwen GGUF (recommended per NOTES §1).
-        .with_tok_model_id("Qwen/Qwen2.5-7B-Instruct")
+        .with_tok_model_id(tok_repo)
         // Logging (NOTES §10).
         .with_logging();
 

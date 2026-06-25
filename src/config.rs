@@ -12,23 +12,24 @@ pub struct Config {
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
 
-    /// HuggingFace model ID to load.
-    #[arg(long, default_value = "Qwen/Qwen2.5-7B-Instruct-GGUF")]
+    /// HuggingFace model ID to load. Default is the lightweight Qwen2.5-3B
+    /// (~2 GB Q4), chosen so the model coexists with the user's other apps on
+    /// a 16 GB machine for small local tasks. Pass --model-id + --gguf-file to
+    /// run a larger model (e.g. Qwen2.5-7B) when more RAM is free.
+    #[arg(long, default_value = "Qwen/Qwen2.5-3B-Instruct-GGUF")]
     pub model_id: String,
 
-    /// GGUF shard filename(s). Repeat the flag for split models.
+    /// GGUF filename(s). Repeat the flag for split models.
     #[arg(long = "gguf-file", default_values_t = [
-        "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf".to_string(),
-        "qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf".to_string(),
+        "qwen2.5-3b-instruct-q4_k_m.gguf".to_string(),
     ])]
     pub gguf_files: Vec<String>,
 
     /// Context window in tokens. On GPU (PagedAttention) this sizes the KV
-    /// cache and is the usable context length. Larger = more GPU memory
-    /// (~55 KB/token; 32768 ≈ 1.8 GB). Default 32768 because agentic clients
-    /// like Claude Code send ~26k-token system+tool prompts. Lower it if the
-    /// model + KV cache don't fit in RAM.
-    #[arg(long, default_value_t = 32768)]
+    /// cache and is the usable context length (~55 KB/token; 8192 ≈ 0.4 GB).
+    /// Default 8192: ample for small tasks while staying light on RAM so the
+    /// model coexists with other apps. Raise it for longer documents.
+    #[arg(long, default_value_t = 8192)]
     pub ctx_len: usize,
 
     /// Disable paged attention.
@@ -63,8 +64,8 @@ mod tests {
     fn defaults_are_localhost_8080_qwen() {
         let c = Config::parse_from(["localllm"]);
         assert_eq!(c.port, 8080);
-        assert_eq!(c.ctx_len, 32768);
-        assert!(c.model_id.contains("Qwen2.5-7B-Instruct"));
+        assert_eq!(c.ctx_len, 8192);
+        assert!(c.model_id.contains("Qwen2.5-3B-Instruct"));
     }
 
     #[test]
@@ -73,9 +74,8 @@ mod tests {
         let ec = c.engine_config();
         // no_paged_attn defaults to false → paged_attn should be true
         assert!(ec.paged_attn, "paged_attn should be true when no_paged_attn=false");
-        // both default gguf shards should be present
-        assert_eq!(ec.gguf_files.len(), 2);
-        assert!(ec.gguf_files[0].contains("00001-of-00002"));
-        assert!(ec.gguf_files[1].contains("00002-of-00002"));
+        // default is the single-file 3B gguf
+        assert_eq!(ec.gguf_files.len(), 1);
+        assert!(ec.gguf_files[0].contains("qwen2.5-3b-instruct-q4_k_m"));
     }
 }
