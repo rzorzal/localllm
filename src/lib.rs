@@ -61,7 +61,10 @@ pub async fn run_server_with_ready(
         Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
     };
 
-    let app = router(engine, cfg.model_id.clone());
+    let policy = std::sync::Arc::new(std::sync::RwLock::new(
+        crate::route::Profile::default().policy(),
+    ));
+    let app = router(engine, cfg.model_id.clone(), policy, cfg.ctx_len);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
 
@@ -118,9 +121,13 @@ impl Generator for FakeGen {
     }
 }
 
-/// Build a test router wired to `FakeGen` and a fixed model id.
+/// Build a test router wired to `FakeGen`, a fixed model id, the default
+/// (SaveTokens) policy, and a small context window so the ctx gate is testable.
 pub fn router_for_test() -> Router {
-    crate::server::router(Arc::new(FakeGen), "test-model".to_string())
+    let policy = Arc::new(std::sync::RwLock::new(
+        crate::route::Profile::default().policy(),
+    ));
+    crate::server::router(Arc::new(FakeGen), "test-model".to_string(), policy, 1000)
 }
 
 /// Send a POST with a JSON body to `path` on `app` and return the parsed

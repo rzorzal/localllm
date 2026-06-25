@@ -68,6 +68,10 @@ pub struct AppState {
     pub gen: Arc<dyn Generator>,
     /// The model identifier reported by `GET /v1/models` and used in responses.
     pub model_id: String,
+    /// Active routing policy, shared with the tray (writer) — read per request.
+    pub policy: Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
+    /// Local model's usable context window (config `ctx_len`), for the ctx gate.
+    pub local_ctx_window: usize,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -89,10 +93,21 @@ impl Generator for crate::engine::Engine {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the axum Router with all four endpoints wired to the given generator
-/// and the configured model id (reported by `GET /v1/models`).
-pub fn router(gen: Arc<dyn Generator>, model_id: String) -> Router {
-    let state = Arc::new(AppState { gen, model_id });
+/// Build the axum Router with all four endpoints wired to the given generator,
+/// the configured model id, the shared routing policy, and the local context
+/// window used by the context gate.
+pub fn router(
+    gen: Arc<dyn Generator>,
+    model_id: String,
+    policy: Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
+    local_ctx_window: usize,
+) -> Router {
+    let state = Arc::new(AppState {
+        gen,
+        model_id,
+        policy,
+        local_ctx_window,
+    });
     Router::new()
         .route("/v1/chat/completions", post(handle_oai_chat))
         .route("/v1/messages", post(handle_anth_messages))
