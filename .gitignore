@@ -1,2 +1,5 @@
 /target
 docs/cc-payload/
+
+# SDD scratch (briefs, reports, review packages, progress ledger)
+.superpowers/
