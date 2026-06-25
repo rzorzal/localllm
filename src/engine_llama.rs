@@ -77,6 +77,11 @@ use crate::api::common::{
 };
 use crate::server::Generator;
 
+/// Bump when `build_prompt`'s output structure changes (tool serialization,
+/// message ordering, stripped blocks). Part of the .kvstate provenance tag so a
+/// state saved by an incompatible prompt format is never warm-loaded.
+const PROMPT_FORMAT_VERSION: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -173,7 +178,12 @@ impl LlamaEngine {
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
             .collect();
-        let provenance_prefix = format!("{}-{}-{}", model_tag, kv_tag, ctx_len);
+        // PROMPT_FORMAT_VERSION: bump whenever build_prompt's structure changes
+        // (tool serialization, message ordering, stripped blocks). It is part of
+        // the provenance tag so a .kvstate saved by an older prompt format is
+        // never warm-loaded against an incompatible new prompt (it would diff to
+        // ~0 common and waste a load). Stable builds keep this constant → warm.
+        let provenance_prefix = format!("{}-{}-{}-pf{}", model_tag, kv_tag, ctx_len, PROMPT_FORMAT_VERSION);
 
         // Spawn the persistent worker thread. It owns backend + model + context.
         std::thread::spawn(move || {
@@ -243,9 +253,15 @@ fn worker_thread(
         kv_cache_type,
         if use_flash_attn { "enabled" } else { "auto" },
     );
+    // n_ubatch is the physical micro-batch the GPU processes at once during
+    // prefill. The default (512) serializes a 21k-token prefix into ~41 steps.
+    // Raising it lets Metal prefill more tokens in parallel → faster cold start.
+    // Capped at 2048 to bound the compute buffer; clamped to ctx_len.
+    let n_ubatch = ctx_len.min(2048);
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(ctx_len))
         .with_n_batch(ctx_len)
+        .with_n_ubatch(n_ubatch)
         .with_type_k(kv_cache_type)
         .with_type_v(kv_cache_type)
         .with_flash_attention_policy(flash_attn_policy);
