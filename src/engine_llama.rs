@@ -121,11 +121,8 @@ pub struct LlamaEngine {
     tx: std_mpsc::SyncSender<Job>,
 }
 
-// SyncSender<Job> is Send+Sync (Job itself need not be Send because we only
-// ever send it from async tasks, but SyncSender requires T: Send).
-// Job contains ChatRequest (Send) and tokio channel senders (Send), so this is fine.
-unsafe impl Send for LlamaEngine {}
-unsafe impl Sync for LlamaEngine {}
+// SyncSender<Job> is Send+Sync (Job: Send via ChatRequest + tokio senders).
+// Auto-derivation is sound; no manual unsafe impls needed.
 
 impl LlamaEngine {
     /// Load a GGUF model from HuggingFace (or local cache), spawn the persistent
@@ -163,9 +160,24 @@ impl LlamaEngine {
         // Oneshot to receive the load result back from the worker thread.
         let (load_tx, load_rx) = tokio::sync::oneshot::channel::<Result<()>>();
 
+        // Compute a compact provenance tag for .kvstate filename validation.
+        // Format: "{sanitized_model_id}-{kv_tag}-{ctx_len}"
+        let kv_tag = match kv_cache_type {
+            KvCacheType::Q8_0 => "q8",
+            KvCacheType::Q4_0 => "q4",
+            KvCacheType::F16  => "f16",
+            _                 => "other",
+        };
+        // Sanitize model_id: keep alphanumeric + dash/dot, collapse rest to '_'.
+        let model_tag: String = model_id
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+            .collect();
+        let provenance_prefix = format!("{}-{}-{}", model_tag, kv_tag, ctx_len);
+
         // Spawn the persistent worker thread. It owns backend + model + context.
         std::thread::spawn(move || {
-            worker_thread(path, ctx_len_u32, kv_cache_type, kv_cache_dir, rx, load_tx);
+            worker_thread(path, ctx_len_u32, kv_cache_type, provenance_prefix, kv_cache_dir, rx, load_tx);
         });
 
         // Wait for the worker to signal successful model load (or an error).
@@ -189,6 +201,7 @@ fn worker_thread(
     model_path: PathBuf,
     ctx_len: u32,
     kv_cache_type: KvCacheType,
+    provenance_prefix: String,
     kv_cache_dir: Option<PathBuf>,
     rx: std_mpsc::Receiver<Job>,
     load_tx: tokio::sync::oneshot::Sender<Result<()>>,
@@ -259,7 +272,7 @@ fn worker_thread(
     // most recently modified one into the context so the next request with
     // that prefix enjoys in-cache reuse without re-prefilling from scratch.
     if let Some(ref kv_dir) = kv_cache_dir {
-        match try_warm_start_from_disk(&mut ctx, kv_dir) {
+        match try_warm_start_from_disk(&mut ctx, kv_dir, &provenance_prefix) {
             Ok(Some(tokens)) => {
                 // KV cache is populated at positions 0..(tokens.len()-1).
                 // We do NOT attempt a warm-up re-decode here (NOTES §9 warm-up).
@@ -305,19 +318,36 @@ fn worker_thread(
         match job {
             Job::Generate { req, reply } => {
                 let mut output = String::new();
-                let result = run_decode_loop(
-                    &model,
-                    &mut ctx,
-                    &mut cached_tokens,
-                    &req,
-                    kv_cache_dir.as_deref(),
-                    |piece| { output.push_str(&piece); true },
-                );
+                // Wrap in catch_unwind so a panic in llama.cpp/decoding replies an
+                // error to this client only; the worker loop continues.
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_decode_loop(
+                        &model,
+                        &mut ctx,
+                        &mut cached_tokens,
+                        &req,
+                        kv_cache_dir.as_deref(),
+                        &provenance_prefix,
+                        |piece| { output.push_str(&piece); true },
+                    )
+                }));
+                let result: Result<(usize, usize, bool)> = match panic_result {
+                    Ok(r) => r,
+                    Err(_payload) => {
+                        tracing::warn!(
+                            target: "localllm::llama",
+                            "inference panicked — resetting KV cache, continuing worker",
+                        );
+                        cached_tokens.clear();
+                        ctx.clear_kv_cache();
+                        Err(anyhow::anyhow!("inference panicked"))
+                    }
+                };
                 let chat_result = result.map(|(prompt_len, gen_tokens, hit_max)| {
                     tracing::debug!(
                         target: "localllm::llama",
                         "generated {gen_tokens} tokens: {:?}",
-                        &output[..output.len().min(200)]
+                        truncate_chars(&output, 200),
                     );
                     let (content, finish_reason) = parse_output(output, hit_max);
                     ChatResult {
@@ -337,22 +367,39 @@ fn worker_thread(
 
             Job::Stream { req, reply } => {
                 let reply_err = reply.clone();
-                let result = run_decode_loop(
-                    &model,
-                    &mut ctx,
-                    &mut cached_tokens,
-                    &req,
-                    kv_cache_dir.as_deref(),
-                    |piece| {
-                        let delta = Ok(StreamDelta {
-                            text: Some(piece),
-                            done: false,
-                            finish_reason: None,
-                        });
-                        // blocking_send blocks if channel is full, returns Err if receiver dropped.
-                        reply.blocking_send(delta).is_ok()
-                    },
-                );
+                // Wrap in catch_unwind so a panic in llama.cpp/decoding replies an
+                // error to this client only; the worker loop continues.
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_decode_loop(
+                        &model,
+                        &mut ctx,
+                        &mut cached_tokens,
+                        &req,
+                        kv_cache_dir.as_deref(),
+                        &provenance_prefix,
+                        |piece| {
+                            let delta = Ok(StreamDelta {
+                                text: Some(piece),
+                                done: false,
+                                finish_reason: None,
+                            });
+                            // blocking_send blocks if channel is full, returns Err if receiver dropped.
+                            reply.blocking_send(delta).is_ok()
+                        },
+                    )
+                }));
+                let result: Result<(usize, usize, bool)> = match panic_result {
+                    Ok(r) => r,
+                    Err(_payload) => {
+                        tracing::warn!(
+                            target: "localllm::llama",
+                            "inference panicked (stream) — resetting KV cache, continuing worker",
+                        );
+                        cached_tokens.clear();
+                        ctx.clear_kv_cache();
+                        Err(anyhow::anyhow!("inference panicked"))
+                    }
+                };
                 // On error, clear the cache state so the next request starts clean.
                 if result.is_err() {
                     cached_tokens.clear();
@@ -376,6 +423,19 @@ fn worker_thread(
         }
     }
     // rx disconnected → process is shutting down. Worker exits cleanly.
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8-safe string helpers
+// ---------------------------------------------------------------------------
+
+/// Return a sub-str of `s` up to `n` Unicode scalar values (characters).
+/// Unlike byte-slicing, this never panics on multi-byte UTF-8 boundaries.
+fn truncate_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,11 +466,12 @@ fn run_decode_loop(
     cached_tokens: &mut Vec<LlamaToken>,
     req: &ChatRequest,
     kv_cache_dir: Option<&std::path::Path>,
+    provenance_prefix: &str,
     mut on_piece: impl FnMut(String) -> bool,
 ) -> Result<(usize /*prompt_tokens*/, usize /*generated*/, bool /*hit_max*/)> {
     // --- Build prompt string ---
     let prompt = build_prompt(model, req)?;
-    tracing::debug!(target: "localllm::llama", "prompt ({} chars):\n{}", prompt.len(), &prompt[..prompt.len().min(400)]);
+    tracing::debug!(target: "localllm::llama", "prompt ({} chars):\n{}", prompt.len(), truncate_chars(&prompt, 400));
 
     // --- Tokenize ---
     let new_tokens = model
@@ -438,24 +499,40 @@ fn run_decode_loop(
     );
 
     // --- Trim KV cache from `common` onward ---
-    // If common == 0, this is equivalent to a full clear.
-    if common == 0 {
+    // `clear_kv_cache_seq` returns `Ok(false)` when the partial removal
+    // FAILED (e.g. non-contiguous paged KV cells). In that case we must
+    // fall back to a FULL reset — otherwise stale KV at [common, end) will
+    // corrupt the next decode.
+    let effective_common = if common == 0 {
         ctx.clear_kv_cache();
+        0
     } else {
         // Remove KV entries from position `common` to end of sequence 0.
-        ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None)
-            .context("clear_kv_cache_seq failed")?;
-    }
+        match ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None)
+            .context("clear_kv_cache_seq failed")?
+        {
+            true => common, // partial removal succeeded — reuse the prefix
+            false => {
+                tracing::warn!(
+                    target: "localllm::llama",
+                    "clear_kv_cache_seq returned false (partial removal failed) — \
+                     falling back to full KV reset and re-prefilling entire prompt",
+                );
+                ctx.clear_kv_cache();
+                0 // must prefill the entire prompt
+            }
+        }
+    };
 
-    // --- Prefill: only new_tokens[common..] starting at position `common` ---
-    let tail = &new_tokens[common..];
+    // --- Prefill: only new_tokens[effective_common..] starting at that position ---
+    let tail = &new_tokens[effective_common..];
     let n_tail = tail.len();
     // Batch capacity must be >= n_tail so all tail tokens fit in a single
     // decode call. We also ensure a minimum of 1 to avoid zero-capacity batches.
     let mut batch = LlamaBatch::new(n_tail.max(1), 1);
     // Add each tail token with its absolute position, logits=true only on last.
     for (i, &tok) in tail.iter().enumerate() {
-        let pos = (common + i) as i32;
+        let pos = (effective_common + i) as i32;
         let is_last = i == n_tail - 1;
         batch
             .add(tok, pos, &[0_i32], is_last)
@@ -468,12 +545,12 @@ fn run_decode_loop(
     // Save after prefill so we capture the full prompt KV. We save the FULL
     // new_tokens (not just the tail) because cached_tokens hasn't been updated
     // yet — new_tokens IS the new prefix to persist.
-    // Conditions: persistence enabled, prefix is large enough, and common==0
+    // Conditions: persistence enabled, prefix is large enough, and effective_common==0
     // (we just prefilled the whole prompt, so this is the freshest possible
-    // complete state). When common>0 the prefix was already cached on disk.
+    // complete state). When effective_common>0 the prefix was already cached on disk.
     if let Some(kv_dir) = kv_cache_dir {
-        if new_tokens.len() >= KV_PERSIST_MIN_TOKENS && common == 0 {
-            if let Err(e) = save_prefix_kv(ctx, kv_dir, &new_tokens) {
+        if new_tokens.len() >= KV_PERSIST_MIN_TOKENS && effective_common == 0 {
+            if let Err(e) = save_prefix_kv(ctx, kv_dir, &new_tokens, provenance_prefix) {
                 tracing::warn!(
                     target: "localllm::llama",
                     "prefix KV save failed (non-fatal): {e}",
@@ -748,20 +825,27 @@ fn hash_tokens(tokens: &[LlamaToken]) -> u64 {
     h.finish()
 }
 
-/// Save the prefix KV state for `tokens` to `kv_dir/{hash}.kvstate`.
+/// Save the prefix KV state for `tokens` to
+/// `kv_dir/{provenance_prefix}-{tokenhash}.kvstate`.
+///
+/// The `provenance_prefix` encodes model identity + kv_type + ctx_len so that
+/// states saved with one configuration are never loaded by a run with a different
+/// model/kv_type/ctx_len.
+///
 /// Skips if the file already exists (idempotent per distinct prefix).
 /// Prunes old files if more than `KV_PERSIST_MAX_FILES` exist.
 fn save_prefix_kv(
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
     kv_dir: &std::path::Path,
     tokens: &[LlamaToken],
+    provenance_prefix: &str,
 ) -> Result<()> {
     // Ensure the directory exists.
     std::fs::create_dir_all(kv_dir)
         .with_context(|| format!("create_dir_all({kv_dir:?})"))?;
 
     let hash = hash_tokens(tokens);
-    let file_path = kv_dir.join(format!("{hash:016x}.kvstate"));
+    let file_path = kv_dir.join(format!("{provenance_prefix}-{hash:016x}.kvstate"));
 
     // Idempotent: don't re-save if we already have this prefix on disk.
     if file_path.exists() {
@@ -787,19 +871,27 @@ fn save_prefix_kv(
         bytes,
     );
 
-    // Prune oldest files if we have exceeded KV_PERSIST_MAX_FILES.
-    prune_kvstate_files(kv_dir);
+    // Prune oldest files (matching this provenance) if we have exceeded KV_PERSIST_MAX_FILES.
+    prune_kvstate_files(kv_dir, provenance_prefix);
 
     Ok(())
 }
 
-/// Delete oldest `.kvstate` files when the directory has more than
-/// `KV_PERSIST_MAX_FILES` entries. Errors are logged but not propagated.
-fn prune_kvstate_files(kv_dir: &std::path::Path) {
+/// Delete oldest `.kvstate` files (matching `provenance_prefix`) when the
+/// directory has more than `KV_PERSIST_MAX_FILES` matching entries.
+/// Errors are logged but not propagated.
+fn prune_kvstate_files(kv_dir: &std::path::Path, provenance_prefix: &str) {
+    let prefix_dash = format!("{provenance_prefix}-");
     let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = match std::fs::read_dir(kv_dir) {
         Ok(rd) => rd
             .flatten()
-            .filter(|e| e.path().extension().map_or(false, |x| x == "kvstate"))
+            .filter(|e| {
+                let p = e.path();
+                p.extension().map_or(false, |x| x == "kvstate")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |n| n.starts_with(&prefix_dash))
+            })
             .filter_map(|e| {
                 let mtime = e.metadata().ok()?.modified().ok()?;
                 Some((mtime, e.path()))
@@ -829,23 +921,33 @@ fn prune_kvstate_files(kv_dir: &std::path::Path) {
 }
 
 /// Attempt to warm-start by loading the most recently modified `.kvstate` file
-/// from `kv_dir` into seq 0.
+/// from `kv_dir` that matches `provenance_prefix` (model + kv_type + ctx_len).
 ///
 /// Returns `Ok(Some(tokens))` on success (tokens loaded), `Ok(None)` if no
-/// files exist, or `Err(...)` on a load failure (caller should continue cold).
+/// matching files exist, or `Err(...)` on a load failure (caller should continue cold).
 fn try_warm_start_from_disk(
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
     kv_dir: &std::path::Path,
+    provenance_prefix: &str,
 ) -> Result<Option<Vec<LlamaToken>>> {
     if !kv_dir.exists() {
         return Ok(None);
     }
 
-    // Collect all *.kvstate files sorted by mtime descending (newest first).
+    let prefix_dash = format!("{provenance_prefix}-");
+
+    // Collect .kvstate files that match the current provenance (model+kv_type+ctx_len),
+    // sorted by mtime descending (newest first).
     let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(kv_dir)
         .with_context(|| format!("read_dir({kv_dir:?})"))?
         .flatten()
-        .filter(|e| e.path().extension().map_or(false, |x| x == "kvstate"))
+        .filter(|e| {
+            let p = e.path();
+            p.extension().map_or(false, |x| x == "kvstate")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with(&prefix_dash))
+        })
         .filter_map(|e| {
             let mtime = e.metadata().ok()?.modified().ok()?;
             Some((mtime, e.path()))
@@ -853,10 +955,16 @@ fn try_warm_start_from_disk(
         .collect();
 
     if entries.is_empty() {
+        tracing::info!(
+            target: "localllm::llama",
+            "warm-start: no matching kvstate files for provenance {:?} in {:?} — cold start",
+            provenance_prefix,
+            kv_dir,
+        );
         return Ok(None);
     }
 
-    // Newest file first.
+    // Newest matching file first.
     entries.sort_by(|a, b| b.0.cmp(&a.0));
     let (_, newest_path) = &entries[0];
 

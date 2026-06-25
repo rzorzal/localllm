@@ -1,10 +1,14 @@
 //! # tscg — Tool-Schema Compact Grammar
 //!
-//! Compresses JSON Schema tool definitions into a compact, lossless textual
-//! form, suitable for embedding in LLM prompts. Achieves ~40-60% size
-//! reduction vs. pretty-printed JSON by dropping schema boilerplate while
-//! preserving all semantic content: names, types, enums, required-ness,
-//! and non-empty descriptions.
+//! Compresses JSON Schema tool definitions into a compact textual form,
+//! suitable for embedding in LLM prompts. Achieves ~40-60% size reduction
+//! vs. pretty-printed JSON by dropping schema boilerplate while preserving
+//! names, types, enums, required-ness, and non-empty descriptions.
+//!
+//! **Fidelity:** lossless for flat schemas; nested object/array structure is
+//! summarised (name + container type preserved, deep shape omitted — a nested
+//! object param becomes `obj`, dropping its inner properties, and `format`/
+//! `const`/numeric-range keywords are not emitted).
 //!
 //! ## Grammar
 //!
