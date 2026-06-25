@@ -36,7 +36,7 @@ cargo build --release
 ## Run
 
 ```bash
-./target/release/localllm --port 8080
+./target/release/localllm --port 31415
 ```
 
 The model is downloaded to the HuggingFace cache on first run, then loaded
@@ -44,14 +44,14 @@ The model is downloaded to the HuggingFace cache on first run, then loaded
 
 ```
 INFO  localllm: loading model Qwen/Qwen2.5-3B-Instruct-GGUF (force_cpu=false)…
-INFO  localllm: listening on http://127.0.0.1:8080
+INFO  localllm: listening on http://127.0.0.1:31415
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `8080` | TCP port (binds `127.0.0.1` only) |
+| `--port` | `31415` | TCP port (binds `127.0.0.1` only) |
 | `--model-id` | `Qwen/Qwen2.5-3B-Instruct-GGUF` | HuggingFace GGUF repo |
 | `--gguf-file` | `qwen2.5-3b-instruct-q4_k_m.gguf` | GGUF filename(s); repeat for split models |
 | `--ctx-len` | `8192` | Context window in tokens (sizes the GPU KV cache) |
@@ -103,21 +103,21 @@ The tokenizer repo is derived automatically by stripping `-GGUF` from
 
 ### OpenAI
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:31415/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"local","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128}'
 ```
 
 ### Anthropic
 ```bash
-curl http://localhost:8080/v1/messages \
+curl http://localhost:31415/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"local","max_tokens":128,"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
 ### Health
 ```bash
-curl http://localhost:8080/health   # {"status":"ok"}
+curl http://localhost:31415/health   # {"status":"ok"}
 ```
 
 ---
@@ -126,13 +126,13 @@ curl http://localhost:8080/health   # {"status":"ok"}
 
 ### Codex CLI
 ```bash
-export OPENAI_BASE_URL=http://localhost:8080/v1
+export OPENAI_BASE_URL=http://localhost:31415/v1
 codex "explain this code"
 ```
 
 ### Claude Code
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=local claude
+ANTHROPIC_BASE_URL=http://localhost:31415 ANTHROPIC_API_KEY=local claude
 ```
 
 > **Heads-up on Claude Code.** Claude Code sends a large agentic prompt

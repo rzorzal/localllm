@@ -36,8 +36,11 @@ pub enum KvType {
 /// All runtime configuration, parsed from command-line arguments.
 #[derive(clap::Parser, Debug)]
 pub struct Config {
-    /// TCP port to listen on.
-    #[arg(long, default_value_t = 8080)]
+    /// TCP port to listen on. Default 31415 (a quiet, uncommon port) so the
+    /// always-on server does not collide with the ports developers use day to
+    /// day (3000/5000/8000/8080) or other local LLM tools (Ollama 11434,
+    /// LM Studio 1234). Override with --port.
+    #[arg(long, default_value_t = 31415)]
     pub port: u16,
 
     /// HuggingFace model ID to load. Default is the lightweight Qwen2.5-3B
@@ -54,10 +57,11 @@ pub struct Config {
     pub gguf_files: Vec<String>,
 
     /// Context window in tokens. On GPU (PagedAttention) this sizes the KV
-    /// cache and is the usable context length (~55 KB/token; 8192 ≈ 0.4 GB).
-    /// Default 8192: ample for small tasks while staying light on RAM so the
-    /// model coexists with other apps. Raise it for longer documents.
-    #[arg(long, default_value_t = 8192)]
+    /// cache and is the usable context length. Default 32768 so agentic clients
+    /// like Claude Code (which send ~20k-token system+tool prompts every turn)
+    /// work out of the box. KV cache for 32k @ Q8 ≈ 0.6 GB on this 3B model.
+    /// Lower it (e.g. --ctx-len 8192) for a lighter footprint on small tasks.
+    #[arg(long, default_value_t = 32768)]
     pub ctx_len: usize,
 
     /// Disable paged attention.
@@ -141,10 +145,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_localhost_8080_qwen() {
+    fn defaults_are_localhost_31415_qwen() {
         let c = Config::parse_from(["localllm"]);
-        assert_eq!(c.port, 8080);
-        assert_eq!(c.ctx_len, 8192);
+        assert_eq!(c.port, 31415);
+        assert_eq!(c.ctx_len, 32768);
         assert!(c.model_id.contains("Qwen2.5-3B-Instruct"));
     }
 

@@ -48,6 +48,19 @@ pub mod macos {
     // Icon generation
     // -----------------------------------------------------------------------
 
+    /// Copy text to the macOS clipboard via `pbcopy`.
+    fn copy_to_clipboard(text: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            tracing::info!("copied to clipboard: {text}");
+        }
+    }
+
     /// Open the log file in the user's editor: Zed if installed, else the
     /// default text app via `open -t`.
     fn open_log_file(path: &str) {
@@ -165,13 +178,17 @@ pub mod macos {
         let info_kv = format!("{:?}", cfg.kv_type);
         let info_backend = format!("{:?}", cfg.backend);
 
+        // Shared flag flipped to true once the server is actually serving.
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_for_server = ready.clone();
+
         // ---- Spawn server on a background thread with its own tokio runtime ----
         std::thread::Builder::new()
             .name("localllm-server".to_string())
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new()
                     .expect("failed to build server tokio runtime");
-                if let Err(e) = rt.block_on(crate::run_server(cfg)) {
+                if let Err(e) = rt.block_on(crate::run_server_with_ready(cfg, Some(ready_for_server))) {
                     tracing::error!("server exited with error: {e:#}");
                     std::process::exit(1);
                 }
@@ -195,6 +212,10 @@ pub mod macos {
         // Set in Init; compared against menu events to dispatch clicks.
         let mut quit_id: Option<tray_icon::menu::MenuId> = None;
         let mut logs_id: Option<tray_icon::menu::MenuId> = None;
+        let mut url_id: Option<tray_icon::menu::MenuId> = None;
+        // Kept so we can flip the status text to "running" once the server is up.
+        let mut status_handle: Option<MenuItem> = None;
+        let mut shown_running = false;
         let log_path = std::env::var("LOCALLLM_LOG")
             .unwrap_or_else(|_| "/tmp/localllm.log".to_string());
 
@@ -214,8 +235,13 @@ pub mod macos {
                     // Title + status, then info lines (all disabled/informational),
                     // a separator, and the clickable Quit item.
                     let title = MenuItem::new("localllm — local LLM server", false, None);
-                    let status = MenuItem::new("● Running", false, None);
-                    let url_line = MenuItem::new(format!("URL:    {url_for_tray}"), false, None);
+                    // Starts as loading (yellow); flips to green "Running" once
+                    // the server thread signals it is actually serving.
+                    let status = MenuItem::new("🟡 Loading model…", false, None);
+                    status_handle = Some(status.clone());
+                    // URL is clickable → copies to clipboard.
+                    let url_line = MenuItem::new(format!("URL:    {url_for_tray}  (click to copy)"), true, None);
+                    url_id = Some(url_line.id().clone());
                     let model_line = MenuItem::new(format!("Model:  {model_short}"), false, None);
                     let ctx_line = MenuItem::new(format!("Context: {info_ctx} tokens"), false, None);
                     let kv_line = MenuItem::new(format!("KV cache: {info_kv}"), false, None);
@@ -255,12 +281,24 @@ pub mod macos {
                 // tao Event enum variants, so we must poll explicitly.
                 Event::MainEventsCleared
                 | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                    // Flip status to green once the server is actually serving.
+                    if !shown_running
+                        && ready.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        if let Some(s) = &status_handle {
+                            s.set_text("🟢 Running");
+                        }
+                        shown_running = true;
+                    }
+
                     while let Ok(menu_event) = MenuEvent::receiver().try_recv() {
                         if quit_id.as_ref() == Some(&menu_event.id) {
                             tracing::info!("quit requested via tray menu — shutting down");
                             std::process::exit(0);
                         } else if logs_id.as_ref() == Some(&menu_event.id) {
                             open_log_file(&log_path);
+                        } else if url_id.as_ref() == Some(&menu_event.id) {
+                            copy_to_clipboard(&url_for_tray);
                         }
                     }
                 }

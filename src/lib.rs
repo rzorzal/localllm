@@ -17,6 +17,16 @@ pub mod tray;
 /// Callable from both the headless `main()` path and the tray-mode background
 /// thread. Never returns on success (the axum serve future runs forever).
 pub async fn run_server(cfg: crate::config::Config) -> anyhow::Result<()> {
+    run_server_with_ready(cfg, None).await
+}
+
+/// Like [`run_server`] but flips `ready` to `true` once the listener is bound
+/// (server actually serving). Used by the tray to show a live "running" status
+/// only after the model has loaded and the port is up.
+pub async fn run_server_with_ready(
+    cfg: crate::config::Config,
+    ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<()> {
     use std::sync::Arc;
     use crate::config::Backend;
     use crate::engine::Engine;
@@ -54,6 +64,9 @@ pub async fn run_server(cfg: crate::config::Config) -> anyhow::Result<()> {
     tracing::info!("listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    if let Some(flag) = ready {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
