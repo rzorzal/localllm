@@ -449,23 +449,21 @@ fn build_prompt(model: &LlamaModel, req: &ChatRequest) -> Result<String> {
     let tool_section = if req.tools.is_empty() {
         String::new()
     } else {
-        let mut tool_json_lines = String::new();
-        for tool in &req.tools {
-            let obj = serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters,
-            });
-            tool_json_lines.push_str(&serde_json::to_string(&obj)?);
-            tool_json_lines.push('\n');
-        }
+        // Use Tscg compact serialization (~57% smaller than verbose JSON).
+        let compact_block = crate::tscg::compact_tools_block(&req.tools);
+        tracing::debug!(
+            target: "localllm::llama",
+            "tool_section: {} tools, compact_block={} chars",
+            req.tools.len(),
+            compact_block.len(),
+        );
         format!(
             "\n\n# Tools\n\nYou may call one or more functions to assist with the user query. \
 Don't make assumptions about what values to plug into functions. \
 For each function call, return a json object with function name and arguments within \
 <tool_call></tool_call> XML tags as follows:\n\
 <tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-dict>}}\n</tool_call>\n\n\
-Here are the available tools:\n<tools>\n{tool_json_lines}</tools>"
+Here are the available tools (compact schema — name(param:type! (desc)) — description):\n<tools>\n{compact_block}\n</tools>"
         )
     };
 
