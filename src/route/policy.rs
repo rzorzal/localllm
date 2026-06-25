@@ -3,9 +3,13 @@
 //! A `Profile` is the user-facing choice (set from the tray in a later phase);
 //! it maps to a `RoutingPolicy` of concrete knobs consumed by `route::decide`.
 
-/// User-facing routing choice. Set from the tray in a later phase.
+/// User-facing routing choice. Selected from the tray; persisted in settings.
 /// Defaults to `SaveTokens` (the token-thrift, local-first profile).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default,
+    serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum Profile {
     /// Local-first; cloud only when local truly cannot serve. Cheapest.
     #[default]
