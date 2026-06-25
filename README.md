@@ -1,80 +1,123 @@
 # localllm
 
-A local LLM inference server that loads Qwen2.5-7B-Instruct (GGUF Q4_K_M, split shards) via [mistralrs](https://github.com/EricLBuehler/mistral.rs) and serves two API surfaces:
+A lightweight local LLM inference server. Loads a Qwen2.5 GGUF model via
+[mistralrs](https://github.com/EricLBuehler/mistral.rs), runs it on the Apple
+GPU (Metal), and serves two API surfaces so existing AI tools can point at it:
 
 - **OpenAI** — `POST /v1/chat/completions`, `GET /v1/models`
 - **Anthropic** — `POST /v1/messages`
 - **Health** — `GET /health`
 
-Both APIs support tool calling (function calling) with full two-step tool chaining, and SSE streaming.
+Both APIs support tool calling (function calling) with full two-step tool
+chaining, and SSE streaming. The default model is the lightweight
+**Qwen2.5-3B-Instruct** so it coexists with your other apps for small local
+tasks; swap in a larger model when you have RAM to spare (see below).
 
 ---
 
 ## Build
 
 ```bash
-MISTRALRS_METAL_PRECOMPILE=0 cargo build --release
+cargo build --release
 ```
 
-> **Why `MISTRALRS_METAL_PRECOMPILE=0`?**  The Metal shader toolchain is broken on this machine — the precompiled Metal shaders fail to compile with Apple's `metallib`. Setting this env var disables Metal shader precompilation so the binary can be built and run on CPU. If you fix the toolchain (`xcodebuild -downloadComponent MetalToolchain` and install full Xcode), you can remove this variable and build with: `cargo build --release --features metal` for GPU acceleration.
+> **Metal toolchain note.** Building the Metal GPU shaders requires Apple's
+> Metal Toolchain (`xcrun metal`). If you hit
+> `cannot execute tool 'metal' due to missing Metal Toolchain`, install it:
+> ```bash
+> xcodebuild -runFirstLaunch          # repairs Xcode plugins if needed
+> xcodebuild -downloadComponent MetalToolchain
+> ```
+> As a fallback (no GPU), you can build with `MISTRALRS_METAL_PRECOMPILE=0` and
+> run with `--force-cpu true` — that skips shader precompilation and runs on CPU.
 
 ---
 
 ## Run
 
 ```bash
-MISTRALRS_METAL_PRECOMPILE=0 ./target/release/localllm --port 8080
+./target/release/localllm --port 8080
 ```
 
-The server loads the model from HuggingFace cache on startup (~10s on CPU). You will see:
+The model is downloaded to the HuggingFace cache on first run, then loaded
+(~10s). You'll see:
 
 ```
+INFO  localllm: loading model Qwen/Qwen2.5-3B-Instruct-GGUF (force_cpu=false)…
 INFO  localllm: listening on http://127.0.0.1:8080
 ```
 
-Options:
+### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | 8080 | TCP port |
-| `--model-id` | `Qwen/Qwen2.5-7B-Instruct-GGUF` | HuggingFace repo |
-| `--gguf-file` | (two shards) | GGUF shard filename(s) |
-| `--ctx-len` | 16384 | KV-cache context length (informational) |
-| `--force-cpu` | true | Force CPU inference |
+| `--port` | `8080` | TCP port (binds `127.0.0.1` only) |
+| `--model-id` | `Qwen/Qwen2.5-3B-Instruct-GGUF` | HuggingFace GGUF repo |
+| `--gguf-file` | `qwen2.5-3b-instruct-q4_k_m.gguf` | GGUF filename(s); repeat for split models |
+| `--ctx-len` | `8192` | Context window in tokens (sizes the GPU KV cache) |
+| `--no-paged-attn` | `false` | Disable PagedAttention |
+| `--force-cpu` | `false` | Force CPU instead of the Apple GPU |
 
 ---
 
-## API Endpoints
+## Choosing a model and context size
 
-### OpenAI (`/v1/chat/completions`)
+The two levers that matter on a 16 GB Mac:
 
+- **Model size (parameters)** — bigger = smarter, slower, more RAM.
+- **`--ctx-len` (context window)** — bigger = handles longer input, more KV-cache
+  RAM (~55 KB/token: 8k ≈ 0.3 GB, 32k ≈ 1.8 GB).
+
+### Light + fast (default) — small tasks alongside other apps
+```bash
+./target/release/localllm
+# Qwen2.5-3B, 8k context. ~2.3 GB, ~39 tok/s on M1 Pro.
+```
+
+### Smarter — when you have RAM free
+First download the model, then point the flags at it:
+```bash
+hf download Qwen/Qwen2.5-7B-Instruct-GGUF \
+  qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf \
+  qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
+
+./target/release/localllm \
+  --model-id Qwen/Qwen2.5-7B-Instruct-GGUF \
+  --gguf-file qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf \
+  --gguf-file qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
+# Qwen2.5-7B. Smarter but ~15 tok/s and heavier on RAM.
+```
+
+### Longer context (e.g. bigger documents)
+```bash
+./target/release/localllm --ctx-len 32768
+# More KV-cache RAM; watch swap on a 16 GB machine.
+```
+
+The tokenizer repo is derived automatically by stripping `-GGUF` from
+`--model-id`, so any `Qwen/...-GGUF` repo works out of the box.
+
+---
+
+## API examples
+
+### OpenAI
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen2.5-7b-instruct",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 128
-  }'
+  -d '{"model":"local","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128}'
 ```
 
-### Anthropic (`/v1/messages`)
-
+### Anthropic
 ```bash
 curl http://localhost:8080/v1/messages \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen2.5-7b-instruct",
-    "max_tokens": 128,
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+  -d '{"model":"local","max_tokens":128,"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-### Health check
-
+### Health
 ```bash
-curl http://localhost:8080/health
-# {"status":"ok"}
+curl http://localhost:8080/health   # {"status":"ok"}
 ```
 
 ---
@@ -82,26 +125,46 @@ curl http://localhost:8080/health
 ## Pointing AI tools at localllm
 
 ### Codex CLI
-
 ```bash
 export OPENAI_BASE_URL=http://localhost:8080/v1
 codex "explain this code"
 ```
 
 ### Claude Code
-
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8080
-claude "explain this code"
+ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=local claude
 ```
+
+> **Heads-up on Claude Code.** Claude Code sends a large agentic prompt
+> (~26k tokens of system instructions + ~27 tool schemas) on *every* turn. To
+> use it you must raise `--ctx-len` to at least `32768`, and on a 16 GB machine
+> that combination (model + 1.8 GB KV cache + your other apps) will swap and
+> respond slowly. It works, but local agentic coding wants more RAM or a
+> smaller model. Simple clients and small prompts run great.
 
 ---
 
-## Tool Calling
+## Request logging
 
-Both APIs support OpenAI-style function calling with two-step chaining. The acceptance tests in `scripts/` demonstrate and verify the full flow end-to-end.
+Every request is logged with a short id so concurrent prompts are easy to
+follow:
 
-Run the tests:
+```
+req-1a2b3c4d [anthropic] start: model=local msgs=3 tools=1 stream=true
+req-1a2b3c4d [anthropic] done (buffered stream): finish=ToolCalls completion_tok=20 0.9s 22.1 tok/s
+```
+
+Set `RUST_LOG=localllm=info` (or `debug`) to control verbosity.
+
+---
+
+## Tool calling
+
+Both APIs support function calling with two-step chaining. Streaming requests
+that carry tools use a "buffered streaming" path: the response is generated in
+full (reusing the non-streaming tool-call path) then replayed as correct SSE
+(`tool_calls` for OpenAI, `tool_use` blocks for Anthropic). Tool-less streaming
+requests stream token-by-token.
 
 ```bash
 bash scripts/test_openai_tools.sh
@@ -114,63 +177,37 @@ bash scripts/test_anthropic_tools.sh
 
 | Optimization | Status | Notes |
 |---|---|---|
-| GGUF Q4_K_M weights | **ACTIVE** | ~4.5 GB on disk, loaded via mmap |
-| Prefix caching | **ACTIVE** | Enabled by default in mistralrs (sequence-level) |
+| GGUF Q4_K_M weights | **ACTIVE** | Loaded via mmap |
+| Metal GPU acceleration | **ACTIVE** | Runs on the Apple GPU (BF16 compute) |
+| PagedAttention | **ACTIVE** | OS-style KV paging on the GPU; sized to `--ctx-len` |
+| Prefix caching | **ACTIVE** | Reuses shared prompt prefixes across turns |
 | mmap weight loading | **ACTIVE** | GGUF files are memory-mapped |
-| 16k+ context window | **ACTIVE** | Model supports 131k; KV-cache default 16k |
-| Metal GPU acceleration | **UNAVAILABLE** | Metal shader toolchain broken on this machine. Fix: `xcodebuild -downloadComponent MetalToolchain` then rebuild without `MISTRALRS_METAL_PRECOMPILE=0` |
-| Paged attention | **UNAVAILABLE** | Requires working Metal runtime or CUDA; skipped on force_cpu |
-| Flash Attention | **UNAVAILABLE** | Requires CUDA (`flash-attn` cargo feature) |
-| KV-cache quantization | **UNAVAILABLE** | Not exposed by `GgufModelBuilder` API |
-| ISQ re-quantization | **UNAVAILABLE** | Only works with `TextModelBuilder`, not GGUF |
+| Flash Attention | **UNAVAILABLE** | Requires CUDA (`flash-attn` feature); Metal uses its own kernels |
+| KV-cache quantization | **UNAVAILABLE** | Not exposed by `GgufModelBuilder` |
+| ISQ re-quantization | **UNAVAILABLE** | GGUF is already quantized; ISQ is for `TextModelBuilder` |
 
-**Current mode:** CPU-only inference. All model weights loaded from GGUF Q4_K_M shards via mmap with prefix caching enabled.
+To fall back to CPU (no Metal), build with `MISTRALRS_METAL_PRECOMPILE=0` and run
+with `--force-cpu true`. PagedAttention is GPU-only and is skipped on CPU.
 
 ---
 
-## Performance (measured on this machine)
+## Performance (measured on this machine — Apple M1 Pro, 16 GB)
 
-Measured with `scripts/measure.sh` on CPU inference (Apple Silicon, force_cpu=true):
+| Model | Context | Throughput | KV cache | Notes |
+|---|---|---|---|---|
+| **Qwen2.5-3B** (default) | 8k | **~39 tok/s** | 288 MB | Light; coexists with other apps |
+| Qwen2.5-7B | 16k | ~15 tok/s | 896 MB | Smarter; heavier on 16 GB |
 
-| Metric | Value |
-|---|---|
-| Peak RAM (RSS) | ~4518 MB (~4.5 GB) |
-| Completion tokens | 72 |
-| Elapsed time | 9s |
-| Throughput | **8.0 tok/s** |
-
-Prompt: *"In exactly two sentences, explain what a transformer neural network is."*
-
-Model response: *"A transformer neural network is a type of deep learning model designed for tasks involving natural language processing, particularly excelling at understanding the context and meaning of text by analyzing the relationships between words in a sentence. It achieves this by using self-attention mechanisms to weigh the importance of different words relative to each other, without relying on fixed-length sequences of hidden layers."*
-
-> **Note on RAM:** The auto device mapper uses `max_seq_len=512` for memory estimation (reduced from the default 4096 to fit within available RAM on this loaded machine). At runtime the model generates at its full context length. If you have more free RAM, increase or remove the device-map limit in `src/engine.rs`.
-
----
-
-## Acceptance Tests
-
-```bash
-# Start server
-MISTRALRS_METAL_PRECOMPILE=0 ./target/release/localllm --port 8080 &
-
-# Wait for health
-until curl -sf localhost:8080/health; do sleep 2; done
-
-# Run tests
-bash scripts/test_openai_tools.sh    # Tests OpenAI two-step tool chain
-bash scripts/test_anthropic_tools.sh # Tests Anthropic two-step tool chain
-bash scripts/measure.sh              # Measures RAM and tok/s
-```
-
-All tests pass on CPU inference. Each inference call on CPU takes ~5-15 seconds for short completions.
+Prefill of very large prompts (e.g. Claude Code's ~26k tokens) is the slow part
+on this hardware, especially when the machine is already low on RAM and swapping.
 
 ---
 
 ## Model
 
-**Qwen2.5-7B-Instruct-GGUF** (Q4_K_M quantization, split into 2 shards)
+**Qwen2.5-3B-Instruct-GGUF** (Q4_K_M) by default.
 
-- HuggingFace: [Qwen/Qwen2.5-7B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF)
-- Context: 131,072 tokens (native), 16,384 KV-cache default
-- Architecture: Qwen2, 28 layers, 3584 embedding dim
-- Quantization: GGUF Q4_K_M (F16 dtype at runtime)
+- HuggingFace: [Qwen/Qwen2.5-3B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF)
+- Native context: 32,768 tokens (server default KV cache: 8,192)
+- Architecture: Qwen2; strong open-source tool-calling in its size class
+- Quantization: GGUF Q4_K_M (BF16 compute on the GPU)
