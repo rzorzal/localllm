@@ -31,6 +31,9 @@ tray-icon = { version = "0.24", default-features = false }
 tao = { version = "0.35", default-features = false }
 png = "0.17"  # encode the generated icon to PNG for the .app .icns
 
+[dev-dependencies]
+wiremock = "0.6"
+
 [profile.release]
 lto = true
 codegen-units = 1
