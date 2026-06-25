@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::sse::{Event, Sse},
     routing::{get, post},
@@ -131,11 +131,15 @@ pub fn router(
         policy,
         local_ctx_window,
     });
+    // Large prompts must reach the routing layer to be forwarded to cloud;
+    // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
+    // axum's default is 2 MB, which would reject them with 413 before routing.
     Router::new()
         .route("/v1/chat/completions", post(handle_oai_chat))
         .route("/v1/messages", post(handle_anth_messages))
         .route("/v1/models", get(handle_models))
         .route("/health", get(handle_health))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
 

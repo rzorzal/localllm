@@ -130,6 +130,43 @@ async fn overflow_request_routes_to_cloud() {
     std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
 }
 
+/// A body larger than 2 MB (axum's old default limit) must still reach the
+/// routing layer and be forwarded to cloud when it overflows the local window.
+/// This is a regression test for the DefaultBodyLimit raise: before the fix a
+/// body >2 MB would be rejected with 413 before routing ran at all.
+#[tokio::test]
+async fn large_over_2mb_request_routes_to_cloud() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"routed":"cloud"}"#))
+        .mount(&server)
+        .await;
+    std::env::set_var("LOCALLLM_ANTHROPIC_BASE", server.uri());
+
+    // 3 MB of content — well above the 2 MB default limit axum would have
+    // previously enforced, and ~750 000 est. tokens (far over the 1 000-token
+    // test window), so routing must choose Cloud.
+    let big = "x".repeat(3_000_000);
+    let body = format!(
+        r#"{{"model":"claude","max_tokens":256,"messages":[{{"role":"user","content":"{big}"}}]}}"#
+    );
+    let resp = localllm::axum_test_request_with_header(
+        localllm::router_for_test(),
+        "/v1/messages",
+        &body,
+        "x-api-key",
+        "sk-test",
+    )
+    .await;
+    assert_eq!(resp["routed"], "cloud");
+
+    std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
+}
+
 /// Overflow WITHOUT a credential must NOT hit cloud; it falls through to the
 /// local path (which here returns FakeGen's tool_use rather than erroring,
 /// because FakeGen ignores prompt size).

@@ -54,6 +54,9 @@ pub enum Decision {
 /// Phase A implements only the hard context-size gate. Difficulty scoring and
 /// cascade are added in Phase B; in-window requests therefore return `Local`.
 pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
+    // Phase A: gate on prompt_tokens only; request's max_tokens output reservation
+    // is intentionally ignored here — conservative ctx_gate_frac + the over-window
+    // backstop cover it; output-reservation accounting is deferred to Phase B.
     let over_window =
         s.prompt_tokens as f64 > s.local_ctx_window as f64 * p.ctx_gate_frac;
     if over_window {

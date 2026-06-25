@@ -74,7 +74,7 @@ pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> Re
                 .status(502)
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
-                    serde_json::json!({"error": format!("cloud forward failed: {e}")})
+                    serde_json::json!({"error": "cloud upstream request failed"})
                         .to_string(),
                 ))
                 .unwrap();
