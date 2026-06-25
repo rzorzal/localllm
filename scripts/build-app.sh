@@ -74,30 +74,21 @@ rm -f "$ICONSET/icon_64x64.png" "$ICONSET/icon_1024x1024.png"
 iconutil -c icns "$ICONSET" -o "$RESOURCES_DIR/AppIcon.icns"
 echo "    icon: $RESOURCES_DIR/AppIcon.icns"
 
-# Create a tiny shell launcher (CFBundleExecutable) that execs the real binary
-# with --tray prepended to any extra args.
-# This is the simplest way to default the .app to tray mode without changing
-# the binary's own default (so headless CLI usage is unaffected).
-LAUNCHER="$MACOS_DIR/${APP_NAME}-launch"
-cat > "$LAUNCHER" << 'LAUNCHER_EOF'
-#!/bin/sh
-# localllm-launch — launcher script for localllm.app
-# Executes the real binary with --tray so the .app runs as a background agent.
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/localllm" --tray "$@"
-LAUNCHER_EOF
-chmod +x "$LAUNCHER"
+# NOTE: CFBundleExecutable is the REAL binary (not a shell wrapper). A shell
+# launcher that exec's the binary breaks NSStatusItem registration with the
+# WindowServer, so the menu-bar icon never appears. The binary auto-enables
+# tray mode when launched from a bundle (it detects __CFBundleIdentifier).
 
 # Write Info.plist
 # LSUIElement=true → background agent: no Dock icon, no app menu, no terminal.
-# CFBundleExecutable → the launcher script (not the binary directly).
+# CFBundleExecutable → the binary directly (so the app registers properly).
 cat > "$CONTENTS/Info.plist" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>${APP_NAME}-launch</string>
+    <string>${APP_NAME}</string>
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundleName</key>
@@ -136,4 +127,4 @@ find "$APP_OUT" -not -path "*/\.*" | sort | sed "s|$REPO_ROOT/||"
 echo ""
 echo "==> SUCCESS: $APP_OUT"
 echo "    Double-click to launch as menu-bar app (no Dock, no terminal)."
-echo "    LSUIElement=true  CFBundleExecutable=${APP_NAME}-launch (passes --tray)"
+echo "    LSUIElement=true  CFBundleExecutable=${APP_NAME} (auto tray via __CFBundleIdentifier)"

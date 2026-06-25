@@ -106,10 +106,17 @@ fn main() -> anyhow::Result<()> {
 
     // --- Tray mode (macOS only): server on background thread,
     //     AppKit event loop on the main thread. ---
+    // Enable tray mode if --tray is passed OR we were launched from a .app
+    // bundle (launchd sets __CFBundleIdentifier). Launching as the bundle's
+    // direct executable (not via a shell wrapper) is required for the
+    // NSStatusItem to register with the WindowServer.
     #[cfg(target_os = "macos")]
-    if args.tray {
-        // run_tray() is `-> !` (exits via process::exit on Quit).
-        localllm::tray::macos::run_tray(args.config);
+    {
+        let from_bundle = std::env::var_os("__CFBundleIdentifier").is_some();
+        if args.tray || from_bundle {
+            // run_tray() is `-> !` (exits via process::exit on Quit).
+            localllm::tray::macos::run_tray(args.config);
+        }
     }
 
     // --- Headless mode (default) ---
