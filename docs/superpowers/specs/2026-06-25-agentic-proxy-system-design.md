@@ -29,44 +29,74 @@ This project attacks both bottlenecks, in research-backed phases:
 - MoE + expert offload (PowerInfer, LLM-in-a-Flash, HOBBIT, FlashMoE) runs
   big-quality models in limited RAM by keeping only hot experts resident.
 
+## Distribution constraint (drives every decision): plug-and-play
+
+The end product ships as a **single Rust executable** for **non-technical users**.
+They cannot install dependencies, toolchains, or CLIs. Therefore:
+
+- **One self-contained binary.** No external `llama-server`, no Homebrew, no
+  Python/`hf` CLI, no Xcode at run time.
+- **Metal shaders compiled at build time** and baked into the binary — only the
+  *developer* needs the Metal toolchain; users get a ready binary.
+- **Model auto-downloads in-process** on first run over HTTPS (no `hf` CLI).
+- **Zero-config start:** double-click / run, it serves on localhost.
+
+This rules out proxying to an external `llama-server` process. The engine must be
+**embedded in-process**.
+
 ## Architecture
 
-`localllm` becomes a transparent **proxy** in front of `llama-server`:
+`localllm` is a single Rust binary that embeds the inference engine and exposes
+the dual API:
 
 ```
 Claude Code / Codex / curl
         │  Anthropic or OpenAI API
         ▼
-  localllm proxy  (our existing Rust crate: dual-API translation,
-        │          per-request logging, buffered streaming)
-        │   + NEW: prefix freezing, Tscg, tool-gating, prewarm
-        ▼  OpenAI API (localhost)
-  llama-server  (llama.cpp: inference, KV persistence, MoE expert offload)
+  localllm  (one Rust binary)
+        │   • dual-API translation, per-request logging, buffered streaming  [done]
+        │   • NEW: prefix freezing, Tscg, tool-gating, prewarm
+        │   • embedded engine ↓
         ▼
-  GGUF model (dense 3B now → MoE later)
+  llama.cpp via the `llama-cpp-2` crate  (in-process)
+        │   • inference + Metal (shaders baked at build)
+        │   • KV state save/load to disk  (llama_state_seq_save_file)
+        │   • MoE expert offload
+        ▼
+  GGUF model (dense 3B now → MoE later), auto-downloaded on first run
 ```
 
-Why a proxy (not embed): preserves all current translation/logging/streaming
-work; gains llama.cpp's KV-save + MoE offload without reimplementing them; clean
-process boundary. The current embedded-mistralrs engine path is retained behind a
-flag for the no-llama-server case until the proxy path is proven.
+Why embed llama.cpp (`llama-cpp-2`) instead of mistralrs or an external server:
+- Single binary (plug-and-play) — unlike an external `llama-server`.
+- Exposes **KV state save/load to disk** (the persistence mistralrs lacks) — the
+  core mechanism for the prefill cure.
+- MoE expert offload and Metal, compiled into the binary.
+
+The current mistralrs engine is kept behind a feature flag as a fallback until the
+llama-cpp backend is proven, then retired.
 
 ## Phased milestones (each independently shippable)
 
-### Phase 1 — Tool-schema compression (Tscg) in the proxy
+> Reordered from first draft: the llama-server backend is the **foundation** (it
+> provides KV reuse/prewarm — the timeout cure — and the prompt-serialization
+> control that Tscg needs), so it goes first.
+
+### Phase 1 — Embedded llama.cpp engine + static-prefix prewarm  (FOUNDATION)
+Add a `llama-cpp-2`-backed engine in-process, behind the existing `Generator`
+trait, so the dual-API/logging/streaming layer is unchanged. Auto-download the
+GGUF on first run. On startup the engine **prewarms** the static prefix and uses
+llama.cpp's KV state save/load + prefix reuse so each turn only prefills the small
+delta.
+- Acceptance: single binary runs with no external deps; model auto-downloads;
+  after prewarm a Claude-Code-shaped request returns first token in ≤ a few
+  seconds (not minutes); measured TTFT before/after prewarm reported.
+
+### Phase 2 — Tool-schema compression (Tscg)
 Deterministic, lossless compression of the incoming JSON tool schemas before they
-reach the model. Target ~45–50% token reduction on the tools block.
-- Pure proxy logic; no engine change.
+reach llama-server (now that the proxy controls serialization). Target ~45–50%
+token reduction on the tools block.
 - Acceptance: a request with N tools has its serialized tool tokens cut ~half;
   tool-calling acceptance scripts still pass (compression is lossless).
-
-### Phase 2 — llama-server backend + static-prefix prewarm
-Run `llama-server` as the inference engine; the proxy forwards to it. On startup
-(or first observed Claude Code prefix), the proxy **prewarms** the static prefix
-KV in the background and relies on `--cache-reuse` / `--slot-save-path` so each
-turn only prefills the small delta.
-- Acceptance: after prewarm, a Claude-Code-shaped request returns first token in
-  ≤ a few seconds (not minutes); measured TTFT before/after prewarm reported.
 
 ### Phase 3 — MoE model + expert offload
 Switch the default model to an MoE (candidate: Qwen3-30B-A3B, ~3B active) loaded
