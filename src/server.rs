@@ -62,6 +62,48 @@ fn route_decision(
     crate::route::decide(&signals, &policy)
 }
 
+/// Bridge a local generation result into the cascade decision.
+///
+/// - `Ok(result)` and (cascade off OR result is strong) → returns `Ok(result)`;
+///   the caller proceeds with the local result as before.
+/// - `Ok(result)` weak (length-truncated) AND `want_cascade` → escalates: returns
+///   `Err(cloud forward response)` which the caller returns directly.
+/// - `Err(gen error)` → if `want_cascade`, escalate to cloud; otherwise return
+///   `Err(500)`.
+///
+/// Consumes `raw` (the original request bytes) because escalation reverse-proxies
+/// it. Only ever called on the buffered/non-stream paths — never mid-stream.
+async fn cascade_or_result(
+    want_cascade: bool,
+    gen_result: anyhow::Result<ChatResult>,
+    provider: crate::cloud::Provider,
+    headers: &HeaderMap,
+    raw: Bytes,
+    rid: &str,
+    api: &str,
+) -> Result<ChatResult, axum::response::Response> {
+    use axum::response::IntoResponse;
+    match gen_result {
+        Ok(result) => {
+            if want_cascade && crate::route::is_weak_result(&result) {
+                tracing::info!(target: "localllm::req", "{rid} [{api}] cascade: weak local (length) → escalating to cloud");
+                Err(crate::cloud::forward(provider, headers, raw).await)
+            } else {
+                Ok(result)
+            }
+        }
+        Err(e) => {
+            if want_cascade {
+                tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade: local generate failed ({e}) → escalating to cloud");
+                Err(crate::cloud::forward(provider, headers, raw).await)
+            } else {
+                tracing::error!(target: "localllm::req", "{rid} [{api}] 500 generate: {e}");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response())
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Generator trait — decouples HTTP handlers from the real Engine
 // ---------------------------------------------------------------------------
@@ -177,17 +219,19 @@ async fn handle_oai_chat(
         }
     };
 
-    // --- Routing decision (Phase A: context-size gate only) ---
-    match route_decision(&state, &internal, &headers) {
+    // --- Routing decision ---
+    let want_cascade = match route_decision(&state, &internal, &headers) {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
             return crate::cloud::forward(crate::cloud::Provider::OpenAI, &headers, raw).await;
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [openai] route=local (cloud wanted but no creds/disallowed)");
+            false
         }
-        _ => {}
-    }
+        crate::route::Decision::LocalThenCascade => true,
+        crate::route::Decision::Local => false,
+    };
 
     let (n_msgs, n_tools) = request_summary(&internal);
     tracing::info!(target: "localllm::req", "{rid} [openai] start: model={model} msgs={n_msgs} tools={n_tools} stream={stream_flag}");
@@ -198,12 +242,17 @@ async fn handle_oai_chat(
         // the tested non-streaming tool-call path) then replayed as SSE chunks.
         // Incremental streaming cannot frame tool_calls safely.
         let id = format!("chatcmpl-{}", Uuid::new_v4());
-        let result = match state.gen.generate(internal).await {
+        let result = match cascade_or_result(
+            want_cascade,
+            state.gen.generate(internal).await,
+            crate::cloud::Provider::OpenAI,
+            &headers,
+            raw,
+            &rid,
+            "openai",
+        ).await {
             Ok(r) => r,
-            Err(e) => {
-                tracing::error!(target: "localllm::req", "{rid} [openai] 500 generate (buffered stream): {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-            }
+            Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
@@ -270,15 +319,17 @@ async fn handle_oai_chat(
         Sse::new(sse_stream).into_response()
     } else {
         // Non-streaming path
-        let result = match state.gen.generate(internal).await {
+        let result = match cascade_or_result(
+            want_cascade,
+            state.gen.generate(internal).await,
+            crate::cloud::Provider::OpenAI,
+            &headers,
+            raw,
+            &rid,
+            "openai",
+        ).await {
             Ok(r) => r,
-            Err(e) => {
-                tracing::error!(target: "localllm::req", "{rid} [openai] 500 generate: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                ).into_response();
-            }
+            Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
@@ -317,17 +368,19 @@ async fn handle_anth_messages(
         }
     };
 
-    // --- Routing decision (Phase A: context-size gate only) ---
-    match route_decision(&state, &internal, &headers) {
+    // --- Routing decision ---
+    let want_cascade = match route_decision(&state, &internal, &headers) {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
             return crate::cloud::forward(crate::cloud::Provider::Anthropic, &headers, raw).await;
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [anthropic] route=local (cloud wanted but no creds/disallowed)");
+            false
         }
-        _ => {}
-    }
+        crate::route::Decision::LocalThenCascade => true,
+        crate::route::Decision::Local => false,
+    };
 
     let (n_msgs, n_tools) = request_summary(&internal);
     tracing::info!(target: "localllm::req", "{rid} [anthropic] start: model={model} msgs={n_msgs} tools={n_tools} stream={stream_flag}");
@@ -337,12 +390,17 @@ async fn handle_anth_messages(
         // Buffered streaming: tool-bearing requests (e.g. every Claude Code turn)
         // are generated fully then replayed as a correct tool_use/text SSE
         // sequence. Incremental streaming cannot frame tool_use blocks safely.
-        let result = match state.gen.generate(internal).await {
+        let result = match cascade_or_result(
+            want_cascade,
+            state.gen.generate(internal).await,
+            crate::cloud::Provider::Anthropic,
+            &headers,
+            raw,
+            &rid,
+            "anthropic",
+        ).await {
             Ok(r) => r,
-            Err(e) => {
-                tracing::error!(target: "localllm::req", "{rid} [anthropic] 500 generate (buffered stream): {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-            }
+            Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
@@ -410,15 +468,17 @@ async fn handle_anth_messages(
         Sse::new(sse_stream).into_response()
     } else {
         // Non-streaming path
-        let result = match state.gen.generate(internal).await {
+        let result = match cascade_or_result(
+            want_cascade,
+            state.gen.generate(internal).await,
+            crate::cloud::Provider::Anthropic,
+            &headers,
+            raw,
+            &rid,
+            "anthropic",
+        ).await {
             Ok(r) => r,
-            Err(e) => {
-                tracing::error!(target: "localllm::req", "{rid} [anthropic] 500 generate: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                ).into_response();
-            }
+            Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };

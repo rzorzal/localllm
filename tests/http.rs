@@ -179,3 +179,54 @@ async fn overflow_request_without_key_stays_local() {
     let resp = localllm::axum_test_request(localllm::router_for_test(), "/v1/messages", &body).await;
     assert_eq!(resp["stop_reason"], "tool_use");
 }
+
+/// In-window request with a credential under a cascade profile (SaveTokens):
+/// the local model returns a length-truncated (weak) result, so the router
+/// escalates to the cloud upstream and returns the cloud response.
+#[tokio::test]
+async fn weak_local_with_cascade_escalates_to_cloud() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"routed":"cloud"}"#))
+        .mount(&server)
+        .await;
+    std::env::set_var("LOCALLLM_ANTHROPIC_BASE", server.uri());
+
+    // Small in-window prompt → decide() = LocalThenCascade (SaveTokens, creds present).
+    let body = r#"{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}"#;
+    let app = localllm::router_for_test_with(
+        std::sync::Arc::new(localllm::FakeGenWeak),
+        localllm::route::Profile::SaveTokens.policy(),
+        1000,
+    );
+    let resp =
+        localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test")
+            .await;
+    assert_eq!(resp["routed"], "cloud");
+
+    std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
+}
+
+/// Trivial in-window request with a credential under MaxQuality (cascade=false,
+/// but trivial score stays under the 0.2 threshold → plain Local). A weak local
+/// result must NOT escalate; the local answer is returned as-is.
+#[tokio::test]
+async fn weak_local_without_cascade_stays_local() {
+    let body = r#"{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}"#;
+    let app = localllm::router_for_test_with(
+        std::sync::Arc::new(localllm::FakeGenWeak),
+        localllm::route::Profile::MaxQuality.policy(),
+        1000,
+    );
+    let resp =
+        localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test")
+            .await;
+    // Anthropic maps FinishReason::Length → stop_reason "max_tokens"; the local
+    // weak text is returned (no cloud escalation).
+    assert_eq!(resp["content"][0]["text"], "local-weak-answer");
+    assert_eq!(resp["stop_reason"], "max_tokens");
+}

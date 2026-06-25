@@ -121,13 +121,52 @@ impl Generator for FakeGen {
     }
 }
 
-/// Build a test router wired to `FakeGen`, a fixed model id, the default
-/// (SaveTokens) policy, and a small context window so the ctx gate is testable.
+/// A fake generator that always returns a length-truncated text answer.
+/// Used to exercise the cascade path (weak local result → escalate to cloud).
+pub struct FakeGenWeak;
+
+#[async_trait::async_trait]
+impl Generator for FakeGenWeak {
+    async fn generate(&self, _req: crate::api::common::ChatRequest) -> anyhow::Result<ChatResult> {
+        Ok(ChatResult {
+            content: vec![ContentPart::Text("local-weak-answer".to_string())],
+            finish_reason: FinishReason::Length,
+            prompt_tokens: 5,
+            completion_tokens: 5,
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _req: crate::api::common::ChatRequest,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
+        let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
+            Ok(StreamDelta { text: Some("local-weak-answer".into()), done: false, finish_reason: None }),
+            Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Length) }),
+        ];
+        Ok(Box::pin(futures::stream::iter(deltas)))
+    }
+}
+
+/// Build a test router with a custom generator, routing policy, and local
+/// context window. Lets tests drive specific routing/cascade decisions.
+pub fn router_for_test_with(
+    gen: Arc<dyn Generator>,
+    policy: crate::route::RoutingPolicy,
+    local_ctx_window: usize,
+) -> Router {
+    let policy = Arc::new(std::sync::RwLock::new(policy));
+    crate::server::router(gen, "test-model".to_string(), policy, local_ctx_window)
+}
+
+/// Build a test router wired to `FakeGen`, the default (SaveTokens) policy, and
+/// a small context window so the ctx gate is testable.
 pub fn router_for_test() -> Router {
-    let policy = Arc::new(std::sync::RwLock::new(
+    router_for_test_with(
+        Arc::new(FakeGen),
         crate::route::Profile::default().policy(),
-    ));
-    crate::server::router(Arc::new(FakeGen), "test-model".to_string(), policy, 1000)
+        1000,
+    )
 }
 
 /// Send a POST with a JSON body to `path` on `app` and return the parsed

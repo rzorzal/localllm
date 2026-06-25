@@ -104,6 +104,13 @@ pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
     }
 }
 
+/// Whether a local result is "weak" enough to escalate to cloud. A length
+/// truncation means the local model hit its token budget mid-answer — a strong
+/// signal it under-served the request. (Logprob/judge confidence is future work.)
+pub fn is_weak_result(r: &crate::api::common::ChatResult) -> bool {
+    r.finish_reason == crate::api::common::FinishReason::Length
+}
+
 /// Estimate the prompt token count with a cheap `chars / 4` heuristic over all
 /// message text, tool-call arguments, tool-result content, and tool schemas.
 /// Conservative and good enough for the context gate; an exact local tokenizer
@@ -253,5 +260,19 @@ mod tests {
             model: "m".into(),
         };
         assert_eq!(estimate_prompt_tokens(&req), 100);
+    }
+
+    #[test]
+    fn weak_result_is_only_length_truncation() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason};
+        let mk = |fr| ChatResult {
+            content: vec![ContentPart::Text("x".into())],
+            finish_reason: fr,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        assert!(is_weak_result(&mk(FinishReason::Length)));
+        assert!(!is_weak_result(&mk(FinishReason::Stop)));
+        assert!(!is_weak_result(&mk(FinishReason::ToolCalls)));
     }
 }
