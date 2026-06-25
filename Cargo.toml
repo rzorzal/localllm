@@ -20,6 +20,9 @@ tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
 llama-cpp-2 = { version = "0.1.150", features = ["metal"] }
 encoding_rs = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+dirs = "5"
+futures-util = "0.3"
 
 [profile.release]
 lto = true
