@@ -18,6 +18,8 @@ uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
+llama-cpp-2 = { version = "0.1.150", features = ["metal"] }
+encoding_rs = "0.8"
 
 [profile.release]
 lto = true
