@@ -49,14 +49,32 @@ pub enum Decision {
     LocalNoCreds,
 }
 
+/// Cheap pre-generation difficulty score in `[0.0, 1.0]`. Higher means the
+/// request is harder/bigger and more likely to need the cloud model.
+///
+/// Transparent heuristic blend (weights sum to 1.0); context fill dominates:
+/// - context fill: how full the local window is (prompt_tokens / window)
+/// - tool load: tool count, saturating at 12 (agentic complexity)
+/// - depth: message count, saturating at 20 (long multi-turn is harder)
+///
+/// A learned router could replace this later; the `decide` interface is unchanged.
+pub fn difficulty_score(s: &Signals) -> f64 {
+    let ctx_fill = if s.local_ctx_window == 0 {
+        1.0
+    } else {
+        (s.prompt_tokens as f64 / s.local_ctx_window as f64).min(1.0)
+    };
+    let tool_load = (s.n_tools as f64 / 12.0).min(1.0);
+    let depth = (s.n_messages as f64 / 20.0).min(1.0);
+    0.6 * ctx_fill + 0.25 * tool_load + 0.15 * depth
+}
+
 /// Decide where a request runs from cheap signals and the active policy.
 ///
-/// Phase A implements only the hard context-size gate. Difficulty scoring and
-/// cascade are added in Phase B; in-window requests therefore return `Local`.
+/// Order: (1) hard context gate, (2) cloud-impossible shortcut, (3) difficulty
+/// score vs the profile threshold, (4) in-window low-score → cascade or local.
 pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
-    // Phase A: gate on prompt_tokens only; request's max_tokens output reservation
-    // is intentionally ignored here — conservative ctx_gate_frac + the over-window
-    // backstop cover it; output-reservation accounting is deferred to Phase B.
+    // 1. Hard context gate: prompt too big for the local window.
     let over_window =
         s.prompt_tokens as f64 > s.local_ctx_window as f64 * p.ctx_gate_frac;
     if over_window {
@@ -65,7 +83,25 @@ pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
         }
         return Decision::LocalNoCreds;
     }
-    Decision::Local
+
+    // 2. Cloud impossible (profile forbids it or no credential to forward) → local.
+    if !p.allow_cloud || !s.has_cloud_creds {
+        return Decision::Local;
+    }
+
+    // 3. Difficulty above the profile threshold → cloud now.
+    //    (MaxQuality's low threshold makes this cloud-first; trivial requests
+    //     still score below it and stay local.)
+    if difficulty_score(s) > p.escalation_threshold {
+        return Decision::Cloud(RouteReason::Difficulty);
+    }
+
+    // 4. In-window, below threshold: local, with cascade fallback when enabled.
+    if p.cascade {
+        Decision::LocalThenCascade
+    } else {
+        Decision::Local
+    }
 }
 
 /// Estimate the prompt token count with a cheap `chars / 4` heuristic over all
@@ -111,8 +147,74 @@ mod tests {
     }
 
     #[test]
-    fn under_window_stays_local() {
-        assert_eq!(decide(&sig(100, true, 1000), &pol()), Decision::Local);
+    fn under_window_with_creds_and_cascade_returns_local_then_cascade() {
+        // SaveTokens has cascade=true and a high threshold; a tiny in-window
+        // request scores well below it, so it serves local with cascade fallback.
+        assert_eq!(
+            decide(&sig(100, true, 1000), &pol()),
+            Decision::LocalThenCascade
+        );
+    }
+
+    #[test]
+    fn under_window_without_creds_is_plain_local() {
+        // No credential to forward → cannot cascade → plain Local.
+        assert_eq!(decide(&sig(100, false, 1000), &pol()), Decision::Local);
+    }
+
+    #[test]
+    fn high_difficulty_in_window_routes_cloud() {
+        // Balanced threshold 0.6; a nearly-full window pushes the score over it.
+        let p = Profile::Balanced.policy();
+        // 850/1000 = 0.85 ctx fill (under the 0.9 ctx_gate, so NOT overflow),
+        // score = 0.6*0.85 = 0.51 from ctx alone; add tools to clear 0.6.
+        let s = Signals {
+            prompt_tokens: 850,
+            local_ctx_window: 1000,
+            n_tools: 12,
+            n_messages: 1,
+            has_cloud_creds: true,
+        };
+        assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::Difficulty));
+    }
+
+    #[test]
+    fn max_quality_routes_nontrivial_to_cloud() {
+        // MaxQuality threshold 0.2; a modest request clears it.
+        let p = Profile::MaxQuality.policy();
+        let s = Signals {
+            prompt_tokens: 400,
+            local_ctx_window: 1000,
+            n_tools: 0,
+            n_messages: 1,
+            has_cloud_creds: true,
+        };
+        // ctx_fill 0.4 → 0.6*0.4 = 0.24 > 0.2 → cloud.
+        assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::Difficulty));
+    }
+
+    #[test]
+    fn max_quality_keeps_trivial_local_no_cascade() {
+        // Trivial request scores under 0.2; MaxQuality has cascade=false → plain Local.
+        let p = Profile::MaxQuality.policy();
+        assert_eq!(decide(&sig(50, true, 1000), &p), Decision::Local);
+    }
+
+    #[test]
+    fn difficulty_score_is_low_for_trivial_and_high_for_full() {
+        let trivial = Signals {
+            prompt_tokens: 10, local_ctx_window: 1000, n_tools: 0,
+            n_messages: 1, has_cloud_creds: true,
+        };
+        let full = Signals {
+            prompt_tokens: 1000, local_ctx_window: 1000, n_tools: 12,
+            n_messages: 20, has_cloud_creds: true,
+        };
+        assert!(difficulty_score(&trivial) < 0.1);
+        assert!(difficulty_score(&full) > 0.95);
+        // monotonic in tool count
+        let more_tools = Signals { n_tools: 6, ..trivial };
+        assert!(difficulty_score(&more_tools) > difficulty_score(&trivial));
     }
 
     #[test]
