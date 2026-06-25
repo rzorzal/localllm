@@ -1,16 +1,24 @@
 //! llama.cpp inference engine via `llama-cpp-2`.
 //!
-//! # Architecture
+//! # Architecture — Persistent Single-Context Worker Thread
 //!
-//! `LlamaEngine` wraps a `LlamaModel` (behind `Arc`) and a `Mutex<LlamaBackend>`.
+//! ## The Metal multi-context problem
+//! On Apple Silicon (Metal), `ggml` compiles its shader library when the first
+//! `LlamaContext` is created. Creating a SECOND context in the same process
+//! causes a Metal shader redefinition error:
+//!   `NSError code 3: program_source: error: redefinition of 'as_bits' / 'fp8_e4m3_to_float'`
+//! This makes every request after the first fail.
 //!
-//! ## Why a per-call context?
-//! `LlamaContext<'_>` borrows from `LlamaModel` and is therefore NOT `'static`.
-//! It also does not implement `Send`. To satisfy the `Generator` trait
-//! (`Send + Sync`, `async fn generate`) we create a fresh `LlamaContext` inside
-//! each `generate` call. This avoids any lifetime or Send issues at the cost of
-//! re-allocating the KV-cache per request — acceptable for a local single-user
-//! server. A `Mutex<()>` serializes inference calls (only one at a time).
+//! ## Fix: one persistent context, owned by a dedicated OS thread
+//! `LlamaContext<'_>` borrows `LlamaModel` and is `!Send`, so it cannot live
+//! in an async struct directly. We solve this with a **dedicated OS thread**
+//! that owns `LlamaBackend` + `LlamaModel` + ONE `LlamaContext` for the whole
+//! process lifetime, and processes requests from a `std::sync::mpsc` channel.
+//!
+//! The async `LlamaEngine` holds only the channel sender (which IS `Send+Sync`).
+//!
+//! Between every request, `ctx.clear_kv_cache()` is called so requests do not
+//! bleed into each other.
 //!
 //! ## Prompt building with tools
 //! `llama-cpp-2::model::apply_chat_template` accepts only `[LlamaChatMessage]`
@@ -27,18 +35,13 @@
 //! To call: <tool_call>{"name":"...","arguments":{...}}</tool_call>
 //! ```
 //!
-//! For the overall ChatML framing we use the model's built-in chat template
-//! (retrieved via `model.chat_template(None)`), which is Qwen2.5's standard
-//! ChatML template. We pass the serialized tool section as part of the system
-//! message content.
-//!
 //! ## Tool-call output parsing
 //! Qwen2.5 emits tool calls as `<tool_call>{json}</tool_call>`. After
 //! generation we scan for these blocks and parse each into a `ContentPart::Call`.
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc as std_mpsc;
 
 use anyhow::{Context, Result};
 use futures::stream::BoxStream;
@@ -57,31 +60,46 @@ use crate::api::common::{
 use crate::server::Generator;
 
 // ---------------------------------------------------------------------------
+// Job enum — requests sent to the worker thread
+// ---------------------------------------------------------------------------
+
+/// A request sent from async callers to the persistent worker thread.
+enum Job {
+    /// Non-streaming: generate the full output and return via oneshot.
+    Generate {
+        req: ChatRequest,
+        reply: tokio::sync::oneshot::Sender<Result<ChatResult>>,
+    },
+    /// Streaming: send one `StreamDelta` per decoded piece through the mpsc channel.
+    Stream {
+        req: ChatRequest,
+        reply: tokio::sync::mpsc::Sender<Result<StreamDelta>>,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // LlamaEngine
 // ---------------------------------------------------------------------------
 
 /// llama.cpp inference engine. Implements `Generator` for use in the HTTP server.
+///
+/// Internally, all inference runs on a dedicated OS thread that owns the single
+/// `LlamaContext`. This struct holds only the channel sender used to dispatch
+/// jobs to that thread.
 pub struct LlamaEngine {
-    /// The loaded model — `LlamaModel` is `Send + Sync` (unsafe impls in llama-cpp-2).
-    model: Arc<LlamaModel>,
-    /// The backend — must outlive the context. Wrapped in Arc so it can be
-    /// moved into `spawn_blocking`.
-    backend: Arc<LlamaBackend>,
-    /// Serializes concurrent inference calls. llama.cpp's context is not
-    /// thread-safe; the Mutex ensures only one generate runs at a time.
-    _inference_lock: Arc<Mutex<()>>,
-    /// Context window in tokens.
-    ctx_len: u32,
+    /// Channel sender to the worker thread. `std_mpsc::SyncSender` is `Send+Sync`.
+    tx: std_mpsc::SyncSender<Job>,
 }
 
-// Safety: LlamaModel is Send+Sync (as declared in llama-cpp-2/src/model.rs).
-// LlamaBackend holds a process-wide singleton — safe to share.
+// SyncSender<Job> is Send+Sync (Job itself need not be Send because we only
+// ever send it from async tasks, but SyncSender requires T: Send).
+// Job contains ChatRequest (Send) and tokio channel senders (Send), so this is fine.
 unsafe impl Send for LlamaEngine {}
 unsafe impl Sync for LlamaEngine {}
 
 impl LlamaEngine {
-    /// Load a GGUF model from HuggingFace (or local cache) and return a
-    /// ready-to-use `LlamaEngine`.
+    /// Load a GGUF model from HuggingFace (or local cache), spawn the persistent
+    /// worker thread, and return a ready-to-use `LlamaEngine`.
     ///
     /// `model_id` – HF repo ID, e.g. `"Qwen/Qwen2.5-3B-Instruct-GGUF"`.
     /// `gguf_files` – GGUF filename(s) within the repo.
@@ -98,123 +116,227 @@ impl LlamaEngine {
             .next()
             .context("ensure_model returned no paths")?;
 
-        // Load backend + model in a blocking thread — llama.cpp init blocks.
         let ctx_len_u32 = u32::try_from(ctx_len).unwrap_or(u32::MAX);
 
-        let (backend, model) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let backend = LlamaBackend::init().context("LlamaBackend::init failed")?;
+        // Channel for sending jobs to the worker thread.
+        // Bound of 4: limits queue depth (we process one at a time anyway).
+        let (tx, rx) = std_mpsc::sync_channel::<Job>(4);
 
-            let model_params = LlamaModelParams::default()
-                .with_n_gpu_layers(u32::MAX); // offload all layers to Metal
+        // Oneshot to receive the load result back from the worker thread.
+        let (load_tx, load_rx) = tokio::sync::oneshot::channel::<Result<()>>();
 
-            let model = LlamaModel::load_from_file(&backend, &path, &model_params)
-                .context("LlamaModel::load_from_file failed")?;
+        // Spawn the persistent worker thread. It owns backend + model + context.
+        std::thread::spawn(move || {
+            worker_thread(path, ctx_len_u32, rx, load_tx);
+        });
 
-            Ok((backend, model))
-        })
-        .await
-        .context("spawn_blocking panicked")??;
+        // Wait for the worker to signal successful model load (or an error).
+        load_rx
+            .await
+            .context("worker thread dropped load channel without signalling")??;
 
-        Ok(LlamaEngine {
-            model: Arc::new(model),
-            backend: Arc::new(backend),
-            _inference_lock: Arc::new(Mutex::new(())),
-            ctx_len: ctx_len_u32,
-        })
+        Ok(LlamaEngine { tx })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker thread
+// ---------------------------------------------------------------------------
+
+/// The persistent worker thread. Owns `LlamaBackend`, `LlamaModel`, and ONE
+/// `LlamaContext` for the entire process lifetime.
+///
+/// Signals model-load success/failure via `load_tx`, then loops processing `Job`s.
+fn worker_thread(
+    model_path: PathBuf,
+    ctx_len: u32,
+    rx: std_mpsc::Receiver<Job>,
+    load_tx: tokio::sync::oneshot::Sender<Result<()>>,
+) {
+    // --- Init backend ---
+    let backend = match LlamaBackend::init().context("LlamaBackend::init failed") {
+        Ok(b) => b,
+        Err(e) => { let _ = load_tx.send(Err(e)); return; }
+    };
+
+    // --- Load model ---
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
+    let model = match LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        .context("LlamaModel::load_from_file failed")
+    {
+        Ok(m) => m,
+        Err(e) => { let _ = load_tx.send(Err(e)); return; }
+    };
+
+    // --- Create the ONE persistent context ---
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(ctx_len));
+    let mut ctx = match model.new_context(&backend, ctx_params)
+        .context("new_context failed")
+    {
+        Ok(c) => c,
+        Err(e) => { let _ = load_tx.send(Err(e)); return; }
+    };
+
+    // Signal successful load.
+    if load_tx.send(Ok(())).is_err() {
+        // Receiver already dropped; nothing to do.
+        return;
     }
 
-    /// Core inference routine, executed in a blocking thread.
-    fn generate_blocking(
-        model: Arc<LlamaModel>,
-        backend: Arc<LlamaBackend>,
-        req: ChatRequest,
-        ctx_len: u32,
-    ) -> Result<ChatResult> {
-        // --- Build prompt string ---
-        let prompt = build_prompt(&model, &req)?;
-        tracing::debug!(target: "localllm::llama", "prompt ({} chars):\n{}", prompt.len(), &prompt[..prompt.len().min(400)]);
+    // --- Job loop ---
+    while let Ok(job) = rx.recv() {
+        // Clear the KV cache before each request so requests don't bleed.
+        ctx.clear_kv_cache();
 
-        // --- Tokenize ---
-        let tokens = model
-            .str_to_token(&prompt, AddBos::Never) // chat template already includes BOS
-            .context("str_to_token failed")?;
-        let prompt_len = tokens.len();
-        tracing::debug!(target: "localllm::llama", "prompt tokens: {prompt_len}");
-
-        // --- Create context ---
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(ctx_len));
-        let mut ctx = model
-            .new_context(&backend, ctx_params)
-            .context("new_context failed")?;
-
-        // --- Prefill: add entire prompt as one batch ---
-        let n_tokens = tokens.len();
-        let mut batch = LlamaBatch::new(n_tokens.max(512), 1);
-        batch
-            .add_sequence(&tokens, 0, false)
-            .context("batch.add_sequence failed")?;
-        ctx.decode(&mut batch).context("ctx.decode (prefill) failed")?;
-        batch.clear();
-
-        // --- Sampler ---
-        let temperature = req.temperature.unwrap_or(0.7) as f32;
-        let mut sampler = if temperature < 0.01 {
-            LlamaSampler::chain_simple([LlamaSampler::greedy()])
-        } else {
-            LlamaSampler::chain_simple([
-                LlamaSampler::temp(temperature),
-                LlamaSampler::top_p(0.9, 1),
-                LlamaSampler::dist(42),
-            ])
-        };
-
-        // --- Generation loop ---
-        let max_new = req.max_tokens.unwrap_or(512);
-        let mut generated_tokens = 0usize;
-        let mut output = String::new();
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut last_idx = (n_tokens as i32) - 1; // logit index of last prefill token
-
-        loop {
-            let tok = sampler.sample(&ctx, last_idx);
-            sampler.accept(tok);
-            generated_tokens += 1;
-
-            if model.is_eog_token(tok) {
-                break;
+        match job {
+            Job::Generate { req, reply } => {
+                let mut output = String::new();
+                let result = run_decode_loop(
+                    &model,
+                    &mut ctx,
+                    &req,
+                    |piece| { output.push_str(&piece); true },
+                );
+                let chat_result = result.map(|(prompt_len, gen_tokens, hit_max)| {
+                    tracing::debug!(
+                        target: "localllm::llama",
+                        "generated {gen_tokens} tokens: {:?}",
+                        &output[..output.len().min(200)]
+                    );
+                    let (content, finish_reason) = parse_output(output, hit_max);
+                    ChatResult {
+                        content,
+                        finish_reason,
+                        prompt_tokens: prompt_len,
+                        completion_tokens: gen_tokens,
+                    }
+                });
+                let _ = reply.send(chat_result);
             }
 
-            let piece = model
-                .token_to_piece(tok, &mut decoder, true, None)
-                .unwrap_or_default();
-            output.push_str(&piece);
-
-            if generated_tokens >= max_new {
-                break;
+            Job::Stream { req, reply } => {
+                let reply_err = reply.clone();
+                let result = run_decode_loop(
+                    &model,
+                    &mut ctx,
+                    &req,
+                    |piece| {
+                        let delta = Ok(StreamDelta {
+                            text: Some(piece),
+                            done: false,
+                            finish_reason: None,
+                        });
+                        // blocking_send blocks if channel is full, returns Err if receiver dropped.
+                        reply.blocking_send(delta).is_ok()
+                    },
+                );
+                // Terminal delta.
+                match result {
+                    Ok((_, _, hit_max)) => {
+                        let finish_reason = if hit_max { FinishReason::Length } else { FinishReason::Stop };
+                        let _ = reply_err.blocking_send(Ok(StreamDelta {
+                            text: None,
+                            done: true,
+                            finish_reason: Some(finish_reason),
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = reply_err.blocking_send(Err(e));
+                    }
+                }
             }
+        }
+    }
+    // rx disconnected → process is shutting down. Worker exits cleanly.
+}
 
-            // Decode the single new token to get its logits.
-            batch.clear();
-            let pos = (n_tokens + generated_tokens - 1) as i32;
-            batch
-                .add(tok, pos, &[0_i32], true)
-                .context("batch.add failed")?;
-            ctx.decode(&mut batch).context("ctx.decode (step) failed")?;
-            last_idx = 0; // single-token batch → index 0
+// ---------------------------------------------------------------------------
+// Core decode loop (operates on existing context — no new_context call)
+// ---------------------------------------------------------------------------
+
+/// Core inference routine, executed on the persistent worker thread.
+///
+/// Operates on an existing `LlamaContext` (caller must clear KV cache first).
+/// Returns the prompt token count, the generated token count, and whether the
+/// generation hit the max-token limit.
+///
+/// `on_piece` is called for each decoded non-empty piece. Return `false` to abort.
+fn run_decode_loop(
+    model: &LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+    req: &ChatRequest,
+    mut on_piece: impl FnMut(String) -> bool,
+) -> Result<(usize /*prompt_tokens*/, usize /*generated*/, bool /*hit_max*/)> {
+    // --- Build prompt string ---
+    let prompt = build_prompt(model, req)?;
+    tracing::debug!(target: "localllm::llama", "prompt ({} chars):\n{}", prompt.len(), &prompt[..prompt.len().min(400)]);
+
+    // --- Tokenize ---
+    let tokens = model
+        .str_to_token(&prompt, AddBos::Never) // chat template already includes BOS
+        .context("str_to_token failed")?;
+    let prompt_len = tokens.len();
+    tracing::debug!(target: "localllm::llama", "prompt tokens: {prompt_len}");
+
+    // --- Prefill: add entire prompt as one batch ---
+    let n_tokens = tokens.len();
+    let mut batch = LlamaBatch::new(n_tokens.max(512), 1);
+    batch
+        .add_sequence(&tokens, 0, false)
+        .context("batch.add_sequence failed")?;
+    ctx.decode(&mut batch).context("ctx.decode (prefill) failed")?;
+    batch.clear();
+
+    // --- Sampler ---
+    let temperature = req.temperature.unwrap_or(0.7) as f32;
+    let mut sampler = if temperature < 0.01 {
+        LlamaSampler::chain_simple([LlamaSampler::greedy()])
+    } else {
+        LlamaSampler::chain_simple([
+            LlamaSampler::temp(temperature),
+            LlamaSampler::top_p(0.9, 1),
+            LlamaSampler::dist(42),
+        ])
+    };
+
+    // --- Generation loop ---
+    let max_new = req.max_tokens.unwrap_or(512);
+    let mut generated_tokens = 0usize;
+    // Single stateful UTF-8 decoder reused across all tokens (multi-byte safe).
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut last_idx = (n_tokens as i32) - 1; // logit index of last prefill token
+
+    loop {
+        let tok = sampler.sample(ctx, last_idx);
+        sampler.accept(tok);
+        generated_tokens += 1;
+
+        if model.is_eog_token(tok) {
+            return Ok((prompt_len, generated_tokens, false));
         }
 
-        tracing::debug!(target: "localllm::llama", "generated {generated_tokens} tokens: {:?}", &output[..output.len().min(200)]);
+        let piece = model
+            .token_to_piece(tok, &mut decoder, true, None)
+            .unwrap_or_default();
 
-        // --- Parse tool calls ---
-        let (content, finish_reason) = parse_output(output, generated_tokens >= max_new);
+        if !piece.is_empty() && !on_piece(piece) {
+            // Caller signalled abort (e.g. channel closed).
+            return Ok((prompt_len, generated_tokens, false));
+        }
 
-        Ok(ChatResult {
-            content,
-            finish_reason,
-            prompt_tokens: prompt_len,
-            completion_tokens: generated_tokens,
-        })
+        if generated_tokens >= max_new {
+            return Ok((prompt_len, generated_tokens, true));
+        }
+
+        // Decode the single new token to get its logits.
+        batch.clear();
+        let pos = (n_tokens + generated_tokens - 1) as i32;
+        batch
+            .add(tok, pos, &[0_i32], true)
+            .context("batch.add failed")?;
+        ctx.decode(&mut batch).context("ctx.decode (step) failed")?;
+        last_idx = 0; // single-token batch → index 0
     }
 }
 
@@ -413,61 +535,45 @@ fn parse_output(output: String, hit_max_tokens: bool) -> (Vec<ContentPart>, Fini
 
 #[async_trait::async_trait]
 impl Generator for LlamaEngine {
-    /// Non-streaming inference. Runs the blocking llama.cpp generate loop
-    /// in a `spawn_blocking` task so the async runtime is not stalled.
+    /// Non-streaming inference. Sends a `Job::Generate` to the worker thread
+    /// and awaits the result via a oneshot channel.
     async fn generate(&self, req: ChatRequest) -> Result<ChatResult> {
-        let model = Arc::clone(&self.model);
-        let backend = Arc::clone(&self.backend);
-        let ctx_len = self.ctx_len;
-
-        tokio::task::spawn_blocking(move || {
-            Self::generate_blocking(model, backend, req, ctx_len)
-        })
-        .await
-        .context("spawn_blocking panicked")?
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Job::Generate { req, reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("worker thread has stopped"))?;
+        reply_rx
+            .await
+            .context("worker thread dropped reply channel")?
     }
 
-    /// Streaming inference — Task 4 will make this incremental.
+    /// Streaming inference. Sends a `Job::Stream` to the worker thread and
+    /// returns a `BoxStream` backed by the reply channel receiver.
     ///
-    /// For now, we run a full non-streaming generation and emit the entire
-    /// result as a single terminal `StreamDelta`. This is correct and safe;
-    /// it avoids a `todo!()` or panic.
+    /// The worker thread sends one `StreamDelta` per decoded piece, then a
+    /// terminal delta with `done=true` and `finish_reason` set.
     async fn generate_stream(
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamDelta>>> {
-        let result = self.generate(req).await?;
+        // Channel capacity: 32 deltas — enough to buffer brief bursts without
+        // blocking the decode loop. The loop parks when full (blocking_send).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamDelta>>(32);
 
-        // Collect text from all content parts.
-        let text: Option<String> = {
-            let parts: Vec<String> = result
-                .content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text(t) => Some(t.clone()),
-                    ContentPart::Call(_) => None,
-                })
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join(""))
-            }
-        };
+        self.tx
+            .send(Job::Stream { req, reply: tx })
+            .map_err(|_| anyhow::anyhow!("worker thread has stopped"))?;
 
-        let finish_reason = result.finish_reason;
-        let deltas: Vec<Result<StreamDelta>> = vec![Ok(StreamDelta {
-            text,
-            done: true,
-            finish_reason: Some(finish_reason),
-        })];
-
-        Ok(Box::pin(futures::stream::iter(deltas)))
+        // Wrap the channel receiver in a futures::Stream.
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Ok(Box::pin(stream))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Smoke-test helper (called from main when --llama flag is passed)
+// Smoke-test helper (called from main when --llama-smoke is passed)
 // ---------------------------------------------------------------------------
 
 /// Convenience wrapper to smoke-test LlamaEngine end-to-end.
