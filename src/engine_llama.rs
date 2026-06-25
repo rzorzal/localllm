@@ -17,8 +17,21 @@
 //!
 //! The async `LlamaEngine` holds only the channel sender (which IS `Send+Sync`).
 //!
-//! Between every request, `ctx.clear_kv_cache()` is called so requests do not
-//! bleed into each other.
+//! ## KV-cache prefix reuse (Task 5)
+//! Instead of full-clearing the KV cache before every request, the worker keeps
+//! track of which tokens are currently resident in the KV cache (`cached_tokens`).
+//! For each new request:
+//!   1. Compute the longest common prefix between `cached_tokens` and the new
+//!      prompt tokens (capped at `new_tokens.len() - 1` so at least 1 token is
+//!      always decoded to produce fresh logits).
+//!   2. Trim the KV cache from position `common` onward via `clear_kv_cache_seq`.
+//!   3. Prefill only `new_tokens[common..]`, starting at position `common`.
+//!   4. After generation, save the prompt tokens (NOT the generated tail) as the
+//!      new `cached_tokens` so the static prefix stays warm for the next turn.
+//!
+//! Claude Code sends a ~26k-token static system+tools prefix on every turn.
+//! After the cold first request the prefix is resident, and each subsequent turn
+//! only re-prefills the small unique tail — dramatically reducing TTFT.
 //!
 //! ## Prompt building with tools
 //! `llama-cpp-2::model::apply_chat_template` accepts only `[LlamaChatMessage]`
@@ -51,6 +64,7 @@ use llama_cpp_2::{
     model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
     context::params::LlamaContextParams,
     sampling::LlamaSampler,
+    token::LlamaToken,
 };
 use uuid::Uuid;
 
@@ -169,8 +183,13 @@ fn worker_thread(
     };
 
     // --- Create the ONE persistent context ---
+    // Set n_batch = ctx_len so large prompts (e.g. 26k-token Claude Code prefix)
+    // can be prefilled in a single decode call without hitting the
+    // "n_tokens_all <= cparams.n_batch" assertion. Without this, the default
+    // n_batch of 512 rejects any prefill batch larger than 512 tokens.
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(ctx_len));
+        .with_n_ctx(NonZeroU32::new(ctx_len))
+        .with_n_batch(ctx_len);
     let mut ctx = match model.new_context(&backend, ctx_params)
         .context("new_context failed")
     {
@@ -184,17 +203,20 @@ fn worker_thread(
         return;
     }
 
+    // Tracks the prompt tokens currently resident in the KV cache.
+    // Initially empty (cache is clean after context creation).
+    // Single-threaded — no locking needed (only the worker touches this).
+    let mut cached_tokens: Vec<LlamaToken> = Vec::new();
+
     // --- Job loop ---
     while let Ok(job) = rx.recv() {
-        // Clear the KV cache before each request so requests don't bleed.
-        ctx.clear_kv_cache();
-
         match job {
             Job::Generate { req, reply } => {
                 let mut output = String::new();
                 let result = run_decode_loop(
                     &model,
                     &mut ctx,
+                    &mut cached_tokens,
                     &req,
                     |piece| { output.push_str(&piece); true },
                 );
@@ -212,6 +234,11 @@ fn worker_thread(
                         completion_tokens: gen_tokens,
                     }
                 });
+                // On error, clear the cache state so the next request starts clean.
+                if chat_result.is_err() {
+                    cached_tokens.clear();
+                    ctx.clear_kv_cache();
+                }
                 let _ = reply.send(chat_result);
             }
 
@@ -220,6 +247,7 @@ fn worker_thread(
                 let result = run_decode_loop(
                     &model,
                     &mut ctx,
+                    &mut cached_tokens,
                     &req,
                     |piece| {
                         let delta = Ok(StreamDelta {
@@ -231,6 +259,11 @@ fn worker_thread(
                         reply.blocking_send(delta).is_ok()
                     },
                 );
+                // On error, clear the cache state so the next request starts clean.
+                if result.is_err() {
+                    cached_tokens.clear();
+                    ctx.clear_kv_cache();
+                }
                 // Terminal delta.
                 match result {
                     Ok((_, _, hit_max)) => {
@@ -257,7 +290,13 @@ fn worker_thread(
 
 /// Core inference routine, executed on the persistent worker thread.
 ///
-/// Operates on an existing `LlamaContext` (caller must clear KV cache first).
+/// Implements longest-common-prefix KV reuse: only re-prefills the portion of
+/// the new prompt that differs from what is already resident in the KV cache.
+///
+/// `cached_tokens` — the prompt tokens currently in the KV cache (empty on
+/// first call). Updated to `new_tokens` (the full prompt) on success so the
+/// static prefix stays warm for the next turn.
+///
 /// Returns the prompt token count, the generated token count, and whether the
 /// generation hit the max-token limit.
 ///
@@ -265,6 +304,7 @@ fn worker_thread(
 fn run_decode_loop(
     model: &LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+    cached_tokens: &mut Vec<LlamaToken>,
     req: &ChatRequest,
     mut on_piece: impl FnMut(String) -> bool,
 ) -> Result<(usize /*prompt_tokens*/, usize /*generated*/, bool /*hit_max*/)> {
@@ -273,18 +313,54 @@ fn run_decode_loop(
     tracing::debug!(target: "localllm::llama", "prompt ({} chars):\n{}", prompt.len(), &prompt[..prompt.len().min(400)]);
 
     // --- Tokenize ---
-    let tokens = model
+    let new_tokens = model
         .str_to_token(&prompt, AddBos::Never) // chat template already includes BOS
         .context("str_to_token failed")?;
-    let prompt_len = tokens.len();
+    let prompt_len = new_tokens.len();
     tracing::debug!(target: "localllm::llama", "prompt tokens: {prompt_len}");
 
-    // --- Prefill: add entire prompt as one batch ---
-    let n_tokens = tokens.len();
-    let mut batch = LlamaBatch::new(n_tokens.max(512), 1);
-    batch
-        .add_sequence(&tokens, 0, false)
-        .context("batch.add_sequence failed")?;
+    // --- Compute longest common prefix for KV reuse ---
+    // Cap at new_tokens.len()-1 so there is always at least one token to decode
+    // and produce fresh logits.
+    let max_common = new_tokens.len().saturating_sub(1);
+    let common = cached_tokens
+        .iter()
+        .zip(new_tokens.iter())
+        .take(max_common)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    tracing::info!(
+        target: "localllm::llama",
+        "prefix reuse: {common}/{total} tokens cached, decoding {} new",
+        new_tokens.len() - common,
+        total = new_tokens.len(),
+    );
+
+    // --- Trim KV cache from `common` onward ---
+    // If common == 0, this is equivalent to a full clear.
+    if common == 0 {
+        ctx.clear_kv_cache();
+    } else {
+        // Remove KV entries from position `common` to end of sequence 0.
+        ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None)
+            .context("clear_kv_cache_seq failed")?;
+    }
+
+    // --- Prefill: only new_tokens[common..] starting at position `common` ---
+    let tail = &new_tokens[common..];
+    let n_tail = tail.len();
+    // Batch capacity must be >= n_tail so all tail tokens fit in a single
+    // decode call. We also ensure a minimum of 1 to avoid zero-capacity batches.
+    let mut batch = LlamaBatch::new(n_tail.max(1), 1);
+    // Add each tail token with its absolute position, logits=true only on last.
+    for (i, &tok) in tail.iter().enumerate() {
+        let pos = (common + i) as i32;
+        let is_last = i == n_tail - 1;
+        batch
+            .add(tok, pos, &[0_i32], is_last)
+            .context("batch.add (prefill) failed")?;
+    }
     ctx.decode(&mut batch).context("ctx.decode (prefill) failed")?;
     batch.clear();
 
@@ -305,7 +381,12 @@ fn run_decode_loop(
     let mut generated_tokens = 0usize;
     // Single stateful UTF-8 decoder reused across all tokens (multi-byte safe).
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut last_idx = (n_tokens as i32) - 1; // logit index of last prefill token
+    // After prefill, logits live at index 0 of the single-batch decode (n_tail-1
+    // relative, but we used a single batch so it's always the last entry).
+    // For the first sample we use idx = n_tail-1 within the batch we just ran
+    // (which had n_tail tokens); since we only set logits=true on the last token
+    // of that batch, we sample at index n_tail-1.
+    let mut last_idx = (n_tail as i32) - 1;
 
     loop {
         let tok = sampler.sample(ctx, last_idx);
@@ -313,6 +394,8 @@ fn run_decode_loop(
         generated_tokens += 1;
 
         if model.is_eog_token(tok) {
+            // Update cached_tokens to the prompt (not the generated tail).
+            *cached_tokens = new_tokens;
             return Ok((prompt_len, generated_tokens, false));
         }
 
@@ -322,16 +405,20 @@ fn run_decode_loop(
 
         if !piece.is_empty() && !on_piece(piece) {
             // Caller signalled abort (e.g. channel closed).
+            // Still update cached_tokens — prefix is still warm.
+            *cached_tokens = new_tokens;
             return Ok((prompt_len, generated_tokens, false));
         }
 
         if generated_tokens >= max_new {
+            *cached_tokens = new_tokens;
             return Ok((prompt_len, generated_tokens, true));
         }
 
         // Decode the single new token to get its logits.
+        // Position is absolute: (prompt length) + (generated so far) - 1.
         batch.clear();
-        let pos = (n_tokens + generated_tokens - 1) as i32;
+        let pos = (prompt_len + generated_tokens - 1) as i32;
         batch
             .add(tok, pos, &[0_i32], true)
             .context("batch.add failed")?;
