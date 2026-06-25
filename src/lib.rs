@@ -30,6 +30,21 @@ pub async fn run_server_with_ready(
     cfg: crate::config::Config,
     ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<()> {
+    use std::sync::{Arc, RwLock};
+    let profile = crate::settings::resolve_profile(cfg.profile);
+    tracing::info!("routing profile: {profile:?}");
+    let policy = Arc::new(RwLock::new(profile.policy()));
+    run_server_with_ready_and_policy(cfg, ready, policy).await
+}
+
+/// Like [`run_server_with_ready`] but takes an externally-owned routing policy
+/// so a caller (the tray) can share the same `Arc<RwLock<RoutingPolicy>>` and
+/// mutate it live while the server reads it per request.
+pub async fn run_server_with_ready_and_policy(
+    cfg: crate::config::Config,
+    ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
+) -> anyhow::Result<()> {
     use std::sync::Arc;
     use crate::config::Backend;
     use crate::engine::Engine;
@@ -62,9 +77,6 @@ pub async fn run_server_with_ready(
         Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
     };
 
-    let policy = std::sync::Arc::new(std::sync::RwLock::new(
-        crate::route::Profile::default().policy(),
-    ));
     let app = router(engine, cfg.model_id.clone(), policy, cfg.ctx_len);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");

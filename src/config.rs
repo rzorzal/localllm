@@ -94,6 +94,12 @@ pub struct Config {
     /// When set, the server uses only in-process prefix reuse (no disk I/O).
     #[arg(long, default_value_t = false)]
     pub no_kv_persist: bool,
+
+    /// Routing profile (local↔cloud heuristic). Overrides the saved setting for
+    /// this run only; tray selections persist, this flag does not. When unset,
+    /// the saved setting (or SaveTokens default) is used.
+    #[arg(long, value_enum)]
+    pub profile: Option<crate::route::Profile>,
 }
 
 impl Config {
@@ -179,5 +185,15 @@ mod tests {
 
         let c = Config::parse_from(["localllm", "--kv-type", "q8"]);
         assert_eq!(c.kv_type, KvType::Q8);
+    }
+
+    #[test]
+    fn profile_flag_parses_and_defaults_none() {
+        let c = Config::parse_from(["localllm"]);
+        assert_eq!(c.profile, None);
+        let c = Config::parse_from(["localllm", "--profile", "balanced"]);
+        assert_eq!(c.profile, Some(crate::route::Profile::Balanced));
+        let c = Config::parse_from(["localllm", "--profile", "local-only"]);
+        assert_eq!(c.profile, Some(crate::route::Profile::LocalOnly));
     }
 }

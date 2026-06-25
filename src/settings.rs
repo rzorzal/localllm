@@ -41,6 +41,12 @@ pub fn load_profile() -> Profile {
     }
 }
 
+/// Resolve the effective startup profile: an explicit CLI choice wins; else the
+/// saved setting (or the default if none/unreadable).
+pub fn resolve_profile(cli: Option<Profile>) -> Profile {
+    cli.unwrap_or_else(load_profile)
+}
+
 /// Persist the chosen routing profile, creating the parent directory if needed.
 pub fn save_profile(p: Profile) -> anyhow::Result<()> {
     let path = settings_path()
@@ -101,6 +107,19 @@ mod tests {
             save_profile(Profile::MaxQuality).unwrap();
             save_profile(Profile::LocalOnly).unwrap();
             assert_eq!(load_profile(), Profile::LocalOnly);
+        });
+    }
+
+    #[test]
+    fn resolve_prefers_cli_then_saved_then_default() {
+        with_temp_settings(|| {
+            // nothing saved, no CLI → default
+            assert_eq!(resolve_profile(None), Profile::default());
+            // saved setting, no CLI → saved
+            save_profile(Profile::MaxQuality).unwrap();
+            assert_eq!(resolve_profile(None), Profile::MaxQuality);
+            // CLI overrides saved
+            assert_eq!(resolve_profile(Some(Profile::LocalOnly)), Profile::LocalOnly);
         });
     }
 }
