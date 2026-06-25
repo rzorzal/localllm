@@ -702,7 +702,14 @@ Here are the available tools (compact schema — name(param:type! (desc)) — de
     };
 
     // --- Assemble LlamaChatMessages ---
+    // Emit ALL system messages FIRST (stable content: prompt + tools + injected
+    // context), then the user/assistant/tool turns. This floats every stable
+    // block to the front so the volatile part (the user's question) is at the
+    // very END of the prompt — maximizing longest-common-prefix KV reuse across
+    // turns (only the question re-decodes on a warm turn). Relative order within
+    // each group is preserved.
     let mut chat_messages: Vec<LlamaChatMessage> = Vec::new();
+    let mut other_messages: Vec<LlamaChatMessage> = Vec::new();
     // Tools are appended to the FIRST system message only — never duplicated.
     let mut tools_emitted = false;
 
@@ -723,7 +730,7 @@ Here are the available tools (compact schema — name(param:type! (desc)) — de
             }
             Role::User => {
                 let content = msg.text.clone().unwrap_or_default();
-                chat_messages.push(
+                other_messages.push(
                     LlamaChatMessage::new("user".to_string(), content)
                         .context("invalid user message content")?,
                 );
@@ -743,7 +750,7 @@ Here are the available tools (compact schema — name(param:type! (desc)) — de
                         serde_json::to_string(&tc_json)?
                     ));
                 }
-                chat_messages.push(
+                other_messages.push(
                     LlamaChatMessage::new("assistant".to_string(), content)
                         .context("invalid assistant message content")?,
                 );
@@ -759,13 +766,17 @@ Here are the available tools (compact schema — name(param:type! (desc)) — de
                 let content =
                     format!("<tool_response>\n{result_content}\n</tool_response>");
                 // Qwen2.5 expects tool results under the "tool" role.
-                chat_messages.push(
+                other_messages.push(
                     LlamaChatMessage::new("tool".to_string(), content)
                         .context("invalid tool message content")?,
                 );
             }
         }
     }
+
+    // Append the user/assistant/tool turns AFTER all system blocks, so the
+    // volatile question lands at the very end of the prompt.
+    chat_messages.append(&mut other_messages);
 
     // If there are no messages, push a minimal user turn so the template
     // doesn't produce an empty / broken prompt.
