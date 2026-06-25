@@ -55,6 +55,25 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 # Copy the real binary
 cp "$BINARY" "$MACOS_DIR/${APP_NAME}"
 
+# --- Generate the app icon (.icns) from the binary's built-in renderer ---
+echo "==> Generating app icon…"
+ICON_PNG="$(mktemp -t localllm-icon).png"
+"$BINARY" --export-icon "$ICON_PNG"
+ICONSET="$(mktemp -d)/AppIcon.iconset"
+mkdir -p "$ICONSET"
+for sz in 16 32 64 128 256 512 1024; do
+    sips -z "$sz" "$sz" "$ICON_PNG" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
+done
+# Provide the @2x names iconutil expects (reuse the larger renders).
+cp "$ICONSET/icon_32x32.png"   "$ICONSET/icon_16x16@2x.png"
+cp "$ICONSET/icon_64x64.png"   "$ICONSET/icon_32x32@2x.png"
+cp "$ICONSET/icon_256x256.png" "$ICONSET/icon_128x128@2x.png"
+cp "$ICONSET/icon_512x512.png" "$ICONSET/icon_256x256@2x.png"
+cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
+rm -f "$ICONSET/icon_64x64.png" "$ICONSET/icon_1024x1024.png"
+iconutil -c icns "$ICONSET" -o "$RESOURCES_DIR/AppIcon.icns"
+echo "    icon: $RESOURCES_DIR/AppIcon.icns"
+
 # Create a tiny shell launcher (CFBundleExecutable) that execs the real binary
 # with --tray prepended to any extra args.
 # This is the simplest way to default the .app to tray mode without changing
@@ -85,6 +104,8 @@ cat > "$CONTENTS/Info.plist" << PLIST_EOF
     <string>${APP_NAME}</string>
     <key>CFBundleDisplayName</key>
     <string>localllm</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
