@@ -25,8 +25,10 @@ pub struct Config {
 
     /// Context window in tokens. On GPU (PagedAttention) this sizes the KV
     /// cache and is the usable context length. Larger = more GPU memory
-    /// (~55 KB/token). Lower it if the model + KV cache don't fit in RAM.
-    #[arg(long, default_value_t = 16384)]
+    /// (~55 KB/token; 32768 ≈ 1.8 GB). Default 32768 because agentic clients
+    /// like Claude Code send ~26k-token system+tool prompts. Lower it if the
+    /// model + KV cache don't fit in RAM.
+    #[arg(long, default_value_t = 32768)]
     pub ctx_len: usize,
 
     /// Disable paged attention.
@@ -61,7 +63,7 @@ mod tests {
     fn defaults_are_localhost_8080_qwen() {
         let c = Config::parse_from(["localllm"]);
         assert_eq!(c.port, 8080);
-        assert_eq!(c.ctx_len, 16384);
+        assert_eq!(c.ctx_len, 32768);
         assert!(c.model_id.contains("Qwen2.5-7B-Instruct"));
     }
 
