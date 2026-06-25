@@ -4,9 +4,11 @@
 //! it maps to a `RoutingPolicy` of concrete knobs consumed by `route::decide`.
 
 /// User-facing routing choice. Set from the tray in a later phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Defaults to `SaveTokens` (the token-thrift, local-first profile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
     /// Local-first; cloud only when local truly cannot serve. Cheapest.
+    #[default]
     SaveTokens,
     /// Local for easy/medium, cloud for hard/big-context.
     Balanced,
@@ -14,12 +16,6 @@ pub enum Profile {
     MaxQuality,
     /// Never route to cloud. Pure local, zero tokens.
     LocalOnly,
-}
-
-impl Default for Profile {
-    fn default() -> Self {
-        Profile::SaveTokens
-    }
 }
 
 impl Profile {
