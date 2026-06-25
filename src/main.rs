@@ -12,19 +12,30 @@ struct MainArgs {
     /// Run the LlamaEngine smoke test (load model, call get_weather tool) and exit.
     #[arg(long, default_value_t = false)]
     llama_smoke: bool,
+
+    /// Debug: load the model, build the prompt for the given Anthropic request
+    /// JSON file, print it to stdout, and exit (no inference). For inspecting
+    /// what actually gets sent to the model.
+    #[arg(long)]
+    dump_prompt: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("localllm=info".parse()?)
-                .add_directive("mistralrs_core=info".parse()?),
-        )
-        .init();
+    // Respect RUST_LOG when set; otherwise default to info for our crate.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("localllm=info,mistralrs_core=info"));
+    // Logs go to stderr so stdout stays clean (e.g. --dump-prompt output).
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 
     let args = MainArgs::parse();
+
+    if let Some(path) = &args.dump_prompt {
+        let cfg = &args.config;
+        let prompt = localllm::engine_llama::dump_prompt(&cfg.model_id, &cfg.gguf_files, path).await?;
+        println!("{prompt}");
+        return Ok(());
+    }
 
     if args.llama_smoke {
         return localllm::engine_llama::run_smoke_test().await;

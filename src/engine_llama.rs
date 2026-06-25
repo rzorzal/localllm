@@ -641,6 +641,33 @@ fn run_decode_loop(
 /// Build the complete prompt string from a `ChatRequest`.
 ///
 /// Strategy:
+/// Debug helper: load the model (for its chat template), translate an Anthropic
+/// request JSON file, build the prompt, and return it — no inference. Used by
+/// `--dump-prompt` to inspect exactly what is sent to the model.
+pub async fn dump_prompt(
+    model_id: &str,
+    gguf_files: &[String],
+    request_json: &std::path::Path,
+) -> Result<String> {
+    let paths = crate::download::ensure_model(model_id, gguf_files)
+        .await
+        .context("ensure_model failed")?;
+    let path = paths.into_iter().next().context("no model path")?;
+    let backend = LlamaBackend::init().context("LlamaBackend::init failed")?;
+    let model = LlamaModel::load_from_file(
+        &backend,
+        &path,
+        &LlamaModelParams::default().with_n_gpu_layers(u32::MAX),
+    )
+    .context("load_from_file failed")?;
+
+    let bytes = std::fs::read(request_json).context("read request json")?;
+    let anth: crate::api::anthropic::AnthRequest =
+        serde_json::from_slice(&bytes).context("parse Anthropic request json")?;
+    let req = crate::api::anthropic::to_internal(anth).map_err(|e| anyhow::anyhow!(e))?;
+    build_prompt(&model, &req)
+}
+
 /// 1. If the request has tools, embed them in the system message using
 ///    Qwen2.5's documented tool-call format.
 /// 2. Collect all messages into `LlamaChatMessage` pairs.
@@ -676,12 +703,19 @@ Here are the available tools (compact schema — name(param:type! (desc)) — de
 
     // --- Assemble LlamaChatMessages ---
     let mut chat_messages: Vec<LlamaChatMessage> = Vec::new();
+    // Tools are appended to the FIRST system message only — never duplicated.
+    let mut tools_emitted = false;
 
     for msg in &req.messages {
         match &msg.role {
             Role::System => {
                 let base = msg.text.clone().unwrap_or_default();
-                let content = format!("{base}{tool_section}");
+                let content = if tools_emitted {
+                    base
+                } else {
+                    tools_emitted = true;
+                    format!("{base}{tool_section}")
+                };
                 chat_messages.push(
                     LlamaChatMessage::new("system".to_string(), content)
                         .context("invalid system message content")?,
