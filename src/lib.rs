@@ -4,6 +4,7 @@ pub mod download;
 pub mod engine;
 pub mod engine_llama;
 pub mod server;
+pub mod tscg;
 
 // ---------------------------------------------------------------------------
 // Test helpers (always public so integration tests in tests/ can import them)
