@@ -185,6 +185,55 @@ pub async fn axum_test_request_status(app: Router, path: &str, body: &str) -> u1
     response.status().as_u16()
 }
 
+/// POST with a JSON body AND a custom header; return the HTTP status code.
+/// Used to exercise routing decisions that depend on a credential header.
+pub async fn axum_test_request_status_with_header(
+    app: Router,
+    path: &str,
+    body: &str,
+    header_name: &str,
+    header_value: &str,
+) -> u16 {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header(header_name, header_value)
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    response.status().as_u16()
+}
+
+/// POST with a JSON body AND a custom header; return the parsed JSON response.
+pub async fn axum_test_request_with_header(
+    app: Router,
+    path: &str,
+    body: &str,
+    header_name: &str,
+    header_value: &str,
+) -> serde_json::Value {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header(header_name, header_value)
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 /// Send a POST with a JSON body to `path` on `app` and return the raw
 /// response body as a `String`. Used for SSE streaming tests where the body
 /// is not a single JSON object.

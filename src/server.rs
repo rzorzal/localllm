@@ -23,6 +23,9 @@ use axum::{
 use futures::stream::BoxStream;
 use serde_json::json;
 
+use axum::body::Bytes;
+use axum::http::HeaderMap;
+
 use crate::api::common::{ChatRequest, ChatResult, StreamDelta};
 use crate::api::openai::{OaiChatRequest, OaiModelInfo, OaiModelList};
 use crate::api::anthropic::AnthRequest;
@@ -37,6 +40,26 @@ fn new_request_id() -> String {
 /// Summarize an internal request for the start log line.
 fn request_summary(req: &ChatRequest) -> (usize, usize) {
     (req.messages.len(), req.tools.len())
+}
+
+/// Compute the routing decision for an already-parsed internal request.
+/// Returns the decision plus whether a forwardable credential header is present.
+fn route_decision(
+    state: &AppState,
+    internal: &ChatRequest,
+    headers: &axum::http::HeaderMap,
+) -> crate::route::Decision {
+    let has_cloud_creds =
+        headers.contains_key("x-api-key") || headers.contains_key("authorization");
+    let signals = crate::route::Signals {
+        prompt_tokens: crate::route::estimate_prompt_tokens(internal),
+        local_ctx_window: state.local_ctx_window,
+        n_tools: internal.tools.len(),
+        n_messages: internal.messages.len(),
+        has_cloud_creds,
+    };
+    let policy = *state.policy.read().unwrap();
+    crate::route::decide(&signals, &policy)
 }
 
 // ---------------------------------------------------------------------------
@@ -123,13 +146,22 @@ pub fn router(
 /// POST /v1/chat/completions
 async fn handle_oai_chat(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<OaiChatRequest>,
+    headers: HeaderMap,
+    raw: Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use futures::StreamExt;
     use uuid::Uuid;
 
     let rid = new_request_id();
+
+    let req: OaiChatRequest = match serde_json::from_slice(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "localllm::req", "{rid} [openai] 400 bad json: {e}");
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
     let model = req.model.clone();
     let stream_flag = req.stream.unwrap_or(false);
 
@@ -137,12 +169,21 @@ async fn handle_oai_chat(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "localllm::req", "{rid} [openai] 400 bad request: {e}");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": e})),
-            ).into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
         }
     };
+
+    // --- Routing decision (Phase A: context-size gate only) ---
+    match route_decision(&state, &internal, &headers) {
+        crate::route::Decision::Cloud(reason) => {
+            tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
+            return crate::cloud::forward(crate::cloud::Provider::OpenAI, &headers, raw).await;
+        }
+        crate::route::Decision::LocalNoCreds => {
+            tracing::warn!(target: "localllm::req", "{rid} [openai] route=local (cloud wanted but no creds/disallowed)");
+        }
+        _ => {}
+    }
 
     let (n_msgs, n_tools) = request_summary(&internal);
     tracing::info!(target: "localllm::req", "{rid} [openai] start: model={model} msgs={n_msgs} tools={n_tools} stream={stream_flag}");
@@ -246,12 +287,21 @@ async fn handle_oai_chat(
 /// POST /v1/messages
 async fn handle_anth_messages(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AnthRequest>,
+    headers: HeaderMap,
+    raw: Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use futures::StreamExt;
 
     let rid = new_request_id();
+
+    let req: AnthRequest = match serde_json::from_slice(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "localllm::req", "{rid} [anthropic] 400 bad json: {e}");
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
     let model = req.model.clone();
     let stream_flag = req.stream.unwrap_or(false);
 
@@ -259,12 +309,21 @@ async fn handle_anth_messages(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "localllm::req", "{rid} [anthropic] 400 bad request: {e}");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": e})),
-            ).into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
         }
     };
+
+    // --- Routing decision (Phase A: context-size gate only) ---
+    match route_decision(&state, &internal, &headers) {
+        crate::route::Decision::Cloud(reason) => {
+            tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
+            return crate::cloud::forward(crate::cloud::Provider::Anthropic, &headers, raw).await;
+        }
+        crate::route::Decision::LocalNoCreds => {
+            tracing::warn!(target: "localllm::req", "{rid} [anthropic] route=local (cloud wanted but no creds/disallowed)");
+        }
+        _ => {}
+    }
 
     let (n_msgs, n_tools) = request_summary(&internal);
     tracing::info!(target: "localllm::req", "{rid} [anthropic] start: model={model} msgs={n_msgs} tools={n_tools} stream={stream_flag}");
