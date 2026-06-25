@@ -5,6 +5,58 @@ pub mod engine;
 pub mod engine_llama;
 pub mod server;
 pub mod tscg;
+#[cfg(target_os = "macos")]
+pub mod tray;
+
+// ---------------------------------------------------------------------------
+// Shared server startup logic
+// ---------------------------------------------------------------------------
+
+/// Build the engine + router, bind, and serve.
+///
+/// Callable from both the headless `main()` path and the tray-mode background
+/// thread. Never returns on success (the axum serve future runs forever).
+pub async fn run_server(cfg: crate::config::Config) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use crate::config::Backend;
+    use crate::engine::Engine;
+    use crate::engine_llama::LlamaEngine;
+    use crate::server::{router, Generator};
+
+    tracing::info!("loading model {} (backend={:?})…", cfg.model_id, cfg.backend);
+
+    let engine: Arc<dyn Generator> = match cfg.backend {
+        Backend::Llama => {
+            let kv_cache_type = cfg.llama_kv_cache_type();
+            let kv_cache_dir = cfg.resolved_kv_cache_dir();
+            tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
+            tracing::info!(
+                "KV persist dir: {:?} (no-persist={})",
+                kv_cache_dir,
+                cfg.no_kv_persist
+            );
+            Arc::new(
+                LlamaEngine::load(
+                    &cfg.model_id,
+                    &cfg.gguf_files,
+                    cfg.ctx_len,
+                    kv_cache_type,
+                    kv_cache_dir,
+                )
+                .await?,
+            )
+        }
+        Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
+    };
+
+    let app = router(engine, cfg.model_id.clone());
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
+    tracing::info!("listening on http://{addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers (always public so integration tests in tests/ can import them)

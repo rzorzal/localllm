@@ -25,6 +25,20 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 dirs = "5"
 futures-util = "0.3"
 
+# macOS menu-bar tray (only used when --tray flag is passed)
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+tao = { version = "0.35", default-features = false }
+
 [profile.release]
 lto = true
 codegen-units = 1
+
+[package.metadata.bundle]
+name = "localllm"
+identifier = "dev.localllm.app"
+category = "Developer Tool"
+short_description = "Local LLM server with OpenAI/Anthropic API compatibility"
+long_description = "Runs a local LLM inference server using llama.cpp with OpenAI and Anthropic API compatibility. Operates as a menu-bar application with no Dock presence."
+copyright = "Copyright 2024 localllm contributors"
+icon = []
