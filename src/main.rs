@@ -36,8 +36,10 @@ async fn main() -> anyhow::Result<()> {
     let engine: Arc<dyn Generator> = match cfg.backend {
         Backend::Llama => {
             let kv_cache_type = cfg.llama_kv_cache_type();
+            let kv_cache_dir = cfg.resolved_kv_cache_dir();
             tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
-            Arc::new(LlamaEngine::load(&cfg.model_id, &cfg.gguf_files, cfg.ctx_len, kv_cache_type).await?)
+            tracing::info!("KV persist dir: {:?} (no-persist={})", kv_cache_dir, cfg.no_kv_persist);
+            Arc::new(LlamaEngine::load(&cfg.model_id, &cfg.gguf_files, cfg.ctx_len, kv_cache_type, kv_cache_dir).await?)
         }
         Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
     };

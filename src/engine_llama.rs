@@ -52,6 +52,8 @@
 //! Qwen2.5 emits tool calls as `<tool_call>{json}</tool_call>`. After
 //! generation we scan for these blocks and parse each into a `ContentPart::Call`.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
@@ -74,6 +76,18 @@ use crate::api::common::{
     ChatRequest, ChatResult, ContentPart, FinishReason, Role, StreamDelta, ToolCall,
 };
 use crate::server::Generator;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Minimum prefix length (in tokens) for the prefix KV cache to be persisted
+/// to disk. Short prefixes aren't worth the I/O overhead.
+const KV_PERSIST_MIN_TOKENS: usize = 1024;
+
+/// Maximum number of `.kvstate` files to keep in the kv-cache-dir.
+/// Oldest files beyond this limit are deleted automatically.
+const KV_PERSIST_MAX_FILES: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Job enum — requests sent to the worker thread
@@ -121,11 +135,13 @@ impl LlamaEngine {
     /// `gguf_files` – GGUF filename(s) within the repo.
     /// `ctx_len` – context window in tokens.
     /// `kv_cache_type` – KV cache quantization type (e.g. `KvCacheType::Q8_0`).
+    /// `kv_cache_dir` – if `Some`, persist prefix KV states to disk here.
     pub async fn load(
         model_id: &str,
         gguf_files: &[String],
         ctx_len: usize,
         kv_cache_type: KvCacheType,
+        kv_cache_dir: Option<PathBuf>,
     ) -> Result<Self> {
         // Download (or skip if cached) and get local paths.
         let paths: Vec<PathBuf> =
@@ -149,7 +165,7 @@ impl LlamaEngine {
 
         // Spawn the persistent worker thread. It owns backend + model + context.
         std::thread::spawn(move || {
-            worker_thread(path, ctx_len_u32, kv_cache_type, rx, load_tx);
+            worker_thread(path, ctx_len_u32, kv_cache_type, kv_cache_dir, rx, load_tx);
         });
 
         // Wait for the worker to signal successful model load (or an error).
@@ -173,6 +189,7 @@ fn worker_thread(
     model_path: PathBuf,
     ctx_len: u32,
     kv_cache_type: KvCacheType,
+    kv_cache_dir: Option<PathBuf>,
     rx: std_mpsc::Receiver<Job>,
     load_tx: tokio::sync::oneshot::Sender<Result<()>>,
 ) {
@@ -237,6 +254,52 @@ fn worker_thread(
     // Single-threaded — no locking needed (only the worker touches this).
     let mut cached_tokens: Vec<LlamaToken> = Vec::new();
 
+    // --- Disk warm-start: load the most recently saved prefix KV state ---
+    // If we have a kv_cache_dir with at least one *.kvstate file, load the
+    // most recently modified one into the context so the next request with
+    // that prefix enjoys in-cache reuse without re-prefilling from scratch.
+    if let Some(ref kv_dir) = kv_cache_dir {
+        match try_warm_start_from_disk(&mut ctx, kv_dir) {
+            Ok(Some(tokens)) => {
+                // KV cache is populated at positions 0..(tokens.len()-1).
+                // We do NOT attempt a warm-up re-decode here (NOTES §9 warm-up).
+                //
+                // Reason: re-decoding at the last loaded position conflicts with the
+                // existing KV entry at that slot — llama.cpp raises
+                // "inconsistent sequence positions" and rejects the batch.
+                // Decoding at position tokens.len() (one past the end) would work
+                // but is wasteful and produces a spurious output token.
+                //
+                // Instead we rely on the existing prefix-reuse path: the next
+                // request computes longest common prefix, clears KV from `common`
+                // onward, and prefills only the tail (typically just 1-2 tokens).
+                // That tail decode produces valid logits from which sampling
+                // proceeds normally. No logits are needed until that first request.
+                cached_tokens = tokens;
+                tracing::info!(
+                    target: "localllm::llama",
+                    "warm-started from disk: {} tokens (KV cache preloaded; logits will be primed on first request tail-decode)",
+                    cached_tokens.len(),
+                );
+            }
+            Ok(None) => {
+                tracing::info!(
+                    target: "localllm::llama",
+                    "no kvstate files found in {:?} — cold start",
+                    kv_dir,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "localllm::llama",
+                    "warm-start failed ({}), continuing cold",
+                    e,
+                );
+                ctx.clear_kv_cache();
+            }
+        }
+    }
+
     // --- Job loop ---
     while let Ok(job) = rx.recv() {
         match job {
@@ -247,6 +310,7 @@ fn worker_thread(
                     &mut ctx,
                     &mut cached_tokens,
                     &req,
+                    kv_cache_dir.as_deref(),
                     |piece| { output.push_str(&piece); true },
                 );
                 let chat_result = result.map(|(prompt_len, gen_tokens, hit_max)| {
@@ -278,6 +342,7 @@ fn worker_thread(
                     &mut ctx,
                     &mut cached_tokens,
                     &req,
+                    kv_cache_dir.as_deref(),
                     |piece| {
                         let delta = Ok(StreamDelta {
                             text: Some(piece),
@@ -326,6 +391,11 @@ fn worker_thread(
 /// first call). Updated to `new_tokens` (the full prompt) on success so the
 /// static prefix stays warm for the next turn.
 ///
+/// `kv_cache_dir` — if `Some`, save the prefix KV state to disk after
+/// prefilling a large prefix (>= `KV_PERSIST_MIN_TOKENS`), keyed by a stable
+/// hash of the cached token sequence. At most `KV_PERSIST_MAX_FILES` files are
+/// retained; older files are pruned.
+///
 /// Returns the prompt token count, the generated token count, and whether the
 /// generation hit the max-token limit.
 ///
@@ -335,6 +405,7 @@ fn run_decode_loop(
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
     cached_tokens: &mut Vec<LlamaToken>,
     req: &ChatRequest,
+    kv_cache_dir: Option<&std::path::Path>,
     mut on_piece: impl FnMut(String) -> bool,
 ) -> Result<(usize /*prompt_tokens*/, usize /*generated*/, bool /*hit_max*/)> {
     // --- Build prompt string ---
@@ -392,6 +463,24 @@ fn run_decode_loop(
     }
     ctx.decode(&mut batch).context("ctx.decode (prefill) failed")?;
     batch.clear();
+
+    // --- Save prefix KV state to disk (if persistence is enabled) ---
+    // Save after prefill so we capture the full prompt KV. We save the FULL
+    // new_tokens (not just the tail) because cached_tokens hasn't been updated
+    // yet — new_tokens IS the new prefix to persist.
+    // Conditions: persistence enabled, prefix is large enough, and common==0
+    // (we just prefilled the whole prompt, so this is the freshest possible
+    // complete state). When common>0 the prefix was already cached on disk.
+    if let Some(kv_dir) = kv_cache_dir {
+        if new_tokens.len() >= KV_PERSIST_MIN_TOKENS && common == 0 {
+            if let Err(e) = save_prefix_kv(ctx, kv_dir, &new_tokens) {
+                tracing::warn!(
+                    target: "localllm::llama",
+                    "prefix KV save failed (non-fatal): {e}",
+                );
+            }
+        }
+    }
 
     // --- Sampler ---
     let temperature = req.temperature.unwrap_or(0.7) as f32;
@@ -644,6 +733,161 @@ fn parse_output(output: String, hit_max_tokens: bool) -> (Vec<ContentPart>, Fini
 }
 
 // ---------------------------------------------------------------------------
+// KV-cache disk persistence helpers
+// ---------------------------------------------------------------------------
+
+/// Compute a stable 64-bit hash of a slice of `LlamaToken`s.
+/// Used to key on-disk `.kvstate` files so a loaded prefix is only reused
+/// when it truly matches the incoming prompt prefix.
+fn hash_tokens(tokens: &[LlamaToken]) -> u64 {
+    let mut h = DefaultHasher::new();
+    tokens.len().hash(&mut h);
+    for t in tokens {
+        t.0.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Save the prefix KV state for `tokens` to `kv_dir/{hash}.kvstate`.
+/// Skips if the file already exists (idempotent per distinct prefix).
+/// Prunes old files if more than `KV_PERSIST_MAX_FILES` exist.
+fn save_prefix_kv(
+    ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+    kv_dir: &std::path::Path,
+    tokens: &[LlamaToken],
+) -> Result<()> {
+    // Ensure the directory exists.
+    std::fs::create_dir_all(kv_dir)
+        .with_context(|| format!("create_dir_all({kv_dir:?})"))?;
+
+    let hash = hash_tokens(tokens);
+    let file_path = kv_dir.join(format!("{hash:016x}.kvstate"));
+
+    // Idempotent: don't re-save if we already have this prefix on disk.
+    if file_path.exists() {
+        tracing::debug!(
+            target: "localllm::llama",
+            "prefix KV already on disk ({} tokens, {:?}) — skip save",
+            tokens.len(),
+            file_path.file_name().unwrap_or_default(),
+        );
+        return Ok(());
+    }
+
+    // Save the per-sequence (seq 0) KV state.
+    let bytes = ctx
+        .state_seq_save_file(&file_path, 0, tokens)
+        .with_context(|| format!("state_seq_save_file({file_path:?})"))?;
+
+    tracing::info!(
+        target: "localllm::llama",
+        "saved prefix KV: {} tokens → {:?} ({} bytes)",
+        tokens.len(),
+        file_path.file_name().unwrap_or_default(),
+        bytes,
+    );
+
+    // Prune oldest files if we have exceeded KV_PERSIST_MAX_FILES.
+    prune_kvstate_files(kv_dir);
+
+    Ok(())
+}
+
+/// Delete oldest `.kvstate` files when the directory has more than
+/// `KV_PERSIST_MAX_FILES` entries. Errors are logged but not propagated.
+fn prune_kvstate_files(kv_dir: &std::path::Path) {
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = match std::fs::read_dir(kv_dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| e.path().extension().map_or(false, |x| x == "kvstate"))
+            .filter_map(|e| {
+                let mtime = e.metadata().ok()?.modified().ok()?;
+                Some((mtime, e.path()))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(target: "localllm::llama", "prune_kvstate_files: read_dir failed: {e}");
+            return;
+        }
+    };
+
+    if entries.len() <= KV_PERSIST_MAX_FILES {
+        return;
+    }
+
+    // Sort ascending by mtime; oldest first.
+    entries.sort_by_key(|(t, _)| *t);
+
+    let to_delete = entries.len() - KV_PERSIST_MAX_FILES;
+    for (_, path) in entries.into_iter().take(to_delete) {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(target: "localllm::llama", "prune: remove {:?} failed: {e}", path);
+        } else {
+            tracing::info!(target: "localllm::llama", "prune: removed old kvstate {:?}", path);
+        }
+    }
+}
+
+/// Attempt to warm-start by loading the most recently modified `.kvstate` file
+/// from `kv_dir` into seq 0.
+///
+/// Returns `Ok(Some(tokens))` on success (tokens loaded), `Ok(None)` if no
+/// files exist, or `Err(...)` on a load failure (caller should continue cold).
+fn try_warm_start_from_disk(
+    ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+    kv_dir: &std::path::Path,
+) -> Result<Option<Vec<LlamaToken>>> {
+    if !kv_dir.exists() {
+        return Ok(None);
+    }
+
+    // Collect all *.kvstate files sorted by mtime descending (newest first).
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(kv_dir)
+        .with_context(|| format!("read_dir({kv_dir:?})"))?
+        .flatten()
+        .filter(|e| e.path().extension().map_or(false, |x| x == "kvstate"))
+        .filter_map(|e| {
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            Some((mtime, e.path()))
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    // Newest file first.
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let (_, newest_path) = &entries[0];
+
+    tracing::info!(
+        target: "localllm::llama",
+        "warm-start: loading {:?} …",
+        newest_path.file_name().unwrap_or_default(),
+    );
+
+    // We need an upper-bound for max_tokens. Use a generous 128k; the actual
+    // token count is embedded in the state file and will be returned.
+    let max_tokens: usize = 131_072;
+    let (tokens, _bytes) = ctx
+        .state_seq_load_file(newest_path, 0, max_tokens)
+        .with_context(|| format!("state_seq_load_file({newest_path:?})"))?;
+
+    if tokens.is_empty() {
+        return Err(anyhow::anyhow!("loaded state file had 0 tokens"));
+    }
+
+    tracing::info!(
+        target: "localllm::llama",
+        "warm-started from disk: {} tokens ({:?})",
+        tokens.len(),
+        newest_path.file_name().unwrap_or_default(),
+    );
+
+    Ok(Some(tokens))
+}
+
+// ---------------------------------------------------------------------------
 // Generator impl
 // ---------------------------------------------------------------------------
 
@@ -703,6 +947,7 @@ pub async fn run_smoke_test() -> Result<()> {
         &["qwen2.5-3b-instruct-q4_k_m.gguf".to_string()],
         4096,
         KvCacheType::Q8_0,
+        None, // no disk persistence for smoke test
     )
     .await?;
 

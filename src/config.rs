@@ -79,9 +79,34 @@ pub struct Config {
     /// Q4 cuts ~75% but may reduce output quality.
     #[arg(long, value_enum, default_value_t = KvType::Q8)]
     pub kv_type: KvType,
+
+    /// Directory where prefix KV-cache state files are persisted to disk.
+    /// Files are named by a stable hash of the cached token sequence.
+    /// Defaults to `<system-cache-dir>/localllm/kvcache`.
+    #[arg(long)]
+    pub kv_cache_dir: Option<std::path::PathBuf>,
+
+    /// Disable on-disk KV-cache persistence entirely (save and load).
+    /// When set, the server uses only in-process prefix reuse (no disk I/O).
+    #[arg(long, default_value_t = false)]
+    pub no_kv_persist: bool,
 }
 
 impl Config {
+    /// Return the resolved KV-cache directory (custom or platform default).
+    /// Returns `None` when `--no-kv-persist` is set.
+    pub fn resolved_kv_cache_dir(&self) -> Option<std::path::PathBuf> {
+        if self.no_kv_persist {
+            return None;
+        }
+        if let Some(ref p) = self.kv_cache_dir {
+            return Some(p.clone());
+        }
+        // Default: <system-cache-dir>/localllm/kvcache
+        dirs::cache_dir()
+            .map(|d| d.join("localllm").join("kvcache"))
+    }
+
     /// Map CLI config into the `EngineConfig` expected by `Engine::load`.
     pub fn engine_config(&self) -> crate::engine::EngineConfig {
         crate::engine::EngineConfig {
