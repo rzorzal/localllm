@@ -110,6 +110,22 @@ pub struct AnthResponse {
 
 /// Convert an incoming Anthropic Messages request into the internal
 /// `ChatRequest` representation.
+/// True if a system text block is volatile telemetry that changes per request
+/// and should be stripped (it would break prefix-cache reuse by sitting at the
+/// front of the prompt yet differing every call).
+fn is_volatile_system_text(t: &str) -> bool {
+    let h = t.trim_start();
+    h.starts_with("x-anthropic-billing-header")
+}
+
+/// Strip volatile leading telemetry from a plain-string system prompt.
+fn strip_volatile_system(s: &str) -> String {
+    s.lines()
+        .filter(|l| !is_volatile_system_text(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn to_internal(req: AnthRequest) -> Result<ChatRequest, String> {
     let mut messages: Vec<ChatMessage> = Vec::new();
 
@@ -118,13 +134,18 @@ pub fn to_internal(req: AnthRequest) -> Result<ChatRequest, String> {
     // form); flatten the array's text into a single system message.
     if let Some(system) = req.system {
         let system_text = match system {
-            StringOrBlocks::Str(s) => s,
+            StringOrBlocks::Str(s) => strip_volatile_system(&s),
             StringOrBlocks::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
                     AnthContentBlock::Text { text } => Some(text.as_str()),
                     _ => None,
                 })
+                // Drop volatile/telemetry lines that change every call and would
+                // otherwise poison prefix-cache reuse (they sit at the very front
+                // of the prompt). Claude Code prepends an `x-anthropic-billing-header`
+                // block whose `cc_version` suffix changes per request.
+                .filter(|t| !is_volatile_system_text(t))
                 .collect::<Vec<_>>()
                 .join("\n"),
         };
