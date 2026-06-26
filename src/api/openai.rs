@@ -48,13 +48,61 @@ pub struct OaiToolCall {
     pub function: OaiFunctionCall,
 }
 
+/// A message `content` value: a plain string, or an array of content parts
+/// (newer OpenAI / Codex clients send the array form, e.g. text + image_url).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OaiContent {
+    Text(String),
+    Parts(Vec<OaiContentPart>),
+}
+
+impl OaiContent {
+    /// Flatten to plain text: a bare string as-is, or the concatenation of the
+    /// text parts (non-text parts like `image_url` are dropped).
+    pub fn into_text(self) -> String {
+        match self {
+            OaiContent::Text(s) => s,
+            OaiContent::Parts(parts) => parts
+                .into_iter()
+                .filter_map(|p| match p {
+                    OaiContentPart::Text { text } => Some(text),
+                    OaiContentPart::Other => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+}
+
+/// A single part inside an array-form `content`. Only text is mapped; any other
+/// part type (`image_url`, `input_audio`, …) is accepted and ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OaiContentPart {
+    Text { text: String },
+    #[serde(other)]
+    Other,
+}
+
+/// Flatten an optional `content` to optional plain text (empty → `None`).
+fn content_to_text(content: Option<OaiContent>) -> Option<String> {
+    let s = content.map(|c| c.into_text()).unwrap_or_default();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// A single message in the request `messages` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OaiMessage {
     pub role: String,
-    /// Present for `user`, `system`, and `tool` messages (may be null for assistant).
+    /// Present for `user`, `system`/`developer`, and `tool` messages (may be
+    /// null for assistant). String or array-of-parts form.
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<OaiContent>,
     /// `tool_call_id` is present only for `role:"tool"` messages.
     #[serde(default)]
     pub tool_call_id: Option<String>,
@@ -144,7 +192,8 @@ pub fn to_internal(req: OaiChatRequest) -> Result<ChatRequest, String> {
 
     for msg in req.messages {
         let role = match msg.role.as_str() {
-            "system" => Role::System,
+            // `developer` is the newer OpenAI name for the system role.
+            "system" | "developer" => Role::System,
             "user" => Role::User,
             "assistant" => Role::Assistant,
             "tool" => Role::Tool,
@@ -157,8 +206,7 @@ pub fn to_internal(req: OaiChatRequest) -> Result<ChatRequest, String> {
                 let tool_call_id = msg
                     .tool_call_id
                     .ok_or_else(|| "tool message missing tool_call_id".to_string())?;
-                let content = msg
-                    .content
+                let content = content_to_text(msg.content)
                     .ok_or_else(|| "tool message missing content".to_string())?;
                 ChatMessage {
                     role,
@@ -184,14 +232,14 @@ pub fn to_internal(req: OaiChatRequest) -> Result<ChatRequest, String> {
                     .collect();
                 ChatMessage {
                     role,
-                    text: msg.content,
+                    text: content_to_text(msg.content),
                     tool_calls,
                     tool_result: None,
                 }
             }
             _ => ChatMessage {
                 role,
-                text: msg.content,
+                text: content_to_text(msg.content),
                 tool_calls: vec![],
                 tool_result: None,
             },
@@ -461,6 +509,39 @@ mod tests {
         assert_eq!(oai.choices[0].finish_reason, "tool_calls");
         assert_eq!(oai.choices[0].message.tool_calls.as_ref().unwrap()[0].function.name,
             "get_weather");
+    }
+
+    #[test]
+    fn parses_array_content_and_ignores_non_text_parts() {
+        // Codex/newer OpenAI shape: content is an array of parts (text + image).
+        let json = r#"{"model":"m","messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"describe this"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+            ]}
+        ]}"#;
+        let req: OaiChatRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages[0].role, Role::User);
+        assert_eq!(internal.messages[0].text.as_deref(), Some("describe this"));
+    }
+
+    #[test]
+    fn developer_role_maps_to_system() {
+        let json = r#"{"model":"m","messages":[{"role":"developer","content":"be terse"}]}"#;
+        let req: OaiChatRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages[0].role, Role::System);
+        assert_eq!(internal.messages[0].text.as_deref(), Some("be terse"));
+    }
+
+    #[test]
+    fn tool_message_with_array_content_flattens() {
+        let json = r#"{"model":"m","messages":[
+            {"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"sunny"}]}]}"#;
+        let req: OaiChatRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages[0].tool_result.as_ref().unwrap().content, "sunny");
     }
 
     #[test]
