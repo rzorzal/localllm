@@ -74,22 +74,25 @@ fn write_token_to(path: &std::path::Path, token: &str) {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)
         {
-            if f.write_all(token.as_bytes()).is_ok() {
-                tracing::info!("admin token written to {}", path.display());
-            }
+            Ok(mut f) => match f.write_all(token.as_bytes()) {
+                Ok(()) => tracing::info!("admin token written to {}", path.display()),
+                Err(e) => tracing::warn!("could not write admin token to {}: {e}", path.display()),
+            },
+            Err(e) => tracing::warn!("could not create admin token file {}: {e}", path.display()),
         }
     }
     #[cfg(not(unix))]
     {
-        if std::fs::write(path, token).is_ok() {
-            tracing::info!("admin token written to {}", path.display());
+        match std::fs::write(path, token) {
+            Ok(()) => tracing::info!("admin token written to {}", path.display()),
+            Err(e) => tracing::warn!("could not write admin token to {}: {e}", path.display()),
         }
     }
 }
@@ -435,7 +438,15 @@ async fn handle_oai_chat(
     };
 
     // --- Routing decision ---
-    if state.manager.is_switching() || state.manager.is_errored() {
+    if state.manager.is_errored() {
+        // The previous model could not be restored — a restart is required.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "model in error state — restart required"})),
+        )
+            .into_response();
+    }
+    if state.manager.is_switching() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Retry-After", "5")],
@@ -610,7 +621,15 @@ async fn handle_anth_messages(
     };
 
     // --- Routing decision ---
-    if state.manager.is_switching() || state.manager.is_errored() {
+    if state.manager.is_errored() {
+        // The previous model could not be restored — a restart is required.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "model in error state — restart required"})),
+        )
+            .into_response();
+    }
+    if state.manager.is_switching() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Retry-After", "5")],

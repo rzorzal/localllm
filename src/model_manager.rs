@@ -285,20 +285,21 @@ impl Generator for ModelManager {
         }
         self.inflight.fetch_add(1, Ordering::SeqCst);
         let counter = self.inflight.clone();
+        // Guard decrements on any early return OR a panic in the await below.
+        // On success we `forget` it and hand the count to the CounterStream,
+        // which decrements for the stream's whole lifetime (no double-decrement).
+        let guard = DecOnDrop(counter.clone());
         // load_full returns Option<Arc<Arc<dyn Generator>>>; deref the outer Arc.
         let engine: Arc<dyn Generator> = match self.engine.load_full() {
             Some(e) => Arc::clone(&*e),
-            None => {
-                counter.fetch_sub(1, Ordering::SeqCst);
-                anyhow::bail!("model switching");
-            }
+            None => anyhow::bail!("model switching"), // guard drops → decrement
         };
         match engine.generate_stream(req).await {
-            Ok(inner) => Ok(Box::pin(CounterStream { inner, counter })),
-            Err(e) => {
-                counter.fetch_sub(1, Ordering::SeqCst);
-                Err(e)
+            Ok(inner) => {
+                std::mem::forget(guard); // CounterStream now owns the decrement
+                Ok(Box::pin(CounterStream { inner, counter }))
             }
+            Err(e) => Err(e), // guard drops → decrement
         }
     }
 }
@@ -403,6 +404,76 @@ mod tests {
     fn req() -> ChatRequest {
         ChatRequest { messages: vec![], tools: vec![], max_tokens: None,
             temperature: None, stream: false, model: "m".into() }
+    }
+
+    /// A generator whose `generate` blocks until a oneshot is fired — lets a test
+    /// hold a request in-flight to exercise the switch drain.
+    struct BlockingGen(tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+    #[async_trait::async_trait]
+    impl Generator for BlockingGen {
+        async fn generate(&self, _req: ChatRequest) -> anyhow::Result<ChatResult> {
+            if let Some(rx) = self.0.lock().await.take() {
+                let _ = rx.await;
+            }
+            Ok(ChatResult {
+                content: vec![ContentPart::Text("blocked".into())],
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+        async fn generate_stream(
+            &self,
+            _req: ChatRequest,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    /// Spec: while a switch is in progress, requests are rejected — the source of
+    /// the HTTP 503 gate.
+    #[tokio::test]
+    async fn requests_bail_while_switching() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let builder: EngineBuilder = Box::new(move |_spec| {
+            let rx = rx.clone();
+            Box::pin(async move {
+                if let Some(rx) = rx.lock().await.take() { let _ = rx.await; }
+                Ok(marker_gen("new"))
+            })
+        });
+        let m = ModelManager::new(marker_gen("orig"), spec("r", "old"), builder);
+        m.start_switch(spec("r2", "new")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(m.is_switching());
+        let err = m.generate(req()).await.unwrap_err();
+        assert!(err.to_string().contains("model switching"), "got: {err}");
+        let _ = tx.send(());
+        wait_ready(&m).await;
+    }
+
+    /// Spec: an in-flight request delays the switch (drain) until it completes.
+    #[tokio::test]
+    async fn drain_waits_for_inflight_then_switches() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let blocking =
+            Arc::new(BlockingGen(tokio::sync::Mutex::new(Some(rx)))) as Arc<dyn Generator>;
+        let m = ModelManager::new(blocking, spec("r", "old"), noop_builder());
+        // Hold a request in-flight.
+        let m2 = m.clone();
+        let handle = tokio::spawn(async move { let _ = m2.generate(req()).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Start a switch — it must wait (drain) while the request is in flight.
+        m.start_switch(spec("r2", "new")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(m.is_switching(), "switch should still be draining");
+        assert_eq!(m.status().phase, SwitchPhase::Draining);
+        // Release the in-flight request → drain completes → switch proceeds.
+        let _ = tx.send(());
+        handle.await.unwrap();
+        wait_ready(&m).await;
+        assert_eq!(m.status().current, spec("r2", "new"));
     }
 
     #[tokio::test]
