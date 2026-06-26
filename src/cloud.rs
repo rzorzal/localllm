@@ -52,11 +52,33 @@ fn is_skipped_header(name: &str) -> bool {
     )
 }
 
+/// Result of a reverse-proxy attempt.
+pub enum ForwardOutcome {
+    /// Upstream produced a client-relevant response (relay it verbatim).
+    Relayed(Response),
+    /// Upstream failed in a way that should degrade to local + notify.
+    Degrade(crate::usage::DegradeReason),
+}
+
+/// A clean 502 to return to the client when degrade-to-local is impossible
+/// (e.g. the prompt overflows the local window). Carries no credential/internal
+/// detail beyond the reason category.
+pub fn degrade_error(reason: crate::usage::DegradeReason) -> Response {
+    Response::builder()
+        .status(502)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({"error": reason.message()}).to_string(),
+        ))
+        .unwrap()
+}
+
 /// Reverse-proxy `body` to `provider`, forwarding the client's headers
-/// (including its credential) unchanged, and relay the streamed response.
-/// On any transport error, return HTTP 502 (graceful local fallback arrives in
-/// Phase D).
-pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> Response {
+/// (including its credential) unchanged. Returns `Relayed` with the streamed
+/// response on success, or `Degrade(reason)` on a failure the caller should
+/// handle by falling back to local. Credentials are never logged.
+pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> ForwardOutcome {
+    use crate::usage::DegradeReason;
     let url = format!("{}{}", provider.base_url(), provider.path());
 
     let mut fwd = HeaderMap::new();
@@ -69,29 +91,32 @@ pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> Re
     let upstream = match shared_client().post(&url).headers(fwd).body(body).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(target: "localllm::req", "cloud forward error: {e}");
-            return Response::builder()
-                .status(502)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({"error": "cloud upstream request failed"})
-                        .to_string(),
-                ))
-                .unwrap();
+            tracing::error!(target: "localllm::req", "cloud forward transport error: {e}");
+            return ForwardOutcome::Degrade(DegradeReason::Offline);
         }
     };
 
     let status = upstream.status();
-    let mut resp_headers = axum::http::HeaderMap::new();
+    if let Some(reason) = match status.as_u16() {
+        401 | 403 => Some(DegradeReason::Auth),
+        429 => Some(DegradeReason::Quota),
+        s if s >= 500 => Some(DegradeReason::ServerError),
+        _ => None,
+    } {
+        tracing::warn!(target: "localllm::req", "cloud upstream status {status} → degrade {reason:?}");
+        return ForwardOutcome::Degrade(reason);
+    }
+
+    let mut resp_headers = HeaderMap::new();
     for (name, value) in upstream.headers().iter() {
         if !is_skipped_header(name.as_str()) {
             resp_headers.insert(name.clone(), value.clone());
         }
     }
     let stream = upstream.bytes_stream();
-    let mut builder = axum::response::Response::builder().status(status);
+    let mut builder = Response::builder().status(status);
     *builder.headers_mut().unwrap() = resp_headers;
-    builder.body(axum::body::Body::from_stream(stream)).unwrap()
+    ForwardOutcome::Relayed(builder.body(axum::body::Body::from_stream(stream)).unwrap())
 }
 
 #[cfg(test)]
@@ -121,7 +146,11 @@ mod tests {
         headers.insert("x-api-key", "sk-test".parse().unwrap());
         let body = Bytes::from_static(br#"{"model":"claude","messages":[]}"#);
 
-        let resp = forward(Provider::Anthropic, &headers, body).await;
+        let outcome = forward(Provider::Anthropic, &headers, body).await;
+        let resp = match outcome {
+            ForwardOutcome::Relayed(r) => r,
+            ForwardOutcome::Degrade(d) => panic!("expected relay, got degrade {d:?}"),
+        };
         assert_eq!(resp.status(), 200);
 
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -133,10 +162,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_unreachable_returns_502() {
+    async fn unreachable_upstream_degrades_offline() {
         std::env::set_var("LOCALLLM_OPENAI_BASE", "http://127.0.0.1:1"); // nothing listening
-        let resp = forward(Provider::OpenAI, &HeaderMap::new(), Bytes::new()).await;
-        assert_eq!(resp.status(), 502);
+        let outcome = forward(Provider::OpenAI, &HeaderMap::new(), Bytes::new()).await;
+        assert!(matches!(
+            outcome,
+            ForwardOutcome::Degrade(crate::usage::DegradeReason::Offline)
+        ));
         std::env::remove_var("LOCALLLM_OPENAI_BASE");
+    }
+
+    async fn outcome_for_status(status: u16) -> ForwardOutcome {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        std::env::set_var("LOCALLLM_OPENAI_BASE", server.uri());
+        let out = forward(Provider::OpenAI, &HeaderMap::new(), Bytes::new()).await;
+        std::env::remove_var("LOCALLLM_OPENAI_BASE");
+        out
+    }
+
+    #[tokio::test]
+    async fn status_401_degrades_auth() {
+        assert!(matches!(
+            outcome_for_status(401).await,
+            ForwardOutcome::Degrade(crate::usage::DegradeReason::Auth)
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_429_degrades_quota() {
+        assert!(matches!(
+            outcome_for_status(429).await,
+            ForwardOutcome::Degrade(crate::usage::DegradeReason::Quota)
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_500_degrades_server_error() {
+        assert!(matches!(
+            outcome_for_status(500).await,
+            ForwardOutcome::Degrade(crate::usage::DegradeReason::ServerError)
+        ));
     }
 }

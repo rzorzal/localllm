@@ -87,7 +87,10 @@ async fn cascade_or_result(
         Ok(result) => {
             if want_cascade && crate::route::is_weak_result(&result) {
                 tracing::info!(target: "localllm::req", "{rid} [{api}] cascade: weak local (length) → escalating to cloud");
-                Err(crate::cloud::forward(provider, headers, raw).await)
+                match crate::cloud::forward(provider, headers, raw).await {
+                    crate::cloud::ForwardOutcome::Relayed(resp) => Err(resp),
+                    crate::cloud::ForwardOutcome::Degrade(d) => Err(crate::cloud::degrade_error(d)),
+                }
             } else {
                 Ok(result)
             }
@@ -95,7 +98,10 @@ async fn cascade_or_result(
         Err(e) => {
             if want_cascade {
                 tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade: local generate failed ({e}) → escalating to cloud");
-                Err(crate::cloud::forward(provider, headers, raw).await)
+                match crate::cloud::forward(provider, headers, raw).await {
+                    crate::cloud::ForwardOutcome::Relayed(resp) => Err(resp),
+                    crate::cloud::ForwardOutcome::Degrade(d) => Err(crate::cloud::degrade_error(d)),
+                }
             } else {
                 tracing::error!(target: "localllm::req", "{rid} [{api}] 500 generate: {e}");
                 Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response())
@@ -223,7 +229,10 @@ async fn handle_oai_chat(
     let want_cascade = match route_decision(&state, &internal, &headers) {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
-            return crate::cloud::forward(crate::cloud::Provider::OpenAI, &headers, raw).await;
+            return match crate::cloud::forward(crate::cloud::Provider::OpenAI, &headers, raw).await {
+                crate::cloud::ForwardOutcome::Relayed(resp) => resp,
+                crate::cloud::ForwardOutcome::Degrade(d) => crate::cloud::degrade_error(d),
+            };
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [openai] route=local (cloud wanted but no creds/disallowed)");
@@ -372,7 +381,10 @@ async fn handle_anth_messages(
     let want_cascade = match route_decision(&state, &internal, &headers) {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
-            return crate::cloud::forward(crate::cloud::Provider::Anthropic, &headers, raw).await;
+            return match crate::cloud::forward(crate::cloud::Provider::Anthropic, &headers, raw).await {
+                crate::cloud::ForwardOutcome::Relayed(resp) => resp,
+                crate::cloud::ForwardOutcome::Degrade(d) => crate::cloud::degrade_error(d),
+            };
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [anthropic] route=local (cloud wanted but no creds/disallowed)");
