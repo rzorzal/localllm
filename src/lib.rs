@@ -4,6 +4,7 @@ pub mod config;
 pub mod download;
 pub mod engine;
 pub mod engine_llama;
+pub mod model_manager;
 pub mod route;
 pub mod settings;
 pub mod usage;
@@ -90,6 +91,39 @@ pub async fn run_server_with_ready_and_policy(
     }
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Test/diagnostic generator whose responses echo a fixed tag, so a test can
+/// tell which engine instance is currently serving (used by hot-swap tests).
+pub mod test_support {
+    use crate::api::common::{ChatResult, ContentPart, FinishReason, StreamDelta};
+    use crate::server::Generator;
+    use futures::stream::BoxStream;
+
+    pub struct TaggedGen(pub &'static str);
+
+    #[async_trait::async_trait]
+    impl Generator for TaggedGen {
+        async fn generate(&self, _req: crate::api::common::ChatRequest) -> anyhow::Result<ChatResult> {
+            Ok(ChatResult {
+                content: vec![ContentPart::Text(self.0.to_string())],
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+        async fn generate_stream(
+            &self,
+            _req: crate::api::common::ChatRequest,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
+            let tag = self.0.to_string();
+            let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
+                Ok(StreamDelta { text: Some(tag), done: false, finish_reason: None }),
+                Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) }),
+            ];
+            Ok(Box::pin(futures::stream::iter(deltas)))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ encoding_rs = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 dirs = "5"
 futures-util = "0.3"
+arc-swap = "1"
 # Cross-platform desktop notifications (Linux libnotify/D-Bus, Windows toast,
 # macOS native — picks up the .app bundle icon when launched from the bundle).
 notify-rust = "4"
