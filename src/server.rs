@@ -101,7 +101,10 @@ fn write_token_to(path: &std::path::Path, token: &str) {
 /// the SPA can authenticate against /admin/* without reading the token file.
 /// `token` is a 32-hex string (no quotes/escapes), safe in a JS string literal.
 pub fn manager_init_script(token: &str) -> String {
-    format!("window.__ADMIN_TOKEN__='{token}';")
+    // JSON-encode the token so any value (even a custom --admin-token with
+    // quotes/backslashes) yields a valid, injection-safe JS string literal.
+    let encoded = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+    format!("window.__ADMIN_TOKEN__={encoded};")
 }
 
 /// GET /manager — the Model Manager SPA (static, no auth).
@@ -908,8 +911,13 @@ mod tests {
     #[test]
     fn manager_init_script_injects_token() {
         let s = super::manager_init_script("abc123");
-        assert_eq!(s, "window.__ADMIN_TOKEN__='abc123';");
+        assert_eq!(s, "window.__ADMIN_TOKEN__=\"abc123\";");
         assert!(s.contains("abc123"));
+        // A token with a quote stays valid JS (escaped), not broken.
+        let s2 = super::manager_init_script("a'b\"c");
+        assert!(s2.starts_with("window.__ADMIN_TOKEN__="));
+        assert!(s2.ends_with(";"));
+        assert!(s2.contains("\\\"")); // the double-quote is escaped
     }
 
     #[test]

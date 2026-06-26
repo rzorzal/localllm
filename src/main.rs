@@ -121,8 +121,9 @@ fn main() -> anyhow::Result<()> {
         localllm::tray::run_tray(args.config, token);
     }
 
-    // --- Headless mode (default) ---
-    // Also the fallback on non-macOS even if --tray was passed.
+    // --- Headless mode ---
+    // Reached only when want_tray is false (no --tray and not a macOS bundle
+    // launch); run_tray is `-> !` so it never returns here.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
