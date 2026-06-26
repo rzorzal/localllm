@@ -35,9 +35,11 @@ pub mod macos {
 
     use tray_icon::{
         TrayIconBuilder,
-        menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+        menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
         Icon,
     };
+    use std::sync::{Arc, RwLock};
+    use crate::route::{Profile, RoutingPolicy};
     use tao::event::{Event, StartCause};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
@@ -182,13 +184,20 @@ pub mod macos {
         let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready_for_server = ready.clone();
 
+        // Resolve the startup profile (CLI > saved > default) and build the
+        // policy the menu and server share. The menu mutates it live.
+        let initial_profile = crate::settings::resolve_profile(cfg.profile);
+        let policy: Arc<RwLock<RoutingPolicy>> =
+            Arc::new(RwLock::new(initial_profile.policy()));
+        let policy_for_server = policy.clone();
+
         // ---- Spawn server on a background thread with its own tokio runtime ----
         std::thread::Builder::new()
             .name("localllm-server".to_string())
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new()
                     .expect("failed to build server tokio runtime");
-                if let Err(e) = rt.block_on(crate::run_server_with_ready(cfg, Some(ready_for_server))) {
+                if let Err(e) = rt.block_on(crate::run_server_with_ready_and_policy(cfg, Some(ready_for_server), policy_for_server)) {
                     tracing::error!("server exited with error: {e:#}");
                     std::process::exit(1);
                 }
@@ -216,6 +225,10 @@ pub mod macos {
         // Kept so we can flip the status text to "running" once the server is up.
         let mut status_handle: Option<MenuItem> = None;
         let mut shown_running = false;
+        // Routing submenu state: (menu id, profile, check item) for each profile,
+        // populated in Init and used to dispatch clicks + re-check on change.
+        let mut routing_items: Vec<(tray_icon::menu::MenuId, Profile, CheckMenuItem)> = Vec::new();
+        let mut routing_status: Option<MenuItem> = None;
         let log_path = std::env::var("LOCALLLM_LOG")
             .unwrap_or_else(|_| "/tmp/localllm.log".to_string());
 
@@ -246,11 +259,29 @@ pub mod macos {
                     let ctx_line = MenuItem::new(format!("Context: {info_ctx} tokens"), false, None);
                     let kv_line = MenuItem::new(format!("KV cache: {info_kv}"), false, None);
                     let backend_line = MenuItem::new(format!("Backend: {info_backend}"), false, None);
-                    let separator = PredefinedMenuItem::separator();
                     let logs_item = MenuItem::new("Open Logs", true, None);
                     logs_id = Some(logs_item.id().clone());
                     let quit_item = MenuItem::new("Quit localllm", true, None);
                     quit_id = Some(quit_item.id().clone());
+
+                    // Routing profile selector (live; persists on click).
+                    let routing_submenu = Submenu::new("Routing", true);
+                    for p in Profile::ALL {
+                        let item = CheckMenuItem::new(
+                            p.label(),
+                            true,
+                            p == initial_profile,
+                            None,
+                        );
+                        routing_items.push((item.id().clone(), p, item.clone()));
+                        routing_submenu.append(&item).expect("append routing item");
+                    }
+                    let routing_line = MenuItem::new(
+                        format!("Routing: {}", initial_profile.label()),
+                        false,
+                        None,
+                    );
+                    routing_status = Some(routing_line.clone());
 
                     menu.append(&title).expect("append title");
                     menu.append(&status).expect("append status");
@@ -260,7 +291,10 @@ pub mod macos {
                     menu.append(&ctx_line).expect("append ctx");
                     menu.append(&kv_line).expect("append kv");
                     menu.append(&backend_line).expect("append backend");
-                    menu.append(&separator).expect("append separator");
+                    menu.append(&PredefinedMenuItem::separator()).expect("sep2");
+                    menu.append(&routing_line).expect("append routing line");
+                    menu.append(&routing_submenu).expect("append routing submenu");
+                    menu.append(&PredefinedMenuItem::separator()).expect("append separator");
                     menu.append(&logs_item).expect("append logs item");
                     menu.append(&quit_item).expect("append quit item");
 
@@ -299,6 +333,22 @@ pub mod macos {
                             open_log_file(&log_path);
                         } else if url_id.as_ref() == Some(&menu_event.id) {
                             copy_to_clipboard(&url_for_tray);
+                        } else if let Some((_, profile, _)) =
+                            routing_items.iter().find(|(id, _, _)| id == &menu_event.id)
+                        {
+                            let chosen = *profile;
+                            crate::route::policy::apply_profile(&policy, chosen);
+                            if let Err(e) = crate::settings::save_profile(chosen) {
+                                tracing::warn!("failed to persist routing profile: {e}");
+                            }
+                            // Re-check exactly the chosen item; update the status line.
+                            for (_, p, item) in &routing_items {
+                                item.set_checked(*p == chosen);
+                            }
+                            if let Some(s) = &routing_status {
+                                s.set_text(format!("Routing: {}", chosen.label()));
+                            }
+                            tracing::info!("routing profile set via tray: {chosen:?}");
                         }
                     }
                 }

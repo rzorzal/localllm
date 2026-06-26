@@ -23,6 +23,24 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// All profiles in the order they appear in the tray menu.
+    pub const ALL: [Profile; 4] = [
+        Profile::SaveTokens,
+        Profile::Balanced,
+        Profile::MaxQuality,
+        Profile::LocalOnly,
+    ];
+
+    /// Human-readable menu/status label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Profile::SaveTokens => "Save tokens (local-first)",
+            Profile::Balanced => "Balanced (smart)",
+            Profile::MaxQuality => "Max quality (cloud-first)",
+            Profile::LocalOnly => "Local only (offline)",
+        }
+    }
+
     /// Map a profile to its concrete routing knobs.
     pub fn policy(&self) -> RoutingPolicy {
         match self {
@@ -68,9 +86,36 @@ pub struct RoutingPolicy {
     pub allow_cloud: bool,
 }
 
+/// Write `p`'s knobs into the shared policy under the lock. Used by the tray to
+/// switch routing live without a restart.
+pub fn apply_profile(lock: &std::sync::RwLock<RoutingPolicy>, p: Profile) {
+    *lock.write().unwrap() = p.policy();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_lists_every_profile_in_menu_order() {
+        assert_eq!(
+            Profile::ALL,
+            [Profile::SaveTokens, Profile::Balanced, Profile::MaxQuality, Profile::LocalOnly]
+        );
+    }
+
+    #[test]
+    fn labels_are_human_readable() {
+        assert_eq!(Profile::SaveTokens.label(), "Save tokens (local-first)");
+        assert_eq!(Profile::LocalOnly.label(), "Local only (offline)");
+    }
+
+    #[test]
+    fn apply_profile_updates_policy_live() {
+        let lock = std::sync::RwLock::new(Profile::SaveTokens.policy());
+        apply_profile(&lock, Profile::MaxQuality);
+        assert_eq!(*lock.read().unwrap(), Profile::MaxQuality.policy());
+    }
 
     #[test]
     fn save_tokens_is_local_biased_and_allows_cloud() {
