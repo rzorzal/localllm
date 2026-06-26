@@ -105,6 +105,12 @@ pub struct Config {
     /// fires (suggesting the Save-tokens profile). Default 200_000.
     #[arg(long, default_value_t = 200_000)]
     pub cloud_token_alert: usize,
+
+    /// Token required on /admin/* control endpoints (X-Admin-Token header).
+    /// If unset, a random token is generated at startup and written to
+    /// <config-dir>/localllm/admin-token (0600).
+    #[arg(long)]
+    pub admin_token: Option<String>,
 }
 
 impl Config {
@@ -208,5 +214,13 @@ mod tests {
         assert_eq!(c.cloud_token_alert, 200_000);
         let c = Config::parse_from(["localllm", "--cloud-token-alert", "50000"]);
         assert_eq!(c.cloud_token_alert, 50_000);
+    }
+
+    #[test]
+    fn admin_token_flag_parses_and_defaults_none() {
+        let c = Config::parse_from(["localllm"]);
+        assert_eq!(c.admin_token, None);
+        let c = Config::parse_from(["localllm", "--admin-token", "secret123"]);
+        assert_eq!(c.admin_token.as_deref(), Some("secret123"));
     }
 }

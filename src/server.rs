@@ -30,6 +30,47 @@ use crate::api::common::{ChatRequest, ChatResult, StreamDelta};
 use crate::api::openai::{OaiChatRequest, OaiModelInfo, OaiModelList};
 use crate::api::anthropic::AnthRequest;
 
+/// Constant-time byte comparison: false on length mismatch, otherwise XOR-
+/// accumulate so the timing does not depend on where the first difference is.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Resolve the admin token: the CLI value, else a fresh random 32-hex string.
+pub fn resolve_admin_token(cli: Option<String>) -> String {
+    cli.unwrap_or_else(|| {
+        let u = uuid::Uuid::new_v4();
+        // 32 hex chars (no dashes)
+        u.simple().to_string()
+    })
+}
+
+/// Best-effort: write the admin token to `<config-dir>/localllm/admin-token`
+/// with 0600 perms so the tray/window/CLI can read it. Logs only that it wrote
+/// the file, never the value.
+pub fn write_admin_token_file(token: &str) {
+    let Some(dir) = dirs::config_dir() else { return };
+    let path = dir.join("localllm").join("admin-token");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&path, token).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        tracing::info!("admin token written to {}", path.display());
+    }
+}
+
 /// Generate a short per-request id (e.g. `req-1a2b3c4d`) used to correlate the
 /// start/finish log lines of a single prompt when several run concurrently.
 fn new_request_id() -> String {
@@ -609,4 +650,23 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<OaiModelList>
 /// GET /health
 async fn handle_health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(super::constant_time_eq(b"abc", b"abc"));
+        assert!(!super::constant_time_eq(b"abc", b"abd"));
+        assert!(!super::constant_time_eq(b"abc", b"abcd")); // length mismatch
+        assert!(!super::constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn resolve_admin_token_uses_cli_else_random() {
+        assert_eq!(super::resolve_admin_token(Some("z".into())), "z");
+        let r = super::resolve_admin_token(None);
+        assert_eq!(r.len(), 32); // random 32-hex
+        assert_ne!(super::resolve_admin_token(None), r); // different each call
+    }
 }
