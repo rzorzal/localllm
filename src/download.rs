@@ -113,6 +113,18 @@ pub async fn ensure_model_with_progress(
     Ok(paths)
 }
 
+/// Delete a cached model file (and any leftover `.part`). Returns whether the
+/// main file existed and was removed. Best-effort on the `.part`.
+pub fn delete_cached(repo: &str, file: &str) -> std::io::Result<bool> {
+    let path = cache_path(repo, file);
+    let _ = std::fs::remove_file(path.with_extension("part"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// For each file in `files`, if it already exists in cache and is non-empty,
 /// skip it; otherwise download it from HuggingFace, streaming to a `.part`
 /// temp file and renaming on success.  Returns the local paths in order.
@@ -201,6 +213,22 @@ mod tests {
         assert_eq!(last_total, Some(1000));
         assert!(dest.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_cached_removes_file_then_reports_absent() {
+        // Create a real cached file at the canonical path for a throwaway repo.
+        let repo = format!("test--del-{}", uuid::Uuid::new_v4());
+        let file = "m.gguf";
+        let path = cache_path(&repo, file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"data").unwrap();
+
+        assert!(delete_cached(&repo, file).unwrap()); // removed
+        assert!(!path.exists());
+        assert!(!delete_cached(&repo, file).unwrap()); // already gone
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Skip-path integration test: create a dummy file at the cache location
