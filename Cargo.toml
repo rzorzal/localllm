@@ -38,6 +38,14 @@ wiremock = "0.6"
 lto = true
 codegen-units = 1
 
+# Dev-iteration release build: same opt level but no LTO and parallel codegen,
+# so the final link of the big statically-linked binary takes ~30s instead of
+# minutes. Used by `scripts/build-app.sh --fast`. Not for distribution.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [package.metadata.bundle]
 name = "localllm"
 identifier = "dev.localllm.app"

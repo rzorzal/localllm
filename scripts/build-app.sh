@@ -8,7 +8,8 @@
 #     without modifying the compiled binary's defaults
 #
 # Usage:
-#   bash scripts/build-app.sh
+#   bash scripts/build-app.sh           # full LTO release (for distribution)
+#   bash scripts/build-app.sh --fast    # non-LTO release-fast (~30s link, dev)
 #
 # Output: target/localllm.app
 #
@@ -30,10 +31,17 @@ APP_NAME="localllm"
 BUNDLE_ID="dev.localllm.app"
 APP_OUT="$REPO_ROOT/target/${APP_NAME}.app"
 
-echo "==> Building release binary…"
-cargo build --release
+# --fast → non-LTO release-fast profile (parallel codegen): the final link of
+# the big statically-linked binary drops from minutes to ~30s for dev iteration.
+PROFILE="release"
+if [[ "${1:-}" == "--fast" ]]; then
+    PROFILE="release-fast"
+fi
 
-BINARY="$REPO_ROOT/target/release/${APP_NAME}"
+echo "==> Building ${PROFILE} binary…"
+cargo build --profile "$PROFILE"
+
+BINARY="$REPO_ROOT/target/${PROFILE}/${APP_NAME}"
 if [[ ! -f "$BINARY" ]]; then
     echo "ERROR: release binary not found at $BINARY" >&2
     exit 1
