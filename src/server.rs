@@ -61,13 +61,39 @@ pub fn write_admin_token_file(token: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if std::fs::write(&path, token).is_ok() {
-        #[cfg(unix)]
+    write_token_to(&path, token);
+}
+
+/// Core of `write_admin_token_file`: atomically creates the file at `path` with
+/// mode 0600 (unix) before writing, so the token is never world-readable even
+/// briefly. Extracted for testability. Best-effort — no panics.
+fn write_token_to(path: &std::path::Path, token: &str) {
+    // Remove any pre-existing file so create+mode applies cleanly.
+    let _ = std::fs::remove_file(path);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            Ok(mut f) => {
+                if f.write_all(token.as_bytes()).is_ok() {
+                    tracing::info!("admin token written to {}", path.display());
+                }
+            }
+            Err(_) => {}
         }
-        tracing::info!("admin token written to {}", path.display());
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::write(path, token).is_ok() {
+            tracing::info!("admin token written to {}", path.display());
+        }
     }
 }
 
@@ -668,5 +694,19 @@ mod tests {
         let r = super::resolve_admin_token(None);
         assert_eq!(r.len(), 32); // random 32-hex
         assert_ne!(super::resolve_admin_token(None), r); // different each call
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_created_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tok-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("admin-token");
+        super::write_token_to(&path, "sekret");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sekret");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
