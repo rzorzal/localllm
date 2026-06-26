@@ -423,3 +423,23 @@ async fn admin_delete_path_traversal_file_is_400() {
     ).await;
     assert_eq!(status, 400);
 }
+
+#[tokio::test]
+async fn manager_page_served_no_auth() {
+    let app = localllm::router_for_test();
+    let (status, ctype, body) = localllm::axum_test_get_full(app, "/manager").await;
+    assert_eq!(status, 200);
+    assert!(ctype.starts_with("text/html"));
+    assert!(body.contains("<html") || body.contains("<!doctype") || body.contains("<!DOCTYPE"));
+}
+
+#[tokio::test]
+async fn manager_assets_served_with_types() {
+    let app = localllm::router_for_test();
+    let (s1, c1, _b1) = localllm::axum_test_get_full(app.clone(), "/manager/app.js").await;
+    assert_eq!(s1, 200);
+    assert!(c1.contains("javascript"));
+    let (s2, c2, _b2) = localllm::axum_test_get_full(app, "/manager/style.css").await;
+    assert_eq!(s2, 200);
+    assert!(c2.contains("css"));
+}

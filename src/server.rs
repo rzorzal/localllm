@@ -97,6 +97,43 @@ fn write_token_to(path: &std::path::Path, token: &str) {
     }
 }
 
+/// The webview initialization script that injects the admin token in-memory so
+/// the SPA can authenticate against /admin/* without reading the token file.
+/// `token` is a 32-hex string (no quotes/escapes), safe in a JS string literal.
+pub fn manager_init_script(token: &str) -> String {
+    format!("window.__ADMIN_TOKEN__='{token}';")
+}
+
+/// GET /manager — the Model Manager SPA (static, no auth).
+async fn handle_manager_page() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [("content-type", "text/html; charset=utf-8")],
+        include_str!("manager_ui/index.html"),
+    )
+        .into_response()
+}
+
+/// GET /manager/app.js
+async fn handle_manager_js() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [("content-type", "text/javascript; charset=utf-8")],
+        include_str!("manager_ui/app.js"),
+    )
+        .into_response()
+}
+
+/// GET /manager/style.css
+async fn handle_manager_css() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("manager_ui/style.css"),
+    )
+        .into_response()
+}
+
 /// Generate a short per-request id (e.g. `req-1a2b3c4d`) used to correlate the
 /// start/finish log lines of a single prompt when several run concurrently.
 fn new_request_id() -> String {
@@ -332,6 +369,9 @@ pub fn router(
         .route("/admin/model", post(handle_admin_switch))
         .route("/admin/model/status", get(handle_admin_status))
         .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
+        .route("/manager", get(handle_manager_page))
+        .route("/manager/app.js", get(handle_manager_js))
+        .route("/manager/style.css", get(handle_manager_css))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -865,6 +905,13 @@ async fn handle_health() -> Json<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manager_init_script_injects_token() {
+        let s = super::manager_init_script("abc123");
+        assert_eq!(s, "window.__ADMIN_TOKEN__='abc123';");
+        assert!(s.contains("abc123"));
+    }
+
     #[test]
     fn constant_time_eq_matches_and_rejects() {
         assert!(super::constant_time_eq(b"abc", b"abc"));

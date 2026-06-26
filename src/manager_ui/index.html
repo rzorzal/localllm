@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>localllm — Model Manager</title>
+  <link rel="stylesheet" href="/manager/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span>localllm</span>
+      <span class="sub">Model Manager</span>
+    </div>
+    <div id="active" class="active" aria-live="polite">—</div>
+  </header>
+
+  <nav id="crumbs" class="crumbs"></nav>
+
+  <main id="view" class="view">
+    <div class="loading">Loading catalog…</div>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="/manager/app.js"></script>
+</body>
+</html>

@@ -307,6 +307,20 @@ pub fn router_for_test() -> Router {
     )
 }
 
+/// GET `path` → (status, content-type, body string).
+pub async fn axum_test_get_full(app: Router, path: &str) -> (u16, String, String) {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder().method("GET").uri(path).body(Body::empty()).unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let ctype = response.headers().get("content-type")
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, ctype, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// GET `path` on `app` → HTTP status code (for auth-gate tests).
 pub async fn axum_test_get_status(app: Router, path: &str) -> u16 {
     use axum::body::Body;
