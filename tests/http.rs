@@ -3,7 +3,7 @@
 /// Serialize all tests that read/write process-global env vars (LOCALLLM_*_BASE)
 /// so they cannot race with each other and corrupt each other's cloud-target URL.
 /// `static Mutex` is the lightest per-process lock available without extra crates.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn openai_endpoint_returns_tool_call() {
@@ -110,7 +110,7 @@ async fn overflow_request_routes_to_cloud() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -145,7 +145,7 @@ async fn large_over_2mb_request_routes_to_cloud() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -195,7 +195,7 @@ async fn weak_local_with_cascade_escalates_to_cloud() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -246,7 +246,7 @@ async fn cloud_quota_degrades_to_local() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -273,7 +273,7 @@ async fn cloud_quota_degrades_to_local() {
 /// cannot fall back to local; it returns a clean 502.
 #[tokio::test]
 async fn overflow_cloud_offline_returns_clean_error() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     std::env::set_var("LOCALLLM_ANTHROPIC_BASE", "http://127.0.0.1:1");
     let big = "x".repeat(8000); // > 0.95 * 1000 window → ContextOverflow
     let body = format!(
@@ -299,7 +299,7 @@ async fn overflow_cloud_offline_returns_clean_error() {
 /// (truncated) answer instead of erroring.
 #[tokio::test]
 async fn cascade_cloud_offline_keeps_local_answer() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     std::env::set_var("LOCALLLM_ANTHROPIC_BASE", "http://127.0.0.1:1");
     let body = r#"{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}"#;
     let app = localllm::router_for_test_with(
