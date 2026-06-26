@@ -311,3 +311,51 @@ async fn cascade_cloud_offline_keeps_local_answer() {
     assert_eq!(resp["content"][0]["text"], "local-weak-answer"); // local kept
     std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
 }
+
+// --- Hot-swap admin endpoints (sub-project 1) ---
+
+#[tokio::test]
+async fn admin_status_requires_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_get_status(app, "/admin/model/status").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_status_ok_with_token() {
+    let app = localllm::router_for_test();
+    let resp = localllm::axum_test_get_with_header(
+        app, "/admin/model/status", "x-admin-token", "test-token",
+    ).await;
+    assert_eq!(resp["state"], "ready");
+}
+
+#[tokio::test]
+async fn admin_switch_accepts_with_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_request_status_with_header(
+        app, "/admin/model",
+        r#"{"repo":"r2","file":"f2"}"#, "x-admin-token", "test-token",
+    ).await;
+    assert_eq!(status, 202);
+}
+
+#[tokio::test]
+async fn admin_switch_rejects_bad_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_request_status_with_header(
+        app, "/admin/model",
+        r#"{"repo":"r","file":"f"}"#, "x-admin-token", "wrong",
+    ).await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_switch_bad_body_is_400() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_request_status_with_header(
+        app, "/admin/model",
+        r#"{"repo":"r"}"#, "x-admin-token", "test-token",
+    ).await;
+    assert_eq!(status, 400);
+}

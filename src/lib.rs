@@ -81,7 +81,61 @@ pub async fn run_server_with_ready_and_policy(
 
     crate::usage::enable_notifications();
     let usage = std::sync::Arc::new(crate::usage::Usage::new());
-    let app = router(engine, cfg.model_id.clone(), policy, cfg.ctx_len, usage, cfg.cloud_token_alert);
+
+    // Wrap the initial engine in a hot-swappable ModelManager. The builder
+    // downloads (reporting progress to the manager via a Weak slot to avoid a
+    // reference cycle) then loads a LlamaEngine. A switch always builds a
+    // LlamaEngine (switching backends is out of scope).
+    use crate::model_manager::{EngineBuilder, ModelManager, ModelSpec};
+    let initial_spec = ModelSpec {
+        repo: cfg.model_id.clone(),
+        file: cfg.gguf_files[0].clone(),
+    };
+    let b_ctx_len = cfg.ctx_len;
+    let b_kv_type = cfg.llama_kv_cache_type();
+    let b_kv_dir = cfg.resolved_kv_cache_dir();
+    let manager_slot: Arc<std::sync::OnceLock<std::sync::Weak<ModelManager>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let slot_for_builder = manager_slot.clone();
+    let builder: EngineBuilder = Box::new(move |spec: ModelSpec| {
+        let kv_dir = b_kv_dir.clone();
+        let slot = slot_for_builder.clone();
+        Box::pin(async move {
+            let progress_target = slot.get().and_then(|w| w.upgrade());
+            crate::download::ensure_model_with_progress(
+                &spec.repo,
+                std::slice::from_ref(&spec.file),
+                |done, total| {
+                    if let Some(m) = &progress_target {
+                        let pct = match total {
+                            Some(t) if t > 0 => (done * 100 / t) as u8,
+                            _ => 0,
+                        };
+                        m.set_progress(pct);
+                    }
+                },
+            )
+            .await?;
+            let engine =
+                LlamaEngine::load(&spec.repo, &[spec.file], b_ctx_len, b_kv_type, kv_dir).await?;
+            Ok(Arc::new(engine) as Arc<dyn Generator>)
+        })
+    });
+    let manager = ModelManager::new(engine, initial_spec, builder);
+    let _ = manager_slot.set(Arc::downgrade(&manager));
+
+    let admin_token = crate::server::resolve_admin_token(cfg.admin_token.clone());
+    crate::server::write_admin_token_file(&admin_token);
+
+    let app = router(
+        manager,
+        cfg.model_id.clone(),
+        policy,
+        cfg.ctx_len,
+        usage,
+        cfg.cloud_token_alert,
+        Arc::from(admin_token),
+    );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
 
@@ -205,9 +259,29 @@ pub fn router_for_test_with(
     policy: crate::route::RoutingPolicy,
     local_ctx_window: usize,
 ) -> Router {
+    use crate::model_manager::{EngineBuilder, ModelManager, ModelSpec};
     let policy = Arc::new(std::sync::RwLock::new(policy));
     let usage = Arc::new(crate::usage::Usage::new());
-    crate::server::router(gen, "test-model".to_string(), policy, local_ctx_window, usage, 200_000)
+    // Test builder: an instant TaggedGen("switched") — no download/Metal/network.
+    let builder: EngineBuilder = Box::new(|_spec| {
+        Box::pin(async {
+            Ok(Arc::new(crate::test_support::TaggedGen("switched")) as Arc<dyn Generator>)
+        })
+    });
+    let manager = ModelManager::new(
+        gen,
+        ModelSpec { repo: "test".into(), file: "test".into() },
+        builder,
+    );
+    crate::server::router(
+        manager,
+        "test-model".to_string(),
+        policy,
+        local_ctx_window,
+        usage,
+        200_000,
+        Arc::from("test-token"),
+    )
 }
 
 /// Build a test router wired to `FakeGen`, the default (SaveTokens) policy, and
@@ -218,6 +292,39 @@ pub fn router_for_test() -> Router {
         crate::route::Profile::default().policy(),
         1000,
     )
+}
+
+/// GET `path` on `app` → HTTP status code (for auth-gate tests).
+pub async fn axum_test_get_status(app: Router, path: &str) -> u16 {
+    use axum::body::Body;
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(Body::empty())
+        .unwrap();
+    app.oneshot(request).await.unwrap().status().as_u16()
+}
+
+/// GET `path` on `app` with a header → parsed JSON body.
+pub async fn axum_test_get_with_header(
+    app: Router,
+    path: &str,
+    hname: &str,
+    hval: &str,
+) -> serde_json::Value {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(hname, hval)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 /// Send a POST with a JSON body to `path` on `app` and return the parsed

@@ -74,19 +74,16 @@ fn write_token_to(path: &std::path::Path, token: &str) {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new()
+        if let Ok(mut f) = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)
         {
-            Ok(mut f) => {
-                if f.write_all(token.as_bytes()).is_ok() {
-                    tracing::info!("admin token written to {}", path.display());
-                }
+            if f.write_all(token.as_bytes()).is_ok() {
+                tracing::info!("admin token written to {}", path.display());
             }
-            Err(_) => {}
         }
     }
     #[cfg(not(unix))]
@@ -260,8 +257,8 @@ pub trait Generator: Send + Sync {
 /// Shared state injected into every handler via axum's `State` extractor.
 #[derive(Clone)]
 pub struct AppState {
-    /// The inference backend (real Engine or FakeGen in tests).
-    pub gen: Arc<dyn Generator>,
+    /// The swappable inference backend (also the Generator the handlers call).
+    pub manager: Arc<crate::model_manager::ModelManager>,
     /// The model identifier reported by `GET /v1/models` and used in responses.
     pub model_id: String,
     /// Active routing policy, shared with the tray (writer) — read per request.
@@ -272,6 +269,8 @@ pub struct AppState {
     pub usage: std::sync::Arc<crate::usage::Usage>,
     /// Session cloud-token total that triggers the one-shot high-usage alert.
     pub cloud_token_alert: usize,
+    /// Token required on /admin/* endpoints.
+    pub admin_token: Arc<str>,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -297,20 +296,22 @@ impl Generator for crate::engine::Engine {
 /// the configured model id, the shared routing policy, the local context
 /// window used by the context gate, and the session usage tracker.
 pub fn router(
-    gen: Arc<dyn Generator>,
+    manager: Arc<crate::model_manager::ModelManager>,
     model_id: String,
     policy: Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
     local_ctx_window: usize,
     usage: std::sync::Arc<crate::usage::Usage>,
     cloud_token_alert: usize,
+    admin_token: Arc<str>,
 ) -> Router {
     let state = Arc::new(AppState {
-        gen,
+        manager,
         model_id,
         policy,
         local_ctx_window,
         usage,
         cloud_token_alert,
+        admin_token,
     });
     // Large prompts must reach the routing layer to be forwarded to cloud;
     // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
@@ -320,8 +321,83 @@ pub fn router(
         .route("/v1/messages", post(handle_anth_messages))
         .route("/v1/models", get(handle_models))
         .route("/health", get(handle_health))
+        .route("/admin/model", post(handle_admin_switch))
+        .route("/admin/model/status", get(handle_admin_status))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+
+/// Verify the `X-Admin-Token` header against the configured token (constant-time).
+/// Returns `Some(401 response)` to reject, `None` when the token is valid.
+fn check_admin(headers: &HeaderMap, state: &AppState) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let provided = headers
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if constant_time_eq(provided.as_bytes(), state.admin_token.as_bytes()) {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing or invalid admin token"})),
+            )
+                .into_response(),
+        )
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AdminSwitchBody {
+    repo: String,
+    file: String,
+}
+
+/// POST /admin/model — start a model switch (token-guarded).
+async fn handle_admin_switch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: AdminSwitchBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    if body.repo.is_empty() || body.file.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "repo and file are required"})),
+        )
+            .into_response();
+    }
+    let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file };
+    match state.manager.start_switch(spec) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state": "switching"}))).into_response(),
+        Err(crate::model_manager::SwitchError::AlreadySwitching) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "switch already in progress"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /admin/model/status — report switch progress (token-guarded).
+async fn handle_admin_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    Json(state.manager.status()).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +435,15 @@ async fn handle_oai_chat(
     };
 
     // --- Routing decision ---
+    if state.manager.is_switching() || state.manager.is_errored() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Retry-After", "5")],
+            Json(json!({"error": "model switching, retry shortly"})),
+        )
+            .into_response();
+    }
+
     let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
@@ -396,7 +481,7 @@ async fn handle_oai_chat(
         let id = format!("chatcmpl-{}", Uuid::new_v4());
         let result = match cascade_or_result(
             want_cascade,
-            state.gen.generate(internal).await,
+            state.manager.generate(internal).await,
             crate::cloud::Provider::OpenAI,
             &headers,
             raw,
@@ -429,7 +514,7 @@ async fn handle_oai_chat(
         let model_clone = model.clone();
         let rid_stream = rid.clone();
 
-        let delta_stream = match state.gen.generate_stream(internal).await {
+        let delta_stream = match state.manager.generate_stream(internal).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(target: "localllm::req", "{rid} [openai] 500 stream init: {e}");
@@ -475,7 +560,7 @@ async fn handle_oai_chat(
         // Non-streaming path
         let result = match cascade_or_result(
             want_cascade,
-            state.gen.generate(internal).await,
+            state.manager.generate(internal).await,
             crate::cloud::Provider::OpenAI,
             &headers,
             raw,
@@ -525,6 +610,15 @@ async fn handle_anth_messages(
     };
 
     // --- Routing decision ---
+    if state.manager.is_switching() || state.manager.is_errored() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Retry-After", "5")],
+            Json(json!({"error": "model switching, retry shortly"})),
+        )
+            .into_response();
+    }
+
     let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
@@ -561,7 +655,7 @@ async fn handle_anth_messages(
         // sequence. Incremental streaming cannot frame tool_use blocks safely.
         let result = match cascade_or_result(
             want_cascade,
-            state.gen.generate(internal).await,
+            state.manager.generate(internal).await,
             crate::cloud::Provider::Anthropic,
             &headers,
             raw,
@@ -589,7 +683,7 @@ async fn handle_anth_messages(
     if stream_flag {
         // Streaming path: return Anthropic SSE protocol
         let rid_stream = rid.clone();
-        let delta_stream = match state.gen.generate_stream(internal).await {
+        let delta_stream = match state.manager.generate_stream(internal).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(target: "localllm::req", "{rid} [anthropic] 500 stream init: {e}");
@@ -641,7 +735,7 @@ async fn handle_anth_messages(
         // Non-streaming path
         let result = match cascade_or_result(
             want_cascade,
-            state.gen.generate(internal).await,
+            state.manager.generate(internal).await,
             crate::cloud::Provider::Anthropic,
             &headers,
             raw,
