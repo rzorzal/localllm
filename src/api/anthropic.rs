@@ -14,7 +14,7 @@ use crate::api::common::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub(crate) enum StringOrBlocks {
+pub enum StringOrBlocks {
     Str(String),
     Blocks(Vec<AnthContentBlock>),
 }
@@ -43,8 +43,32 @@ pub enum AnthContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        /// Claude Code sends tool_result content as an array of blocks (text,
+        /// images, …), not just a plain string. Accept both; non-text blocks are
+        /// flattened out in `to_internal`.
+        #[serde(default)]
+        content: StringOrBlocks,
     },
+    /// Any block type we don't model (image, document, thinking, …). Accepted
+    /// and ignored so real Claude Code payloads never fail to parse.
+    #[serde(other)]
+    Other,
+}
+
+/// Flatten a string-or-blocks content value to plain text: a bare string as-is,
+/// or the concatenation of its text blocks (non-text blocks dropped).
+fn flatten_content_text(content: StringOrBlocks) -> String {
+    match content {
+        StringOrBlocks::Str(s) => s,
+        StringOrBlocks::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                AnthContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
 }
 
 /// A single message in the Anthropic `messages` array.
@@ -204,10 +228,12 @@ pub fn to_internal(req: AnthRequest) -> Result<ChatRequest, String> {
                                 tool_calls: vec![],
                                 tool_result: Some(ToolResult {
                                     tool_call_id: tool_use_id,
-                                    content,
+                                    content: flatten_content_text(content),
                                 }),
                             });
                         }
+                        // Unknown block types (image, document, thinking, …): ignore.
+                        AnthContentBlock::Other => {}
                     }
                 }
 
@@ -499,6 +525,53 @@ mod tests {
         assert_eq!(internal.messages[0].role, Role::System);
         assert_eq!(internal.messages[0].text.as_deref(), Some("be terse"));
         assert_eq!(internal.tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn parses_claude_code_tool_result_array_and_unknown_blocks() {
+        // Real Claude Code shape: assistant turn with a thinking block + text
+        // (with cache_control) + tool_use; user turn with a tool_result whose
+        // content is an ARRAY of blocks including an image. None of this must 400.
+        let body = r#"{"model":"claude","max_tokens":256,"messages":[
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"hmm"},
+                {"type":"text","text":"checking","cache_control":{"type":"ephemeral"}},
+                {"type":"tool_use","id":"t1","name":"read","input":{"path":"x"}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":[
+                    {"type":"text","text":"file contents"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+                ]}
+            ]}
+        ]}"#;
+        let req: AnthRequest =
+            serde_json::from_str(body).expect("Claude Code payload must parse");
+        let internal = to_internal(req).expect("to_internal");
+        // tool_use captured on the assistant turn
+        assert!(internal.messages.iter().any(|m| m.tool_calls.iter().any(|c| c.name == "read")));
+        // tool_result text flattened out of the array (image dropped)
+        assert!(internal.messages.iter().any(|m| m
+            .tool_result
+            .as_ref()
+            .map(|tr| tr.content == "file contents")
+            .unwrap_or(false)));
+    }
+
+    #[test]
+    fn tool_result_plain_string_content_still_parses() {
+        let body = r#"{"model":"m","max_tokens":256,"messages":[
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"plain string result"}
+            ]}
+        ]}"#;
+        let req: AnthRequest = serde_json::from_str(body).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert!(internal.messages.iter().any(|m| m
+            .tool_result
+            .as_ref()
+            .map(|tr| tr.content == "plain string result")
+            .unwrap_or(false)));
     }
 
     #[test]
