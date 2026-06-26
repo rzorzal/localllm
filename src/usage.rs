@@ -3,7 +3,7 @@
 //! Counters are atomic so the shared `Usage` can be read/updated from any
 //! request without a lock. Notifications are one-shot (degrade re-arms only
 //! after a later success) and are a no-op unless the real server has called
-//! [`enable_notifications`], so test runs never spawn `osascript`.
+//! [`enable_notifications`], so test runs never raise a desktop notification.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -93,25 +93,20 @@ pub fn enable_notifications() {
     NOTIFY_ENABLED.store(true, Ordering::SeqCst);
 }
 
-/// Show a desktop notification when enabled; otherwise a no-op (also logs).
+/// Show a cross-platform desktop notification when enabled; otherwise a no-op
+/// (always logs). Uses `notify-rust`: libnotify/D-Bus on Linux, toast on
+/// Windows, and the native Notification Center on macOS — which picks up the
+/// `localllm.app` bundle icon when launched from the bundle. Best-effort:
+/// failures (no D-Bus session, no bundle, etc.) are ignored.
 pub fn notify(title: &str, body: &str) {
     tracing::info!(target: "localllm::req", "notify: {title} — {body}");
     if !NOTIFY_ENABLED.load(Ordering::SeqCst) {
         return;
     }
-    #[cfg(target_os = "macos")]
-    {
-        // Best-effort; ignore failure. Quote-escape to avoid breaking the script.
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            body.replace('"', "'"),
-            title.replace('"', "'"),
-        );
-        let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .spawn();
-    }
+    let _ = notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .show();
 }
 
 #[cfg(test)]
