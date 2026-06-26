@@ -2,9 +2,9 @@
 //!
 //! `ModelManager` holds the current engine behind `ArcSwapOption` and implements
 //! `Generator`, so it slots into `AppState` where the fixed engine used to live.
-//! It tracks in-flight requests and (in a later step) runs a switch that drains,
-//! drops the old engine — freeing the single Metal context — builds the new one,
-//! and swaps it in, restoring the old engine on failure.
+//! It tracks in-flight requests and runs a switch that drains, drops the old engine
+//! — freeing the single Metal context — builds the new one, and swaps it in,
+//! restoring the old engine on failure.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,12 @@ pub type EngineBuilder = Box<
     dyn Fn(ModelSpec) -> BoxFuture<'static, anyhow::Result<Arc<dyn Generator>>> + Send + Sync,
 >;
 
+/// Why a switch could not be started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchError {
+    AlreadySwitching,
+}
+
 const PHASE_IDLE: u8 = 0;
 const PHASE_DRAINING: u8 = 1;
 const PHASE_DOWNLOADING: u8 = 2;
@@ -65,11 +71,12 @@ pub struct ModelManager {
     target: Mutex<Option<ModelSpec>>,
     switching: AtomicBool,
     errored: AtomicBool,
-    inflight: AtomicUsize,
+    /// Shared with `DecOnDrop` (generate path) and `CounterStream` (stream path)
+    /// so the guard can outlive `&self`.
+    inflight: Arc<AtomicUsize>,
     phase: AtomicU8,
     progress: AtomicU8,
     error: Mutex<Option<String>>,
-    #[allow(dead_code)]
     builder: EngineBuilder,
 }
 
@@ -81,7 +88,7 @@ impl ModelManager {
             target: Mutex::new(None),
             switching: AtomicBool::new(false),
             errored: AtomicBool::new(false),
-            inflight: AtomicUsize::new(0),
+            inflight: Arc::new(AtomicUsize::new(0)),
             phase: AtomicU8::new(PHASE_IDLE),
             progress: AtomicU8::new(100),
             error: Mutex::new(None),
@@ -91,6 +98,10 @@ impl ModelManager {
 
     pub fn is_switching(&self) -> bool {
         self.switching.load(Ordering::SeqCst)
+    }
+
+    pub fn is_errored(&self) -> bool {
+        self.errored.load(Ordering::SeqCst)
     }
 
     pub fn status(&self) -> SwitchStatus {
@@ -116,27 +127,131 @@ impl ModelManager {
             error: self.error.lock().unwrap().clone(),
         }
     }
-}
 
-/// Decrements the in-flight counter when dropped (covers both the request future
-/// and a streaming response's lifetime).
-#[allow(dead_code)]
-struct InflightGuard(Arc<ModelManager>);
-#[allow(dead_code)]
-impl Drop for InflightGuard {
-    fn drop(&mut self) {
-        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+    /// Set download progress percent (0..100). Called by the builder's callback.
+    pub fn set_progress(&self, pct: u8) {
+        self.progress.store(pct.min(100), Ordering::SeqCst);
+    }
+
+    fn set_phase(&self, p: u8) {
+        self.phase.store(p, Ordering::SeqCst);
+    }
+
+    /// Start switching to `target`. Returns immediately; the switch runs in a
+    /// spawned task. One switch at a time — a second call while one is running
+    /// returns `AlreadySwitching` (→ HTTP 409).
+    pub fn start_switch(self: &Arc<Self>, target: ModelSpec) -> Result<(), SwitchError> {
+        if self
+            .switching
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(SwitchError::AlreadySwitching);
+        }
+        // Entering a switch clears any prior error state.
+        self.errored.store(false, Ordering::SeqCst);
+        *self.error.lock().unwrap() = None;
+        *self.target.lock().unwrap() = Some(target.clone());
+        self.progress.store(0, Ordering::SeqCst);
+
+        let me = self.clone();
+        tokio::spawn(async move {
+            me.run_switch(target).await;
+        });
+        Ok(())
+    }
+
+    async fn run_switch(self: Arc<Self>, target: ModelSpec) {
+        // 1. Drain in-flight (bounded ~30 s). The `switching` flag already 503s new ones.
+        self.set_phase(PHASE_DRAINING);
+        let drained = {
+            let mut ok = false;
+            for _ in 0..6000 {
+                // ~30 s at 5 ms
+                if self.inflight.load(Ordering::SeqCst) == 0 {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            ok
+        };
+        if !drained {
+            // Nothing torn down yet → abort, stay on the old model.
+            *self.error.lock().unwrap() = Some("switch aborted: requests did not drain".into());
+            self.set_phase(PHASE_IDLE);
+            *self.target.lock().unwrap() = None;
+            self.switching.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        // 2. Drop the old engine FIRST (frees the single Metal context).
+        let previous = self.current.lock().unwrap().clone();
+        self.engine.store(None);
+
+        // 3. Build the new engine.
+        self.set_phase(PHASE_DOWNLOADING);
+        match (self.builder)(target.clone()).await {
+            Ok(new_engine) => {
+                // new_engine: Arc<dyn Generator>; the field is ArcSwapOption<Arc<dyn Generator>>,
+                // so we wrap it in another Arc to satisfy the double-Arc storage.
+                self.engine.store(Some(Arc::new(new_engine)));
+                *self.current.lock().unwrap() = target;
+                *self.target.lock().unwrap() = None;
+                self.progress.store(100, Ordering::SeqCst);
+                self.set_phase(PHASE_IDLE);
+                self.switching.store(false, Ordering::SeqCst);
+            }
+            Err(e) => {
+                let msg = format!("model switch failed: {e}");
+                tracing::warn!(target: "localllm::req", "{msg} — restoring previous model");
+                crate::usage::notify("localllm — model switch failed", &msg);
+                // 4. Restore the previous model (its GGUF is cached → fast).
+                self.set_phase(PHASE_LOADING);
+                match (self.builder)(previous.clone()).await {
+                    Ok(restored) => {
+                        self.engine.store(Some(Arc::new(restored)));
+                        *self.current.lock().unwrap() = previous;
+                        *self.error.lock().unwrap() = Some(msg);
+                        *self.target.lock().unwrap() = None;
+                        self.set_phase(PHASE_IDLE);
+                        self.switching.store(false, Ordering::SeqCst);
+                    }
+                    Err(e2) => {
+                        // Could not even restore → degraded; all /v1/* will 503.
+                        *self.error.lock().unwrap() =
+                            Some(format!("{msg}; restore also failed: {e2}"));
+                        self.errored.store(true, Ordering::SeqCst);
+                        self.set_phase(PHASE_IDLE);
+                        *self.target.lock().unwrap() = None;
+                        self.switching.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
     }
 }
 
-/// A stream that holds an `InflightGuard` until it is fully consumed/dropped.
-#[allow(dead_code)]
-struct GuardedStream {
-    inner: BoxStream<'static, anyhow::Result<StreamDelta>>,
-    _guard: InflightGuard,
+/// Decrement-on-drop: used in the non-stream path to decrement inflight.
+struct DecOnDrop(Arc<AtomicUsize>);
+impl Drop for DecOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
-#[allow(dead_code)]
-impl futures::Stream for GuardedStream {
+
+/// A stream that holds a cloned `Arc<AtomicUsize>` and decrements inflight on drop,
+/// covering the full lifetime of a streaming response.
+struct CounterStream {
+    inner: BoxStream<'static, anyhow::Result<StreamDelta>>,
+    counter: Arc<AtomicUsize>,
+}
+impl Drop for CounterStream {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl futures::Stream for CounterStream {
     type Item = anyhow::Result<StreamDelta>;
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -153,7 +268,7 @@ impl Generator for ModelManager {
             anyhow::bail!("model switching");
         }
         self.inflight.fetch_add(1, Ordering::SeqCst);
-        let _dec = scopeguard_dec(&self.inflight);
+        let _g = DecOnDrop(self.inflight.clone());
         // load_full returns Option<Arc<Arc<dyn Generator>>>; deref the outer Arc.
         let engine: Arc<dyn Generator> = Arc::clone(
             &*self.engine.load_full().ok_or_else(|| anyhow::anyhow!("model switching"))?,
@@ -169,42 +284,30 @@ impl Generator for ModelManager {
             anyhow::bail!("model switching");
         }
         self.inflight.fetch_add(1, Ordering::SeqCst);
+        let counter = self.inflight.clone();
         // load_full returns Option<Arc<Arc<dyn Generator>>>; deref the outer Arc.
         let engine: Arc<dyn Generator> = match self.engine.load_full() {
             Some(e) => Arc::clone(&*e),
             None => {
-                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                counter.fetch_sub(1, Ordering::SeqCst);
                 anyhow::bail!("model switching");
             }
         };
-        // NOTE: the stream is guarded by a manual decrement in a wrapper created
-        // by the manager's Arc-aware caller; see `generate_stream_arc`.
-        let inner = engine.generate_stream(req).await;
-        match inner {
-            Ok(s) => Ok(s),
+        match engine.generate_stream(req).await {
+            Ok(inner) => Ok(Box::pin(CounterStream { inner, counter })),
             Err(e) => {
-                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                counter.fetch_sub(1, Ordering::SeqCst);
                 Err(e)
             }
         }
     }
 }
 
-/// Decrement-on-drop helper for the non-stream path.
-fn scopeguard_dec(counter: &AtomicUsize) -> impl Drop + '_ {
-    struct G<'a>(&'a AtomicUsize);
-    impl Drop for G<'_> {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    G(counter)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::common::{ContentPart, FinishReason};
+    use std::sync::atomic::AtomicUsize as TestAtomicUsize;
 
     fn marker_gen(tag: &'static str) -> Arc<dyn Generator> {
         Arc::new(crate::test_support::TaggedGen(tag))
@@ -216,6 +319,90 @@ mod tests {
 
     fn noop_builder() -> EngineBuilder {
         Box::new(|_spec| Box::pin(async { Ok(marker_gen("new")) }))
+    }
+
+    /// A builder that records calls and returns a TaggedGen("new"), optionally
+    /// after awaiting a release signal, or failing for a specific repo.
+    fn counting_builder(
+        calls: Arc<TestAtomicUsize>,
+        fail_repo: Option<&'static str>,
+    ) -> EngineBuilder {
+        Box::new(move |spec: ModelSpec| {
+            let calls = calls.clone();
+            let fail = fail_repo.map(|s| s.to_string());
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if Some(&spec.repo) == fail.as_ref() {
+                    anyhow::bail!("boom");
+                }
+                Ok(marker_gen("new"))
+            })
+        })
+    }
+
+    async fn wait_ready(m: &Arc<ModelManager>) {
+        for _ in 0..200 {
+            if !m.is_switching() { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("switch did not finish");
+    }
+
+    #[tokio::test]
+    async fn happy_switch_swaps_engine_and_updates_current() {
+        let calls = Arc::new(TestAtomicUsize::new(0));
+        let m = ModelManager::new(marker_gen("orig"), spec("r", "old"), counting_builder(calls.clone(), None));
+        m.start_switch(spec("r2", "new")).unwrap();
+        wait_ready(&m).await;
+        // engine now serves "new"
+        let out = m.generate(req()).await.unwrap();
+        assert!(matches!(&out.content[0], ContentPart::Text(t) if t == "new"));
+        assert_eq!(m.status().current, spec("r2", "new"));
+        assert_eq!(m.status().state, "ready");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn second_switch_while_in_progress_is_rejected() {
+        // Builder blocks until released → first switch stays in progress.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let builder: EngineBuilder = Box::new(move |_spec| {
+            let rx = rx.clone();
+            Box::pin(async move {
+                if let Some(rx) = rx.lock().await.take() { let _ = rx.await; }
+                Ok(marker_gen("new"))
+            })
+        });
+        let m = ModelManager::new(marker_gen("orig"), spec("r", "old"), builder);
+        m.start_switch(spec("r2", "a")).unwrap();
+        // give the task a moment to flip `switching`
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(matches!(m.start_switch(spec("r3", "b")), Err(SwitchError::AlreadySwitching)));
+        assert!(m.is_switching());
+        let _ = tx.send(());
+        wait_ready(&m).await;
+    }
+
+    #[tokio::test]
+    async fn failed_build_restores_previous_model() {
+        // target repo "bad" fails; restore rebuilds "r"/"old" (succeeds).
+        let calls = Arc::new(TestAtomicUsize::new(0));
+        let m = ModelManager::new(marker_gen("orig"), spec("r", "old"), counting_builder(calls.clone(), Some("bad")));
+        m.start_switch(spec("bad", "x")).unwrap();
+        wait_ready(&m).await;
+        let s = m.status();
+        assert_eq!(s.state, "ready"); // restored
+        assert_eq!(s.current, spec("r", "old")); // back to the old model
+        assert!(s.error.is_some()); // but the failure is reported
+        // and the engine still serves
+        let out = m.generate(req()).await.unwrap();
+        assert!(matches!(&out.content[0], ContentPart::Text(t) if t == "new")); // restore built a fresh engine
+    }
+
+    fn req() -> ChatRequest {
+        ChatRequest { messages: vec![], tools: vec![], max_tokens: None,
+            temperature: None, stream: false, model: "m".into() }
     }
 
     #[tokio::test]
