@@ -100,6 +100,11 @@ pub struct Config {
     /// the saved setting (or SaveTokens default) is used.
     #[arg(long, value_enum)]
     pub profile: Option<crate::route::Profile>,
+
+    /// Session cloud prompt-token total at which a one-shot "high usage" alert
+    /// fires (suggesting the Save-tokens profile). Default 200_000.
+    #[arg(long, default_value_t = 200_000)]
+    pub cloud_token_alert: usize,
 }
 
 impl Config {
@@ -195,5 +200,13 @@ mod tests {
         assert_eq!(c.profile, Some(crate::route::Profile::Balanced));
         let c = Config::parse_from(["localllm", "--profile", "local-only"]);
         assert_eq!(c.profile, Some(crate::route::Profile::LocalOnly));
+    }
+
+    #[test]
+    fn cloud_token_alert_defaults_and_parses() {
+        let c = Config::parse_from(["localllm"]);
+        assert_eq!(c.cloud_token_alert, 200_000);
+        let c = Config::parse_from(["localllm", "--cloud-token-alert", "50000"]);
+        assert_eq!(c.cloud_token_alert, 50_000);
     }
 }

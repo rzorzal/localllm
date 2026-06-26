@@ -42,43 +42,84 @@ fn request_summary(req: &ChatRequest) -> (usize, usize) {
     (req.messages.len(), req.tools.len())
 }
 
-/// Compute the routing decision for an already-parsed internal request.
-/// Returns the decision plus whether a forwardable credential header is present.
+/// Returns the routing decision plus the estimated prompt token count (so the
+/// caller can record cloud usage without recomputing).
 fn route_decision(
     state: &AppState,
     internal: &ChatRequest,
     headers: &axum::http::HeaderMap,
-) -> crate::route::Decision {
+) -> (crate::route::Decision, usize) {
     let has_cloud_creds =
         headers.contains_key("x-api-key") || headers.contains_key("authorization");
+    let prompt_tokens = crate::route::estimate_prompt_tokens(internal);
     let signals = crate::route::Signals {
-        prompt_tokens: crate::route::estimate_prompt_tokens(internal),
+        prompt_tokens,
         local_ctx_window: state.local_ctx_window,
         n_tools: internal.tools.len(),
         n_messages: internal.messages.len(),
         has_cloud_creds,
     };
     let policy = *state.policy.read().unwrap();
-    crate::route::decide(&signals, &policy)
+    (crate::route::decide(&signals, &policy), prompt_tokens)
+}
+
+/// Record a successful cloud call and fire the one-shot high-usage alert if the
+/// session just crossed the threshold. Also clears the degrade gate so a later
+/// failure notifies again.
+fn record_cloud_success(state: &AppState, est_prompt_tokens: usize) {
+    state.usage.note_success();
+    if state
+        .usage
+        .record_cloud_call(est_prompt_tokens, state.cloud_token_alert)
+    {
+        crate::usage::notify(
+            "localllm — high cloud usage",
+            "High cloud token use this session — consider the Save tokens profile.",
+        );
+    }
+}
+
+/// Handle a degrade signal: notify once, then decide whether local can serve.
+/// Returns `Some(response)` when the caller must return it (cannot fall back to
+/// local because the prompt overflows the window); `None` when the caller should
+/// proceed to the local path.
+fn handle_degrade(
+    state: &AppState,
+    reason: crate::usage::DegradeReason,
+    route_reason: crate::route::RouteReason,
+) -> Option<axum::response::Response> {
+    if state.usage.note_degrade() {
+        crate::usage::notify("localllm — cloud degraded", reason.message());
+    }
+    if route_reason == crate::route::RouteReason::ContextOverflow {
+        // Prompt cannot fit the local window → no local fallback.
+        Some(crate::cloud::degrade_error(reason))
+    } else {
+        None
+    }
 }
 
 /// Bridge a local generation result into the cascade decision.
 ///
 /// - `Ok(result)` and (cascade off OR result is strong) → returns `Ok(result)`;
 ///   the caller proceeds with the local result as before.
-/// - `Ok(result)` weak (length-truncated) AND `want_cascade` → escalates: returns
-///   `Err(cloud forward response)` which the caller returns directly.
+/// - `Ok(result)` weak (length-truncated) AND `want_cascade` → escalates: on
+///   Relayed records success and returns `Err(cloud response)`; on Degrade keeps
+///   the already-computed local result.
 /// - `Err(gen error)` → if `want_cascade`, escalate to cloud; otherwise return
 ///   `Err(500)`.
 ///
 /// Consumes `raw` (the original request bytes) because escalation reverse-proxies
 /// it. Only ever called on the buffered/non-stream paths — never mid-stream.
+#[allow(clippy::too_many_arguments)]
 async fn cascade_or_result(
     want_cascade: bool,
     gen_result: anyhow::Result<ChatResult>,
     provider: crate::cloud::Provider,
     headers: &HeaderMap,
     raw: Bytes,
+    state: &AppState,
+    est_prompt_tokens: usize,
     rid: &str,
     api: &str,
 ) -> Result<ChatResult, axum::response::Response> {
@@ -88,8 +129,17 @@ async fn cascade_or_result(
             if want_cascade && crate::route::is_weak_result(&result) {
                 tracing::info!(target: "localllm::req", "{rid} [{api}] cascade: weak local (length) → escalating to cloud");
                 match crate::cloud::forward(provider, headers, raw).await {
-                    crate::cloud::ForwardOutcome::Relayed(resp) => Err(resp),
-                    crate::cloud::ForwardOutcome::Degrade(d) => Err(crate::cloud::degrade_error(d)),
+                    crate::cloud::ForwardOutcome::Relayed(resp) => {
+                        record_cloud_success(state, est_prompt_tokens);
+                        Err(resp)
+                    }
+                    crate::cloud::ForwardOutcome::Degrade(d) => {
+                        if state.usage.note_degrade() {
+                            crate::usage::notify("localllm — cloud degraded", d.message());
+                        }
+                        tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade cloud degraded ({d:?}) → keeping local result");
+                        Ok(result) // serve the (truncated) local answer we already have
+                    }
                 }
             } else {
                 Ok(result)
@@ -99,8 +149,16 @@ async fn cascade_or_result(
             if want_cascade {
                 tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade: local generate failed ({e}) → escalating to cloud");
                 match crate::cloud::forward(provider, headers, raw).await {
-                    crate::cloud::ForwardOutcome::Relayed(resp) => Err(resp),
-                    crate::cloud::ForwardOutcome::Degrade(d) => Err(crate::cloud::degrade_error(d)),
+                    crate::cloud::ForwardOutcome::Relayed(resp) => {
+                        record_cloud_success(state, est_prompt_tokens);
+                        Err(resp)
+                    }
+                    crate::cloud::ForwardOutcome::Degrade(d) => {
+                        if state.usage.note_degrade() {
+                            crate::usage::notify("localllm — cloud degraded", d.message());
+                        }
+                        Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("local generation failed and cloud degraded ({d:?})")}))).into_response())
+                    }
                 }
             } else {
                 tracing::error!(target: "localllm::req", "{rid} [{api}] 500 generate: {e}");
@@ -143,6 +201,10 @@ pub struct AppState {
     pub policy: Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
     /// Local model's usable context window (config `ctx_len`), for the ctx gate.
     pub local_ctx_window: usize,
+    /// Per-session cloud usage counters + notification gates.
+    pub usage: std::sync::Arc<crate::usage::Usage>,
+    /// Session cloud-token total that triggers the one-shot high-usage alert.
+    pub cloud_token_alert: usize,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -165,19 +227,23 @@ impl Generator for crate::engine::Engine {
 // ---------------------------------------------------------------------------
 
 /// Build the axum Router with all four endpoints wired to the given generator,
-/// the configured model id, the shared routing policy, and the local context
-/// window used by the context gate.
+/// the configured model id, the shared routing policy, the local context
+/// window used by the context gate, and the session usage tracker.
 pub fn router(
     gen: Arc<dyn Generator>,
     model_id: String,
     policy: Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
     local_ctx_window: usize,
+    usage: std::sync::Arc<crate::usage::Usage>,
+    cloud_token_alert: usize,
 ) -> Router {
     let state = Arc::new(AppState {
         gen,
         model_id,
         policy,
         local_ctx_window,
+        usage,
+        cloud_token_alert,
     });
     // Large prompts must reach the routing layer to be forwarded to cloud;
     // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
@@ -226,13 +292,23 @@ async fn handle_oai_chat(
     };
 
     // --- Routing decision ---
-    let want_cascade = match route_decision(&state, &internal, &headers) {
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
-            return match crate::cloud::forward(crate::cloud::Provider::OpenAI, &headers, raw).await {
-                crate::cloud::ForwardOutcome::Relayed(resp) => resp,
-                crate::cloud::ForwardOutcome::Degrade(d) => crate::cloud::degrade_error(d),
-            };
+            match crate::cloud::forward(crate::cloud::Provider::OpenAI, &headers, raw.clone()).await {
+                crate::cloud::ForwardOutcome::Relayed(resp) => {
+                    record_cloud_success(&state, est_prompt_tokens);
+                    return resp;
+                }
+                crate::cloud::ForwardOutcome::Degrade(d) => {
+                    if let Some(resp) = handle_degrade(&state, d, reason) {
+                        return resp;
+                    }
+                    tracing::warn!(target: "localllm::req", "{rid} [openai] cloud degraded ({d:?}) → serving local");
+                    false
+                }
+            }
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [openai] route=local (cloud wanted but no creds/disallowed)");
@@ -257,6 +333,8 @@ async fn handle_oai_chat(
             crate::cloud::Provider::OpenAI,
             &headers,
             raw,
+            &state,
+            est_prompt_tokens,
             &rid,
             "openai",
         ).await {
@@ -334,6 +412,8 @@ async fn handle_oai_chat(
             crate::cloud::Provider::OpenAI,
             &headers,
             raw,
+            &state,
+            est_prompt_tokens,
             &rid,
             "openai",
         ).await {
@@ -378,13 +458,23 @@ async fn handle_anth_messages(
     };
 
     // --- Routing decision ---
-    let want_cascade = match route_decision(&state, &internal, &headers) {
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
-            return match crate::cloud::forward(crate::cloud::Provider::Anthropic, &headers, raw).await {
-                crate::cloud::ForwardOutcome::Relayed(resp) => resp,
-                crate::cloud::ForwardOutcome::Degrade(d) => crate::cloud::degrade_error(d),
-            };
+            match crate::cloud::forward(crate::cloud::Provider::Anthropic, &headers, raw.clone()).await {
+                crate::cloud::ForwardOutcome::Relayed(resp) => {
+                    record_cloud_success(&state, est_prompt_tokens);
+                    return resp;
+                }
+                crate::cloud::ForwardOutcome::Degrade(d) => {
+                    if let Some(resp) = handle_degrade(&state, d, reason) {
+                        return resp;
+                    }
+                    tracing::warn!(target: "localllm::req", "{rid} [anthropic] cloud degraded ({d:?}) → serving local");
+                    false
+                }
+            }
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [anthropic] route=local (cloud wanted but no creds/disallowed)");
@@ -408,6 +498,8 @@ async fn handle_anth_messages(
             crate::cloud::Provider::Anthropic,
             &headers,
             raw,
+            &state,
+            est_prompt_tokens,
             &rid,
             "anthropic",
         ).await {
@@ -486,6 +578,8 @@ async fn handle_anth_messages(
             crate::cloud::Provider::Anthropic,
             &headers,
             raw,
+            &state,
+            est_prompt_tokens,
             &rid,
             "anthropic",
         ).await {

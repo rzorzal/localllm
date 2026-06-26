@@ -120,13 +120,19 @@ pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> Fo
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)] // intentional: ENV_LOCK serializes concurrent tests on a global env var
 mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Serialize tests that touch process-global env vars (LOCALLLM_*_BASE) so
+    /// concurrent test threads cannot interfere with each other's upstream URLs.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn forwards_body_and_relays_response() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -163,6 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_upstream_degrades_offline() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("LOCALLLM_OPENAI_BASE", "http://127.0.0.1:1"); // nothing listening
         let outcome = forward(Provider::OpenAI, &HeaderMap::new(), Bytes::new()).await;
         assert!(matches!(
@@ -173,6 +180,8 @@ mod tests {
     }
 
     async fn outcome_for_status(status: u16) -> ForwardOutcome {
+        // Caller must hold ENV_LOCK before calling this to avoid racing on
+        // LOCALLLM_OPENAI_BASE with other concurrent tests.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(status))
@@ -186,6 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_401_degrades_auth() {
+        let _guard = ENV_LOCK.lock().unwrap();
         assert!(matches!(
             outcome_for_status(401).await,
             ForwardOutcome::Degrade(crate::usage::DegradeReason::Auth)
@@ -194,6 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_429_degrades_quota() {
+        let _guard = ENV_LOCK.lock().unwrap();
         assert!(matches!(
             outcome_for_status(429).await,
             ForwardOutcome::Degrade(crate::usage::DegradeReason::Quota)
@@ -202,6 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_500_degrades_server_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
         assert!(matches!(
             outcome_for_status(500).await,
             ForwardOutcome::Degrade(crate::usage::DegradeReason::ServerError)

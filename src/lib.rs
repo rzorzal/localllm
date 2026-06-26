@@ -78,7 +78,9 @@ pub async fn run_server_with_ready_and_policy(
         Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
     };
 
-    let app = router(engine, cfg.model_id.clone(), policy, cfg.ctx_len);
+    crate::usage::enable_notifications();
+    let usage = std::sync::Arc::new(crate::usage::Usage::new());
+    let app = router(engine, cfg.model_id.clone(), policy, cfg.ctx_len, usage, cfg.cloud_token_alert);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
 
@@ -170,7 +172,8 @@ pub fn router_for_test_with(
     local_ctx_window: usize,
 ) -> Router {
     let policy = Arc::new(std::sync::RwLock::new(policy));
-    crate::server::router(gen, "test-model".to_string(), policy, local_ctx_window)
+    let usage = Arc::new(crate::usage::Usage::new());
+    crate::server::router(gen, "test-model".to_string(), policy, local_ctx_window, usage, 200_000)
 }
 
 /// Build a test router wired to `FakeGen`, the default (SaveTokens) policy, and

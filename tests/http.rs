@@ -1,5 +1,10 @@
 // tests/http.rs — integration tests for HTTP handlers
 
+/// Serialize all tests that read/write process-global env vars (LOCALLLM_*_BASE)
+/// so they cannot race with each other and corrupt each other's cloud-target URL.
+/// `static Mutex` is the lightest per-process lock available without extra crates.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::test]
 async fn openai_endpoint_returns_tool_call() {
     let app = localllm::router_for_test();
@@ -105,6 +110,7 @@ async fn overflow_request_routes_to_cloud() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    let _guard = ENV_LOCK.lock().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -139,6 +145,7 @@ async fn large_over_2mb_request_routes_to_cloud() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    let _guard = ENV_LOCK.lock().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -188,6 +195,7 @@ async fn weak_local_with_cascade_escalates_to_cloud() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    let _guard = ENV_LOCK.lock().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -229,4 +237,77 @@ async fn weak_local_without_cascade_stays_local() {
     // weak text is returned (no cloud escalation).
     assert_eq!(resp["content"][0]["text"], "local-weak-answer");
     assert_eq!(resp["stop_reason"], "max_tokens");
+}
+
+/// An in-window difficulty/cloud route whose upstream returns 429 degrades to the
+/// local model instead of erroring (FakeGen tool_use proves local ran).
+#[tokio::test]
+async fn cloud_quota_degrades_to_local() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    std::env::set_var("LOCALLLM_ANTHROPIC_BASE", server.uri());
+
+    // MaxQuality + a modest in-window prompt → Cloud(Difficulty); 429 → degrade local.
+    let body = r#"{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"a fairly involved question about routing"}],
+        "tools":[{"name":"get_weather","description":"w","input_schema":{"type":"object"}}]}"#;
+    let app = localllm::router_for_test_with(
+        std::sync::Arc::new(localllm::FakeGen),
+        localllm::route::Profile::MaxQuality.policy(),
+        1000,
+    );
+    let resp = localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test").await;
+    assert_eq!(resp["stop_reason"], "tool_use"); // FakeGen → local served
+
+    std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
+}
+
+/// An over-window (context-overflow) cloud route whose upstream is unreachable
+/// cannot fall back to local; it returns a clean 502.
+#[tokio::test]
+async fn overflow_cloud_offline_returns_clean_error() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("LOCALLLM_ANTHROPIC_BASE", "http://127.0.0.1:1");
+    let big = "x".repeat(8000); // > 0.95 * 1000 window → ContextOverflow
+    let body = format!(
+        r#"{{"model":"claude","max_tokens":256,"messages":[{{"role":"user","content":"{big}"}}]}}"#
+    );
+    let status = localllm::axum_test_request_status_with_header(
+        localllm::router_for_test_with(
+            std::sync::Arc::new(localllm::FakeGen),
+            localllm::route::Profile::SaveTokens.policy(),
+            1000,
+        ),
+        "/v1/messages",
+        &body,
+        "x-api-key",
+        "sk-test",
+    )
+    .await;
+    assert_eq!(status, 502);
+    std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
+}
+
+/// A weak local cascade whose cloud escalation fails (offline) keeps the local
+/// (truncated) answer instead of erroring.
+#[tokio::test]
+async fn cascade_cloud_offline_keeps_local_answer() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("LOCALLLM_ANTHROPIC_BASE", "http://127.0.0.1:1");
+    let body = r#"{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}"#;
+    let app = localllm::router_for_test_with(
+        std::sync::Arc::new(localllm::FakeGenWeak),
+        localllm::route::Profile::SaveTokens.policy(),
+        1000,
+    );
+    let resp = localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test").await;
+    assert_eq!(resp["content"][0]["text"], "local-weak-answer"); // local kept
+    std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
 }
