@@ -403,3 +403,23 @@ async fn admin_switch_bad_body_is_400() {
     ).await;
     assert_eq!(status, 400);
 }
+
+#[tokio::test]
+async fn admin_delete_bad_body_is_400() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_delete_status_with_header(
+        app, "/admin/models", r#"{"not":"valid"}"#, "x-admin-token", "test-token",
+    ).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn admin_delete_path_traversal_file_is_400() {
+    // A crafted file with path components must be rejected before touching the FS.
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_delete_status_with_header(
+        app, "/admin/models",
+        r#"{"repo":"x","file":"../../etc/passwd"}"#, "x-admin-token", "test-token",
+    ).await;
+    assert_eq!(status, 400);
+}

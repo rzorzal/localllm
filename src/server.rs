@@ -363,6 +363,14 @@ struct AdminSwitchBody {
     file: String,
 }
 
+/// A model `file` must be a bare filename (no path components), so it can never
+/// escape the cache directory when joined into `download::cache_path`. Rejects
+/// `""`, `..`, and anything containing `/` or `\`.
+fn is_safe_model_file(file: &str) -> bool {
+    !file.is_empty()
+        && std::path::Path::new(file).file_name() == Some(std::ffi::OsStr::new(file))
+}
+
 /// POST /admin/model — start a model switch (token-guarded).
 async fn handle_admin_switch(
     State(state): State<Arc<AppState>>,
@@ -379,10 +387,10 @@ async fn handle_admin_switch(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
         }
     };
-    if body.repo.is_empty() || body.file.is_empty() {
+    if body.repo.is_empty() || !is_safe_model_file(&body.file) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "repo and file are required"})),
+            Json(json!({"error": "repo and a valid (non-path) file are required"})),
         )
             .into_response();
     }
@@ -445,8 +453,8 @@ async fn handle_model_delete(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
         }
     };
-    if body.repo.is_empty() || body.file.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and file are required"})))
+    if body.repo.is_empty() || !is_safe_model_file(&body.file) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and a valid (non-path) file are required"})))
             .into_response();
     }
     let active = state.manager.status().current;

@@ -134,6 +134,9 @@ pub async fn run_server_with_ready_and_policy(
         sys.refresh_memory();
         sys.total_memory() / (1024 * 1024) // bytes → MB
     };
+    if total_ram_mb == 0 {
+        tracing::warn!("sysinfo reported 0 total RAM; catalog fit verdicts will use budget=0");
+    }
 
     let app = router(
         manager,
