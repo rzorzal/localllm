@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     if let Some(path) = &args.export_icon {
         let size: u32 = 1024;
-        let rgba = localllm::tray::macos::render_icon_rgba(size);
+        let rgba = localllm::tray::render_icon_rgba(size);
         let file = std::fs::File::create(path)?;
         let w = std::io::BufWriter::new(file);
         let mut encoder = png::Encoder::new(w, size, size);
@@ -104,19 +104,21 @@ fn main() -> anyhow::Result<()> {
             .block_on(localllm::engine_llama::run_smoke_test());
     }
 
-    // --- Tray mode (macOS only): server on background thread,
-    //     AppKit event loop on the main thread. ---
-    // Enable tray mode if --tray is passed OR we were launched from a .app
-    // bundle (launchd sets __CFBundleIdentifier). Launching as the bundle's
-    // direct executable (not via a shell wrapper) is required for the
+    // --- Tray mode: server on background thread, event loop on main thread. ---
+    // Enable tray mode if --tray is passed OR we were launched from a macOS
+    // .app bundle (launchd sets __CFBundleIdentifier). Launching as the
+    // bundle's direct executable (not via a shell wrapper) is required for the
     // NSStatusItem to register with the WindowServer.
-    #[cfg(target_os = "macos")]
-    {
-        let from_bundle = std::env::var_os("__CFBundleIdentifier").is_some();
-        if args.tray || from_bundle {
-            // run_tray() is `-> !` (exits via process::exit on Quit).
-            localllm::tray::macos::run_tray(args.config);
-        }
+    let want_tray = args.tray || {
+        #[cfg(target_os = "macos")]
+        { std::env::var_os("__CFBundleIdentifier").is_some() }
+        #[cfg(not(target_os = "macos"))]
+        { false }
+    };
+    if want_tray {
+        let token = std::sync::Arc::from(localllm::server::resolve_admin_token(args.config.admin_token.clone()));
+        // run_tray() is `-> !` (exits via process::exit on Quit).
+        localllm::tray::run_tray(args.config, token);
     }
 
     // --- Headless mode (default) ---

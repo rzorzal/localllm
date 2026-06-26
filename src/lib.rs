@@ -11,7 +11,6 @@ pub mod settings;
 pub mod usage;
 pub mod server;
 pub mod tscg;
-#[cfg(target_os = "macos")]
 pub mod tray;
 
 // ---------------------------------------------------------------------------
@@ -47,6 +46,18 @@ pub async fn run_server_with_ready_and_policy(
     cfg: crate::config::Config,
     ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
+) -> anyhow::Result<()> {
+    let admin_token = std::sync::Arc::from(crate::server::resolve_admin_token(cfg.admin_token.clone()));
+    run_server_with_ready_policy_token(cfg, ready, policy, admin_token).await
+}
+
+/// Like [`run_server_with_ready_and_policy`] but takes an externally-resolved
+/// admin token (so the tray shares the same token with its Model Manager window).
+pub async fn run_server_with_ready_policy_token(
+    cfg: crate::config::Config,
+    ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
+    admin_token: std::sync::Arc<str>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use crate::config::Backend;
@@ -125,7 +136,6 @@ pub async fn run_server_with_ready_and_policy(
     let manager = ModelManager::new(engine, initial_spec, builder);
     let _ = manager_slot.set(Arc::downgrade(&manager));
 
-    let admin_token = crate::server::resolve_admin_token(cfg.admin_token.clone());
     crate::server::write_admin_token_file(&admin_token);
 
     let total_ram_mb = {
@@ -145,7 +155,7 @@ pub async fn run_server_with_ready_and_policy(
         cfg.ctx_len,
         usage,
         cfg.cloud_token_alert,
-        Arc::from(admin_token),
+        admin_token.clone(),
         total_ram_mb,
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
