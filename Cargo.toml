@@ -31,7 +31,7 @@ notify-rust = "4"
 # Total physical RAM detection (read once at startup for catalog fit/recommend).
 sysinfo = "0.32"
 # Cross-platform menu-bar tray + event loop (only active when --tray is passed)
-tao = { version = "0.35", default-features = false }
+tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
 tray-icon = { version = "0.24", default-features = false }
 png = "0.17"
 wry = "0.45"

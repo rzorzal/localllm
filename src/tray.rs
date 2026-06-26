@@ -192,6 +192,42 @@ fn make_icon() -> Icon {
 }
 
 // ---------------------------------------------------------------------------
+// Model Manager webview window
+// ---------------------------------------------------------------------------
+
+mod window {
+    //! The Model Manager webview window (tao + wry). Single-instance, opened from
+    //! the tray. Cross-platform (macOS WKWebView / Linux WebKitGTK / Windows WebView2).
+    pub(crate) struct ModelManagerWindow {
+        pub window: tao::window::Window,
+        _webview: wry::WebView,
+    }
+
+    impl ModelManagerWindow {
+        /// Build the window + webview pointed at the local /manager SPA, injecting
+        /// the admin token in-memory.
+        pub fn open<T: 'static>(
+            target: &tao::event_loop::EventLoopWindowTarget<T>,
+            port: u16,
+            admin_token: &str,
+        ) -> anyhow::Result<Self> {
+            use tao::dpi::LogicalSize;
+            use tao::window::WindowBuilder;
+            let window = WindowBuilder::new()
+                .with_title("localllm \u{2014} Model Manager")
+                .with_inner_size(LogicalSize::new(900.0_f64, 640.0_f64))
+                .build(target)?;
+            let url = format!("http://127.0.0.1:{port}/manager");
+            let webview = wry::WebViewBuilder::new(&window)
+                .with_url(&url)
+                .with_initialization_script(&crate::server::manager_init_script(admin_token))
+                .build()?;
+            Ok(Self { window, _webview: webview })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tray entry point
 // ---------------------------------------------------------------------------
 
@@ -274,13 +310,15 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let log_path = std::env::var("LOCALLLM_LOG")
         .unwrap_or_else(|_| "/tmp/localllm.log".to_string());
 
-    // Keep admin_token in scope for Task 3's window (consumed there).
-    let _admin_token_for_window = admin_token;
+    // Model Manager window state: None until first open, then single-instance.
+    // admin_token (function param) is captured by the closure for window injection.
+    let mut manager_id: Option<tray_icon::menu::MenuId> = None;
+    let mut manager_window: Option<window::ModelManagerWindow> = None;
 
     // Poll interval for the menu-event channel.
     let poll_interval = Duration::from_millis(100);
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         // Wake up periodically to poll the menu-event channel.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + poll_interval);
 
@@ -306,6 +344,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let backend_line = MenuItem::new(format!("Backend: {info_backend}"), false, None);
                 let logs_item = MenuItem::new("Open Logs", true, None);
                 logs_id = Some(logs_item.id().clone());
+                let manager_item = MenuItem::new("Open Model Manager", true, None);
+                manager_id = Some(manager_item.id().clone());
                 let quit_item = MenuItem::new("Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
@@ -341,6 +381,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&routing_submenu).expect("append routing submenu");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator");
                 menu.append(&logs_item).expect("append logs item");
+                menu.append(&manager_item).expect("append manager item");
                 menu.append(&quit_item).expect("append quit item");
 
                 _tray_keeper.push(
@@ -396,6 +437,32 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                             s.set_text(format!("Routing: {}", chosen.label()));
                         }
                         tracing::info!("routing profile set via tray: {chosen:?}");
+                    } else if manager_id.as_ref() == Some(&menu_event.id) {
+                        match &manager_window {
+                            Some(w) => {
+                                w.window.set_visible(true);
+                                w.window.set_focus();
+                            }
+                            None => match window::ModelManagerWindow::open(target, port, &admin_token) {
+                                Ok(w) => manager_window = Some(w),
+                                Err(e) => tracing::error!(
+                                    "Model Manager window failed: {e} (needs WebView2/WebKitGTK)"
+                                ),
+                            },
+                        }
+                    }
+                }
+            }
+
+            // Hide (don't destroy) the Model Manager window on close.
+            Event::WindowEvent {
+                event: tao::event::WindowEvent::CloseRequested,
+                window_id,
+                ..
+            } => {
+                if let Some(w) = &manager_window {
+                    if w.window.id() == window_id {
+                        w.window.set_visible(false);
                     }
                 }
             }
