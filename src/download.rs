@@ -37,83 +37,87 @@ pub fn cache_path(repo: &str, file: &str) -> PathBuf {
 // ensure_model
 // ---------------------------------------------------------------------------
 
+/// Download a single URL to `dest` (via a `.part` temp), invoking `on_progress`
+/// with (bytes_done, total_from_Content-Length) throttled to ~1% changes.
+async fn download_to_with_progress(
+    url: &str,
+    dest: &std::path::Path,
+    on_progress: impl Fn(u64, Option<u64>),
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder().use_rustls_tls().build()
+        .context("building reqwest client")?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating cache dir {}", parent.display()))?;
+    }
+    let part_path = dest.with_extension("part");
+    let response = client.get(url).send().await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status().with_context(|| format!("HTTP error for {url}"))?;
+    let total = response.content_length();
+    let mut stream = response.bytes_stream();
+    let mut part_file = tokio::fs::File::create(&part_path).await
+        .with_context(|| format!("creating {}", part_path.display()))?;
+    let mut downloaded: u64 = 0;
+    let mut last_pct: i64 = -1;
+    on_progress(0, total);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("reading stream for {url}"))?;
+        tokio::io::AsyncWriteExt::write_all(&mut part_file, &chunk).await
+            .with_context(|| format!("writing to {}", part_path.display()))?;
+        downloaded += chunk.len() as u64;
+        if let Some(t) = total {
+            if t > 0 {
+                let pct = (downloaded * 100 / t) as i64;
+                if pct != last_pct {
+                    last_pct = pct;
+                    on_progress(downloaded, total);
+                }
+            }
+        } else {
+            on_progress(downloaded, None);
+        }
+    }
+    tokio::io::AsyncWriteExt::flush(&mut part_file).await?;
+    drop(part_file);
+    std::fs::rename(&part_path, dest)
+        .with_context(|| format!("renaming {} → {}", part_path.display(), dest.display()))?;
+    on_progress(downloaded, total.or(Some(downloaded)));
+    Ok(())
+}
+
+/// Like [`ensure_model`] but reports download progress per chunk. `on_progress`
+/// receives (bytes_done, total) for the file currently downloading; cache-hit
+/// files report 100% immediately (done==total==file len).
+pub async fn ensure_model_with_progress(
+    repo: &str,
+    files: &[String],
+    on_progress: impl Fn(u64, Option<u64>),
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(files.len());
+    for file in files {
+        let dest = cache_path(repo, file);
+        if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            info!("cache hit: {}", dest.display());
+            let len = dest.metadata().map(|m| m.len()).unwrap_or(0);
+            on_progress(len, Some(len)); // 100%
+            paths.push(dest);
+            continue;
+        }
+        let url = hf_url(repo, file);
+        info!("downloading {} → {}", url, dest.display());
+        download_to_with_progress(&url, &dest, &on_progress).await?;
+        info!("download complete: {}", dest.display());
+        paths.push(dest);
+    }
+    Ok(paths)
+}
+
 /// For each file in `files`, if it already exists in cache and is non-empty,
 /// skip it; otherwise download it from HuggingFace, streaming to a `.part`
 /// temp file and renaming on success.  Returns the local paths in order.
 pub async fn ensure_model(repo: &str, files: &[String]) -> anyhow::Result<Vec<PathBuf>> {
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .build()
-        .context("building reqwest client")?;
-
-    let mut paths = Vec::with_capacity(files.len());
-
-    for file in files {
-        let dest = cache_path(repo, file);
-
-        // Skip if already present and non-empty.
-        if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-            info!("cache hit: {}", dest.display());
-            paths.push(dest);
-            continue;
-        }
-
-        // Ensure parent directory exists.
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating cache dir {}", parent.display()))?;
-        }
-
-        let url = hf_url(repo, file);
-        info!("downloading {} → {}", url, dest.display());
-
-        let part_path = dest.with_extension("part");
-
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()
-            .with_context(|| format!("HTTP error for {url}"))?;
-
-        let total = response.content_length();
-        let mut stream = response.bytes_stream();
-
-        let mut part_file = tokio::fs::File::create(&part_path)
-            .await
-            .with_context(|| format!("creating {}", part_path.display()))?;
-
-        let mut downloaded: u64 = 0;
-        let mut last_logged: u64 = 0;
-        const LOG_EVERY: u64 = 50 * 1024 * 1024; // 50 MB
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("reading stream for {url}"))?;
-            tokio::io::AsyncWriteExt::write_all(&mut part_file, &chunk)
-                .await
-                .with_context(|| format!("writing to {}", part_path.display()))?;
-            downloaded += chunk.len() as u64;
-            if downloaded - last_logged >= LOG_EVERY {
-                last_logged = downloaded;
-                match total {
-                    Some(t) => info!("  {file}: {:.1} / {:.1} MB", mb(downloaded), mb(t)),
-                    None    => info!("  {file}: {:.1} MB downloaded", mb(downloaded)),
-                }
-            }
-        }
-
-        // Flush + rename to final path.
-        tokio::io::AsyncWriteExt::flush(&mut part_file).await?;
-        drop(part_file);
-        std::fs::rename(&part_path, &dest)
-            .with_context(|| format!("renaming {} → {}", part_path.display(), dest.display()))?;
-
-        info!("download complete: {} ({:.1} MB)", dest.display(), mb(downloaded));
-        paths.push(dest);
-    }
-
-    Ok(paths)
+    ensure_model_with_progress(repo, files, |_, _| {}).await
 }
 
 fn mb(bytes: u64) -> f64 {
@@ -161,6 +165,46 @@ mod tests {
         // (the slash was replaced) — it should be "Org--Repo".
         let parent_name = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
         assert_eq!(parent_name, "Org--Repo");
+    }
+
+    #[tokio::test]
+    async fn progress_reports_total_and_reaches_full() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = vec![b'x'; 1000];
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        // Point hf_url at the mock by using a repo/file whose resolve URL is the mock.
+        // ensure_model_with_progress builds the URL via hf_url(repo,file); override the
+        // base by setting the file to an absolute path is not possible, so we test the
+        // callback wiring through a direct download against the mock server URL instead.
+        let seen: Arc<Mutex<Vec<(u64, Option<u64>)>>> = Arc::new(Mutex::new(vec![]));
+        let seen2 = seen.clone();
+
+        // Use a temp cache by pointing HOME/XDG cache via the repo/file path under a temp dir
+        // is overkill here; instead assert the callback contract via a unit on the streaming
+        // helper. We verify: final callback has done == total == 1000.
+        let dir = std::env::temp_dir().join(format!("dl-prog-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("model.bin");
+        download_to_with_progress(&server.uri(), &dest, |done, total| {
+            seen2.lock().unwrap().push((done, total));
+        })
+        .await
+        .unwrap();
+
+        let s = seen.lock().unwrap();
+        let (last_done, last_total) = *s.last().unwrap();
+        assert_eq!(last_done, 1000);
+        assert_eq!(last_total, Some(1000));
+        assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Skip-path integration test: create a dummy file at the cache location
