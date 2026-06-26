@@ -1,4 +1,5 @@
 pub mod api;
+pub mod catalog;
 pub mod cloud;
 pub mod config;
 pub mod download;
