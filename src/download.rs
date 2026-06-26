@@ -120,10 +120,6 @@ pub async fn ensure_model(repo: &str, files: &[String]) -> anyhow::Result<Vec<Pa
     ensure_model_with_progress(repo, files, |_, _| {}).await
 }
 
-fn mb(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0)
-}
-
 // ---------------------------------------------------------------------------
 // Tests — RED step: written BEFORE any implementation existed
 // ---------------------------------------------------------------------------
