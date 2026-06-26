@@ -128,6 +128,13 @@ pub async fn run_server_with_ready_and_policy(
     let admin_token = crate::server::resolve_admin_token(cfg.admin_token.clone());
     crate::server::write_admin_token_file(&admin_token);
 
+    let total_ram_mb = {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory() / (1024 * 1024) // bytes → MB
+    };
+
     let app = router(
         manager,
         cfg.model_id.clone(),
@@ -136,6 +143,7 @@ pub async fn run_server_with_ready_and_policy(
         usage,
         cfg.cloud_token_alert,
         Arc::from(admin_token),
+        total_ram_mb,
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
@@ -282,6 +290,7 @@ pub fn router_for_test_with(
         usage,
         200_000,
         Arc::from("test-token"),
+        16384,
     )
 }
 
@@ -381,6 +390,22 @@ pub async fn axum_test_request_status(app: Router, path: &str, body: &str) -> u1
 
     let response = app.oneshot(request).await.unwrap();
     response.status().as_u16()
+}
+
+/// DELETE with a JSON body + header → HTTP status code.
+pub async fn axum_test_delete_status_with_header(
+    app: Router, path: &str, body: &str, hname: &str, hval: &str,
+) -> u16 {
+    use axum::body::Body;
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("DELETE")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header(hname, hval)
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    app.oneshot(request).await.unwrap().status().as_u16()
 }
 
 /// POST with a JSON body AND a custom header; return the HTTP status code.

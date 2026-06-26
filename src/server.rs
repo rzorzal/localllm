@@ -274,6 +274,8 @@ pub struct AppState {
     pub cloud_token_alert: usize,
     /// Token required on /admin/* endpoints.
     pub admin_token: Arc<str>,
+    /// Total physical RAM in MB (read once at startup), for catalog fit/recommend.
+    pub total_ram_mb: u64,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -298,6 +300,7 @@ impl Generator for crate::engine::Engine {
 /// Build the axum Router with all four endpoints wired to the given generator,
 /// the configured model id, the shared routing policy, the local context
 /// window used by the context gate, and the session usage tracker.
+#[allow(clippy::too_many_arguments)]
 pub fn router(
     manager: Arc<crate::model_manager::ModelManager>,
     model_id: String,
@@ -306,6 +309,7 @@ pub fn router(
     usage: std::sync::Arc<crate::usage::Usage>,
     cloud_token_alert: usize,
     admin_token: Arc<str>,
+    total_ram_mb: u64,
 ) -> Router {
     let state = Arc::new(AppState {
         manager,
@@ -315,6 +319,7 @@ pub fn router(
         usage,
         cloud_token_alert,
         admin_token,
+        total_ram_mb,
     });
     // Large prompts must reach the routing layer to be forwarded to cloud;
     // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
@@ -326,6 +331,7 @@ pub fn router(
         .route("/health", get(handle_health))
         .route("/admin/model", post(handle_admin_switch))
         .route("/admin/model/status", get(handle_admin_status))
+        .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -401,6 +407,64 @@ async fn handle_admin_status(
         return resp;
     }
     Json(state.manager.status()).into_response()
+}
+
+/// GET /admin/models — the annotated catalog for this machine (token-guarded).
+async fn handle_models_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let active = state.manager.status().current;
+    let view = crate::catalog::catalog_view(
+        crate::catalog::CATALOG,
+        state.total_ram_mb,
+        Some(&active),
+        |r, f| crate::download::cache_path(r, f).exists(),
+    );
+    Json(view).into_response()
+}
+
+/// DELETE /admin/models — free disk for a downloaded model (token-guarded).
+/// Refuses the in-use model.
+async fn handle_model_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: AdminSwitchBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    if body.repo.is_empty() || body.file.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and file are required"})))
+            .into_response();
+    }
+    let active = state.manager.status().current;
+    if active.repo == body.repo && active.file == body.file {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "cannot delete the model in use"})),
+        )
+            .into_response();
+    }
+    match crate::download::delete_cached(&body.repo, &body.file) {
+        Ok(deleted) => Json(json!({"deleted": deleted})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("delete failed: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

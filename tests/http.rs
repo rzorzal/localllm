@@ -295,6 +295,50 @@ async fn overflow_cloud_offline_returns_clean_error() {
     std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
 }
 
+// --- Model catalog endpoints (sub-project 2, task 3) ---
+
+#[tokio::test]
+async fn admin_models_requires_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_get_status(app, "/admin/models").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_models_returns_catalog_with_recommendation() {
+    let app = localllm::router_for_test();
+    let resp = localllm::axum_test_get_with_header(
+        app, "/admin/models", "x-admin-token", "test-token",
+    ).await;
+    // grouped families, non-empty, with exactly one recommended across all
+    let families = resp.as_array().expect("array of families");
+    assert!(!families.is_empty());
+    let rec_count: usize = families.iter()
+        .flat_map(|f| f["models"].as_array().unwrap())
+        .filter(|m| m["recommended"] == true)
+        .count();
+    assert_eq!(rec_count, 1);
+}
+
+#[tokio::test]
+async fn admin_delete_rejects_bad_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_delete_status_with_header(
+        app, "/admin/models", r#"{"repo":"r","file":"f"}"#, "x-admin-token", "wrong",
+    ).await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_delete_in_use_model_is_409() {
+    // router_for_test's ModelManager current spec is {repo:"test", file:"test"}.
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_delete_status_with_header(
+        app, "/admin/models", r#"{"repo":"test","file":"test"}"#, "x-admin-token", "test-token",
+    ).await;
+    assert_eq!(status, 409);
+}
+
 /// A weak local cascade whose cloud escalation fails (offline) keeps the local
 /// (truncated) answer instead of erroring.
 #[tokio::test]

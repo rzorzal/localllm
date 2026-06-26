@@ -28,6 +28,8 @@ arc-swap = "1"
 # Cross-platform desktop notifications (Linux libnotify/D-Bus, Windows toast,
 # macOS native — picks up the .app bundle icon when launched from the bundle).
 notify-rust = "4"
+# Total physical RAM detection (read once at startup for catalog fit/recommend).
+sysinfo = "0.32"
 
 # macOS menu-bar tray (only used when --tray flag is passed)
 [target.'cfg(target_os = "macos")'.dependencies]
