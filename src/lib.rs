@@ -6,6 +6,7 @@ pub mod engine;
 pub mod engine_llama;
 pub mod route;
 pub mod settings;
+pub mod usage;
 pub mod server;
 pub mod tscg;
 #[cfg(target_os = "macos")]
