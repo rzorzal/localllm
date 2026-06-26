@@ -192,7 +192,8 @@ mod tests {
         // ensure_model_with_progress builds the URL via hf_url(repo,file); override the
         // base by setting the file to an absolute path is not possible, so we test the
         // callback wiring through a direct download against the mock server URL instead.
-        let seen: Arc<Mutex<Vec<(u64, Option<u64>)>>> = Arc::new(Mutex::new(vec![]));
+        type ProgressLog = Vec<(u64, Option<u64>)>;
+        let seen: Arc<Mutex<ProgressLog>> = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
 
         // Use a temp cache by pointing HOME/XDG cache via the repo/file path under a temp dir
