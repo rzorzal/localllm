@@ -226,6 +226,7 @@ async fn cascade_or_result(
     want_cascade: bool,
     gen_result: anyhow::Result<ChatResult>,
     provider: crate::cloud::Provider,
+    upstream_path: &str,
     headers: &HeaderMap,
     raw: Bytes,
     state: &AppState,
@@ -238,7 +239,7 @@ async fn cascade_or_result(
         Ok(result) => {
             if want_cascade && crate::route::is_weak_result(&result) {
                 tracing::info!(target: "localllm::req", "{rid} [{api}] cascade: weak local (length) → escalating to cloud");
-                match crate::cloud::forward(provider, headers, raw).await {
+                match crate::cloud::forward(provider, upstream_path, headers, raw).await {
                     crate::cloud::ForwardOutcome::Relayed(resp) => {
                         record_cloud_success(state, est_prompt_tokens);
                         Err(resp)
@@ -258,7 +259,7 @@ async fn cascade_or_result(
         Err(e) => {
             if want_cascade {
                 tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade: local generate failed ({e}) → escalating to cloud");
-                match crate::cloud::forward(provider, headers, raw).await {
+                match crate::cloud::forward(provider, upstream_path, headers, raw).await {
                     crate::cloud::ForwardOutcome::Relayed(resp) => {
                         record_cloud_success(state, est_prompt_tokens);
                         Err(resp)
@@ -577,7 +578,7 @@ async fn handle_oai_chat(
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
-            match crate::cloud::forward(crate::cloud::Provider::OpenAI, &headers, raw.clone()).await {
+            match crate::cloud::forward(crate::cloud::Provider::OpenAI, "/v1/chat/completions", &headers, raw.clone()).await {
                 crate::cloud::ForwardOutcome::Relayed(resp) => {
                     record_cloud_success(&state, est_prompt_tokens);
                     return resp;
@@ -612,6 +613,7 @@ async fn handle_oai_chat(
             want_cascade,
             state.manager.generate(internal).await,
             crate::cloud::Provider::OpenAI,
+            "/v1/chat/completions",
             &headers,
             raw,
             &state,
@@ -691,6 +693,7 @@ async fn handle_oai_chat(
             want_cascade,
             state.manager.generate(internal).await,
             crate::cloud::Provider::OpenAI,
+            "/v1/chat/completions",
             &headers,
             raw,
             &state,
@@ -760,7 +763,7 @@ async fn handle_anth_messages(
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
-            match crate::cloud::forward(crate::cloud::Provider::Anthropic, &headers, raw.clone()).await {
+            match crate::cloud::forward(crate::cloud::Provider::Anthropic, "/v1/messages", &headers, raw.clone()).await {
                 crate::cloud::ForwardOutcome::Relayed(resp) => {
                     record_cloud_success(&state, est_prompt_tokens);
                     return resp;
@@ -794,6 +797,7 @@ async fn handle_anth_messages(
             want_cascade,
             state.manager.generate(internal).await,
             crate::cloud::Provider::Anthropic,
+            "/v1/messages",
             &headers,
             raw,
             &state,
@@ -874,6 +878,7 @@ async fn handle_anth_messages(
             want_cascade,
             state.manager.generate(internal).await,
             crate::cloud::Provider::Anthropic,
+            "/v1/messages",
             &headers,
             raw,
             &state,
