@@ -11,7 +11,7 @@ pub use policy::{Profile, RoutingPolicy};
 use crate::api::common::ChatRequest;
 
 /// Cheap, pre-generation signals used to decide where a request runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Signals {
     /// Estimated prompt size in tokens.
     pub prompt_tokens: usize,
@@ -21,6 +21,9 @@ pub struct Signals {
     pub n_messages: usize,
     /// Whether the incoming request carries cloud credentials we can forward.
     pub has_cloud_creds: bool,
+    /// Active local model's parameter size in billions (0.0 = unknown/neutral).
+    /// Shifts the difficulty threshold: weaker local → more cloud.
+    pub local_capability_b: f32,
 }
 
 /// Why a request was sent to cloud.
@@ -89,10 +92,16 @@ pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
         return Decision::Local;
     }
 
-    // 3. Difficulty above the profile threshold → cloud now.
-    //    (MaxQuality's low threshold makes this cloud-first; trivial requests
-    //     still score below it and stay local.)
-    if difficulty_score(s) > p.escalation_threshold {
+    // 3. Difficulty above the *capability-adjusted* threshold → cloud now.
+    //    Weaker local model (cap < 7B) lowers the cutoff (more cloud); stronger
+    //    (cap > 7B) raises it (more local); unknown (0.0) → no change.
+    let adj = if s.local_capability_b > 0.0 {
+        ((s.local_capability_b - 7.0) as f64 * 0.03).clamp(-0.3, 0.3)
+    } else {
+        0.0
+    };
+    let effective_threshold = (p.escalation_threshold + adj).clamp(0.0, 1.0);
+    if difficulty_score(s) > effective_threshold {
         return Decision::Cloud(RouteReason::Difficulty);
     }
 
@@ -150,6 +159,7 @@ mod tests {
             n_tools: 0,
             n_messages: 1,
             has_cloud_creds: has_creds,
+            local_capability_b: 0.0,
         }
     }
 
@@ -181,6 +191,7 @@ mod tests {
             n_tools: 12,
             n_messages: 1,
             has_cloud_creds: true,
+            local_capability_b: 0.0,
         };
         assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::Difficulty));
     }
@@ -195,6 +206,7 @@ mod tests {
             n_tools: 0,
             n_messages: 1,
             has_cloud_creds: true,
+            local_capability_b: 0.0,
         };
         // ctx_fill 0.4 → 0.6*0.4 = 0.24 > 0.2 → cloud.
         assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::Difficulty));
@@ -211,11 +223,11 @@ mod tests {
     fn difficulty_score_is_low_for_trivial_and_high_for_full() {
         let trivial = Signals {
             prompt_tokens: 10, local_ctx_window: 1000, n_tools: 0,
-            n_messages: 1, has_cloud_creds: true,
+            n_messages: 1, has_cloud_creds: true, local_capability_b: 0.0,
         };
         let full = Signals {
             prompt_tokens: 1000, local_ctx_window: 1000, n_tools: 12,
-            n_messages: 20, has_cloud_creds: true,
+            n_messages: 20, has_cloud_creds: true, local_capability_b: 0.0,
         };
         assert!(difficulty_score(&trivial) < 0.1);
         assert!(difficulty_score(&full) > 0.95);
@@ -260,6 +272,39 @@ mod tests {
             model: "m".into(),
         };
         assert_eq!(estimate_prompt_tokens(&req), 100);
+    }
+
+    // A request scoring ~0.55: ctx 700/1000=0.7→0.42, 6 tools→0.125, 1 msg→~0.0075.
+    fn mid_sig(cap: f32) -> Signals {
+        Signals {
+            prompt_tokens: 700, local_ctx_window: 1000, n_tools: 6,
+            n_messages: 1, has_cloud_creds: true, local_capability_b: cap,
+        }
+    }
+
+    #[test]
+    fn weak_local_lowers_threshold_to_cloud() {
+        let p = Profile::Balanced.policy(); // threshold 0.6
+        // neutral (0.0) and 7B: score ~0.55 < 0.6 → stays local (cascade).
+        assert_eq!(decide(&mid_sig(0.0), &p), Decision::LocalThenCascade);
+        assert_eq!(decide(&mid_sig(7.0), &p), Decision::LocalThenCascade);
+        // 3B: adj −0.12 → effective 0.48 → 0.55 > 0.48 → cloud.
+        assert_eq!(decide(&mid_sig(3.0), &p), Decision::Cloud(RouteReason::Difficulty));
+    }
+
+    #[test]
+    fn strong_local_raises_threshold_to_local() {
+        let p = Profile::Balanced.policy();
+        // 14B: adj +0.21 → effective 0.81 → 0.55 < 0.81 → stays local.
+        assert_eq!(decide(&mid_sig(14.0), &p), Decision::LocalThenCascade);
+    }
+
+    #[test]
+    fn capability_never_overrides_context_gate() {
+        // Over-window even with a huge model → still ContextOverflow.
+        let s = Signals { prompt_tokens: 5000, local_ctx_window: 1000, n_tools: 0,
+            n_messages: 1, has_cloud_creds: true, local_capability_b: 32.0 };
+        assert_eq!(decide(&s, &Profile::SaveTokens.policy()), Decision::Cloud(RouteReason::ContextOverflow));
     }
 
     #[test]

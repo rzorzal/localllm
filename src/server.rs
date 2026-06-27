@@ -159,12 +159,15 @@ fn route_decision(
     let has_cloud_creds =
         headers.contains_key("x-api-key") || headers.contains_key("authorization");
     let prompt_tokens = crate::route::estimate_prompt_tokens(internal);
+    let active = state.manager.status().current;
+    let local_capability_b = crate::catalog::active_params_b(&active.repo, &active.file);
     let signals = crate::route::Signals {
         prompt_tokens,
         local_ctx_window: state.local_ctx_window,
         n_tools: internal.tools.len(),
         n_messages: internal.messages.len(),
         has_cloud_creds,
+        local_capability_b,
     };
     let policy = *state.policy.read().unwrap();
     (crate::route::decide(&signals, &policy), prompt_tokens)
