@@ -443,3 +443,65 @@ async fn manager_assets_served_with_types() {
     assert_eq!(s2, 200);
     assert!(c2.contains("css"));
 }
+
+// --- OpenAI Responses API (sub-project 3, task 5) ---
+
+#[tokio::test]
+async fn responses_endpoint_returns_function_call() {
+    let app = localllm::router_for_test();
+    // FakeGen returns a tool call → output should carry a function_call item.
+    let body = r#"{"model":"m","input":"weather?",
+        "tools":[{"type":"function","name":"get_weather","description":"w","parameters":{"type":"object"}}]}"#;
+    let resp = localllm::axum_test_request(app, "/v1/responses", body).await;
+    assert_eq!(resp["object"], "response");
+    assert_eq!(resp["output"][0]["type"], "function_call");
+    assert_eq!(resp["output"][0]["name"], "get_weather");
+}
+
+#[tokio::test]
+async fn responses_unknown_role_returns_400() {
+    let app = localllm::router_for_test();
+    let body = r#"{"model":"m","input":[{"type":"message","role":"frob","content":"hi"}]}"#;
+    let status = localllm::axum_test_request_status(app, "/v1/responses", body).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn responses_stream_returns_event_sequence() {
+    let app = localllm::router_for_test();
+    let body = r#"{"model":"m","stream":true,"input":"hi"}"#;
+    let raw = localllm::axum_test_request_raw(app, "/v1/responses", body).await;
+    assert!(raw.contains("response.created"), "missing created: {raw}");
+    assert!(raw.contains("response.completed"), "missing completed: {raw}");
+    // no Chat-style DONE sentinel for Responses
+    assert!(!raw.contains("[DONE]"), "responses stream must not emit [DONE]: {raw}");
+}
+
+#[tokio::test]
+async fn responses_overflow_routes_to_cloud() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = ENV_LOCK.lock().await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"routed":"cloud"}"#))
+        .mount(&server)
+        .await;
+    std::env::set_var("LOCALLLM_OPENAI_BASE", server.uri());
+
+    let big = "x".repeat(8000); // overflow the tiny test window
+    let body = format!(r#"{{"model":"m","input":"{big}"}}"#);
+    let resp = localllm::axum_test_request_with_header(
+        localllm::router_for_test(),
+        "/v1/responses",
+        &body,
+        "authorization",
+        "Bearer sk-test",
+    )
+    .await;
+    assert_eq!(resp["routed"], "cloud");
+
+    std::env::remove_var("LOCALLLM_OPENAI_BASE");
+}
