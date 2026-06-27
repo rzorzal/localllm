@@ -10,6 +10,13 @@ const toastEl = document.getElementById("toast");
 
 let families = [];          // FamilyView[]
 let pollTimer = null;
+// Re-renders the pane the user is currently on, re-resolving from the latest
+// `families` so a background refresh (or external hot-swap) updates badges
+// without losing the user's place. Set by each render*() below.
+let currentView = renderFamilies;
+// JSON of the last-rendered families, so the background tick only re-renders
+// (and risks scroll reset) when the data actually changed.
+let lastFamiliesJson = "";
 
 function authHeaders(extra) {
   return Object.assign({ "x-admin-token": TOKEN }, extra || {});
@@ -44,7 +51,25 @@ const gb = (mb) => (mb / 1024).toFixed(1) + " GB";
 
 async function refresh() {
   families = await api("GET", "/admin/models");
+  lastFamiliesJson = JSON.stringify(families);
   await refreshStatusHeader();
+}
+
+// Background sync: re-fetch the catalog and, if it changed, re-render whatever
+// pane is open so an external switch (or a switch finished elsewhere) is
+// reflected. Skips while a switch we started is actively polling.
+async function tick() {
+  if (pollTimer) return;
+  let next;
+  try { next = await api("GET", "/admin/models"); }
+  catch (_) { return; }
+  await refreshStatusHeader();
+  const j = JSON.stringify(next);
+  if (j !== lastFamiliesJson) {
+    lastFamiliesJson = j;
+    families = next;
+    currentView();
+  }
 }
 
 async function refreshStatusHeader() {
@@ -80,6 +105,7 @@ function el(tag, cls, html) {
 
 // ---- Pane 1: families ----
 function renderFamilies() {
+  currentView = renderFamilies;
   setCrumbs([{ label: "Models" }]);
   const grid = el("div", "grid");
   families.forEach((fam) => {
@@ -100,6 +126,11 @@ function renderFamilies() {
 
 // ---- Pane 2: models in a family ----
 function renderModels(fam) {
+  const famName = fam.family;
+  currentView = () => {
+    const f = families.find((x) => x.family === famName);
+    f ? renderModels(f) : renderFamilies();
+  };
   setCrumbs([{ label: "Models", onClick: renderFamilies }, { label: fam.family }]);
   const grid = el("div", "grid");
   fam.models.forEach((m) => {
@@ -119,6 +150,12 @@ function renderModels(fam) {
 
 // ---- Pane 3: detail + actions ----
 function renderDetail(fam, m) {
+  const famName = fam.family, file = m.file;
+  currentView = () => {
+    const f = families.find((x) => x.family === famName);
+    const mm = f && f.models.find((x) => x.file === file);
+    mm ? renderDetail(f, mm) : (f ? renderModels(f) : renderFamilies());
+  };
   setCrumbs([
     { label: "Models", onClick: renderFamilies },
     { label: fam.family, onClick: () => renderModels(fam) },
@@ -195,6 +232,13 @@ async function doDelete(m) {
 (async function boot() {
   try { await refresh(); renderFamilies(); }
   catch (e) { view.innerHTML = `<div class="loading">${e.message}</div>`; }
-  // keep the header live (catches switches started elsewhere)
-  setInterval(() => { if (!pollTimer) refreshStatusHeader().catch(() => {}); }, 3000);
+  // Keep header + grid live: catches switches started elsewhere and stale
+  // badges after the window was hidden then reopened from the tray.
+  setInterval(() => { tick().catch(() => {}); }, 3000);
+  // The window is hidden (not destroyed) on close, so reopening fires focus
+  // rather than a reload — refresh immediately so it never shows stale state.
+  window.addEventListener("focus", () => { tick().catch(() => {}); });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) tick().catch(() => {});
+  });
 })();

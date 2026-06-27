@@ -227,6 +227,88 @@ mod window {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::model_menu_label;
+    use crate::model_manager::ModelSpec;
+
+    #[test]
+    fn label_strips_repo_owner_and_appends_file() {
+        let spec = ModelSpec {
+            repo: "Qwen/Qwen2.5-7B-Instruct-GGUF".into(),
+            file: "qwen2.5-7b-instruct-q4_k_m.gguf".into(),
+        };
+        assert_eq!(
+            model_menu_label(&spec),
+            "Model:  Qwen2.5-7B-Instruct-GGUF / qwen2.5-7b-instruct-q4_k_m.gguf"
+        );
+    }
+
+    #[test]
+    fn label_handles_repo_without_owner() {
+        let spec = ModelSpec { repo: "local".into(), file: "m.gguf".into() };
+        assert_eq!(model_menu_label(&spec), "Model:  local / m.gguf");
+    }
+
+    use super::status_menu_label;
+    use crate::model_manager::{SwitchPhase, SwitchStatus};
+
+    fn status(state: &str, phase: SwitchPhase, progress: u8) -> SwitchStatus {
+        SwitchStatus {
+            state: state.into(),
+            current: ModelSpec { repo: "r".into(), file: "f".into() },
+            target: None,
+            phase,
+            progress,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn status_ready_is_running() {
+        assert_eq!(status_menu_label(&status("ready", SwitchPhase::Idle, 0)), "🟢 Running");
+    }
+
+    #[test]
+    fn status_switching_shows_phase_and_percent() {
+        assert_eq!(
+            status_menu_label(&status("switching", SwitchPhase::Downloading, 42)),
+            "🟡 Switching… downloading 42%"
+        );
+    }
+
+    #[test]
+    fn status_error_is_failed() {
+        assert_eq!(status_menu_label(&status("error", SwitchPhase::Idle, 0)), "🔴 Switch failed");
+    }
+}
+
+/// Format the tray "Model:" line from the active model spec. Mirrors the
+/// Manager window header (`repo-basename / file`) so the two never disagree.
+fn model_menu_label(spec: &crate::model_manager::ModelSpec) -> String {
+    let short = spec.repo.rsplit('/').next().unwrap_or(&spec.repo);
+    format!("Model:  {short} / {}", spec.file)
+}
+
+/// Format the tray status line from live manager state: green Running when idle,
+/// yellow Switching with phase+percent mid-swap, red on a failed switch.
+fn status_menu_label(s: &crate::model_manager::SwitchStatus) -> String {
+    use crate::model_manager::SwitchPhase;
+    match s.state.as_str() {
+        "switching" => {
+            let phase = match s.phase {
+                SwitchPhase::Draining => "draining",
+                SwitchPhase::Downloading => "downloading",
+                SwitchPhase::Loading => "loading",
+                SwitchPhase::Idle => "switching",
+            };
+            format!("🟡 Switching… {phase} {}%", s.progress)
+        }
+        "error" => "🔴 Switch failed".to_string(),
+        _ => "🟢 Running".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tray entry point
 // ---------------------------------------------------------------------------
@@ -260,6 +342,13 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // Clone the token for the server thread; keep the original for Task 3's window.
     let admin_token_for_server = admin_token.clone();
 
+    // Shared slot the server fills with the live ModelManager once built, so the
+    // tray can poll the active model and keep its "Model:" line in sync after a
+    // hot-swap (the line is otherwise static from launch config).
+    let manager_slot: Arc<std::sync::OnceLock<Arc<crate::model_manager::ModelManager>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let manager_slot_for_server = manager_slot.clone();
+
     // ---- Spawn server on a background thread with its own tokio runtime ----
     std::thread::Builder::new()
         .name("localllm-server".to_string())
@@ -271,6 +360,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 Some(ready_for_server),
                 policy_for_server,
                 admin_token_for_server,
+                Some(manager_slot_for_server),
             )) {
                 tracing::error!("server exited with error: {e:#}");
                 std::process::exit(1);
@@ -300,9 +390,14 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let mut quit_id: Option<tray_icon::menu::MenuId> = None;
     let mut logs_id: Option<tray_icon::menu::MenuId> = None;
     let mut url_id: Option<tray_icon::menu::MenuId> = None;
-    // Kept so we can flip the status text to "running" once the server is up.
+    // Kept so we can live-update the status text from the server/switch state.
+    // last_status avoids redundant set_text on every poll tick.
     let mut status_handle: Option<MenuItem> = None;
-    let mut shown_running = false;
+    let mut last_status: Option<String> = None;
+    // Kept so we can live-update the "Model:" line after a hot-swap; last_model
+    // avoids redundant set_text on every poll tick.
+    let mut model_handle: Option<MenuItem> = None;
+    let mut last_model: Option<crate::model_manager::ModelSpec> = None;
     // Routing submenu state: (menu id, profile, check item) for each profile,
     // populated in Init and used to dispatch clicks + re-check on change.
     let mut routing_items: Vec<(tray_icon::menu::MenuId, Profile, CheckMenuItem)> = Vec::new();
@@ -339,6 +434,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let url_line = MenuItem::new(format!("URL:    {url_for_tray}  (click to copy)"), true, None);
                 url_id = Some(url_line.id().clone());
                 let model_line = MenuItem::new(format!("Model:  {model_short}"), false, None);
+                model_handle = Some(model_line.clone());
                 let ctx_line = MenuItem::new(format!("Context: {info_ctx} tokens"), false, None);
                 let kv_line = MenuItem::new(format!("KV cache: {info_kv}"), false, None);
                 let backend_line = MenuItem::new(format!("Backend: {info_backend}"), false, None);
@@ -402,13 +498,27 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
             Event::MainEventsCleared
             | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 // Flip status to green once the server is actually serving.
-                if !shown_running
-                    && ready.load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    if let Some(s) = &status_handle {
-                        s.set_text("🟢 Running");
+                // Until the server is bound, keep the launch-time "Loading model…"
+                // line. Once ready, drive both the status and the model line from
+                // the live manager so startup, hot-swaps, and switch failures all
+                // show in the tray.
+                if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Some(mgr) = manager_slot.get() {
+                        let st = mgr.status();
+                        let label = status_menu_label(&st);
+                        if last_status.as_deref() != Some(label.as_str()) {
+                            if let Some(s) = &status_handle {
+                                s.set_text(&label);
+                            }
+                            last_status = Some(label);
+                        }
+                        if last_model.as_ref() != Some(&st.current) {
+                            if let Some(m) = &model_handle {
+                                m.set_text(model_menu_label(&st.current));
+                            }
+                            last_model = Some(st.current);
+                        }
                     }
-                    shown_running = true;
                 }
 
                 while let Ok(menu_event) = MenuEvent::receiver().try_recv() {

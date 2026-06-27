@@ -48,16 +48,21 @@ pub async fn run_server_with_ready_and_policy(
     policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
 ) -> anyhow::Result<()> {
     let admin_token = std::sync::Arc::from(crate::server::resolve_admin_token(cfg.admin_token.clone()));
-    run_server_with_ready_policy_token(cfg, ready, policy, admin_token).await
+    run_server_with_ready_policy_token(cfg, ready, policy, admin_token, None).await
 }
 
 /// Like [`run_server_with_ready_and_policy`] but takes an externally-resolved
 /// admin token (so the tray shares the same token with its Model Manager window).
+///
+/// `manager_out`, when supplied, is filled with the live `Arc<ModelManager>`
+/// once built, so a caller (the tray) can read the current model after a
+/// hot-swap and keep its menu in sync.
 pub async fn run_server_with_ready_policy_token(
     cfg: crate::config::Config,
     ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
     admin_token: std::sync::Arc<str>,
+    manager_out: Option<std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::model_manager::ModelManager>>>>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use crate::config::Backend;
@@ -135,6 +140,10 @@ pub async fn run_server_with_ready_policy_token(
     });
     let manager = ModelManager::new(engine, initial_spec, builder);
     let _ = manager_slot.set(Arc::downgrade(&manager));
+    // Hand the live manager to the tray (if any) so it can poll the active model.
+    if let Some(slot) = manager_out {
+        let _ = slot.set(manager.clone());
+    }
 
     crate::server::write_admin_token_file(&admin_token);
 
