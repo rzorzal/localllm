@@ -1,0 +1,969 @@
+# OpenAI Responses API (`/v1/responses`) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add a `POST /v1/responses` endpoint that speaks the OpenAI Responses API so Codex can target localllm, routed local/cloud exactly like the existing wires.
+
+**Architecture:** New `src/api/openai_responses.rs` mirrors `src/api/openai.rs` (wire types → `to_internal` → engine → render / stream). A new handler in `src/server.rs` reuses `route_decision` + `cascade_or_result`. `cloud::forward` is generalized to take an explicit upstream path so the same OpenAI base serves both `/v1/chat/completions` and `/v1/responses`.
+
+**Tech Stack:** Rust, axum, serde / serde_json, futures (SSE), wiremock (tests). Internal types in `src/api/common.rs`: `ChatRequest`, `ChatMessage`, `Role`, `ToolCall`, `ToolResult`, `ToolSpec`, `ChatResult`, `ContentPart`, `FinishReason`.
+
+## Global Constraints
+
+- Reuse internal types from `src/api/common.rs`; **no new model or routing logic**.
+- Streaming for `/v1/responses` is **buffered**: generate the full result (reusing the tested non-streaming path), then replay it as the Responses SSE event sequence. This guarantees correct item/content/function-call framing. (Same rationale as the existing buffered tool-streaming in `openai.rs`.)
+- Stateless only: no `previous_response_id` / `store`. Image/reasoning/built-in-tool inputs are accepted-and-ignored, never error.
+- Responses SSE has **no `[DONE]` sentinel**; the stream ends with a `response.completed` event.
+- Every cloud forward carries the client's own headers/credential byte-faithfully (existing `cloud::forward` behavior).
+- TDD: failing test first, minimal impl, commit per task.
+
+---
+
+### Task 1: Generalize `cloud::forward` to take an explicit upstream path
+
+Pure refactor, no behavior change. Removes `Provider::path()`; the caller passes the upstream path. Unblocks forwarding `/v1/responses` to the OpenAI base.
+
+**Files:**
+- Modify: `src/cloud.rs` (`forward` signature + URL build; remove `Provider::path`; update unit tests)
+- Modify: `src/server.rs` (`cascade_or_result` signature + its two internal `forward` calls; the two direct `forward` calls in `handle_oai_chat` / `handle_anth_messages`; the four `cascade_or_result` call sites)
+
+**Interfaces:**
+- Produces: `pub async fn forward(provider: Provider, upstream_path: &str, headers: &HeaderMap, body: Bytes) -> ForwardOutcome`
+- Produces: `async fn cascade_or_result(want_cascade: bool, local: anyhow::Result<ChatResult>, provider: crate::cloud::Provider, upstream_path: &str, headers: &HeaderMap, raw: Bytes, state: &Arc<AppState>, est_prompt_tokens: usize, rid: &str, tag: &str) -> Result<ChatResult, Response>`
+
+- [ ] **Step 1: Update the `cloud.rs` unit tests to the new signature (failing compile)**
+
+In `src/cloud.rs` tests, change every `forward(Provider::X, &headers, body)` call to pass the path, e.g.:
+
+```rust
+let outcome = forward(Provider::Anthropic, "/v1/messages", &headers, body).await;
+// ...
+let out = forward(Provider::OpenAI, "/v1/chat/completions", &HeaderMap::new(), Bytes::new()).await;
+```
+
+- [ ] **Step 2: Run to verify it fails to compile**
+
+Run: `cargo test --lib cloud:: 2>&1 | tail -20`
+Expected: compile error — `forward` takes 3 args / `this function takes 4 arguments`.
+
+- [ ] **Step 3: Change `forward` and delete `Provider::path()`**
+
+In `src/cloud.rs`, delete the `path(&self)` method from `impl Provider`. Change `forward`:
+
+```rust
+pub async fn forward(
+    provider: Provider,
+    upstream_path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> ForwardOutcome {
+    let url = format!("{}{}", provider.base_url(), upstream_path);
+    // ... rest unchanged ...
+```
+
+- [ ] **Step 4: Update `cascade_or_result` and all `server.rs` call sites**
+
+In `src/server.rs`, add `upstream_path: &str` to `cascade_or_result` (right after the `provider` param) and pass it through to both internal `crate::cloud::forward(provider, ...)` calls:
+
+```rust
+async fn cascade_or_result(
+    want_cascade: bool,
+    local: anyhow::Result<crate::api::common::ChatResult>,
+    provider: crate::cloud::Provider,
+    upstream_path: &str,
+    headers: &HeaderMap,
+    raw: Bytes,
+    state: &Arc<AppState>,
+    est_prompt_tokens: usize,
+    rid: &str,
+    tag: &str,
+) -> Result<crate::api::common::ChatResult, axum::response::Response> {
+    // ...both internal calls become:
+    //   match crate::cloud::forward(provider, upstream_path, headers, raw).await {
+```
+
+Update the direct `forward` call in `handle_oai_chat` (currently line ~580):
+
+```rust
+match crate::cloud::forward(crate::cloud::Provider::OpenAI, "/v1/chat/completions", &headers, raw.clone()).await {
+```
+
+Update the direct `forward` call in `handle_anth_messages` (currently line ~763):
+
+```rust
+match crate::cloud::forward(crate::cloud::Provider::Anthropic, "/v1/messages", &headers, raw.clone()).await {
+```
+
+Update the four `cascade_or_result(...)` call sites to pass the path right after the provider arg: the two OpenAI sites (lines ~614, ~693) pass `"/v1/chat/completions"`; the two Anthropic sites (lines ~796, ~876) pass `"/v1/messages"`. Example:
+
+```rust
+let result = match cascade_or_result(
+    want_cascade,
+    state.manager.generate(internal).await,
+    crate::cloud::Provider::OpenAI,
+    "/v1/chat/completions",
+    &headers,
+    raw,
+    &state,
+    est_prompt_tokens,
+    &rid,
+    "openai",
+).await { Ok(r) => r, Err(resp) => return resp };
+```
+
+- [ ] **Step 5: Run the full suite to verify no behavior changed**
+
+Run: `cargo test 2>&1 | tail -25`
+Expected: all tests PASS (cloud forward + http cloud-route tests still green).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/cloud.rs src/server.rs
+git commit -m "refactor(cloud): forward() takes explicit upstream path (drop Provider::path)"
+```
+
+---
+
+### Task 2: Responses request types + `to_internal`
+
+**Files:**
+- Create: `src/api/openai_responses.rs`
+- Modify: `src/api/mod.rs` (add `pub mod openai_responses;`)
+
+**Interfaces:**
+- Produces: `pub struct RespRequest { model, instructions, input, tools, stream, max_output_tokens, temperature }`
+- Produces: `pub fn to_internal(req: RespRequest) -> Result<crate::api::common::ChatRequest, String>`
+
+- [ ] **Step 1: Register the module**
+
+In `src/api/mod.rs` add:
+
+```rust
+pub mod openai_responses;
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `src/api/openai_responses.rs` with the wire types and a `to_internal` declaration that returns `Err`, plus tests:
+
+```rust
+// OpenAI Responses API translation layer (stateless subset for Codex).
+use serde::Deserialize;
+use crate::api::common::{ChatMessage, ChatRequest, Role, ToolResult, ToolSpec};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RespRequest {
+    pub model: String,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    pub input: RespInput,
+    #[serde(default)]
+    pub tools: Option<Vec<RespTool>>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RespInput {
+    Text(String),
+    Items(Vec<RespItem>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum RespItem {
+    #[serde(rename = "message")]
+    Message {
+        role: String,
+        #[serde(default)]
+        content: Option<RespContent>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput { call_id: String, output: String },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RespContent {
+    Text(String),
+    Parts(Vec<RespPart>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum RespPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RespTool {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+}
+
+fn content_to_text(c: Option<RespContent>) -> Option<String> {
+    let s = match c {
+        None => String::new(),
+        Some(RespContent::Text(s)) => s,
+        Some(RespContent::Parts(parts)) => parts
+            .into_iter()
+            .filter_map(|p| match p {
+                RespPart::InputText { text } | RespPart::OutputText { text } => Some(text),
+                RespPart::Other => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    };
+    if s.is_empty() { None } else { Some(s) }
+}
+
+pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
+    Err("not implemented".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_input_becomes_single_user_message() {
+        let json = r#"{"model":"m","input":"hi"}"#;
+        let req: RespRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages.len(), 1);
+        assert_eq!(internal.messages[0].role, Role::User);
+        assert_eq!(internal.messages[0].text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn instructions_become_leading_system_message() {
+        let json = r#"{"model":"m","instructions":"be terse","input":"hi"}"#;
+        let req: RespRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages[0].role, Role::System);
+        assert_eq!(internal.messages[0].text.as_deref(), Some("be terse"));
+        assert_eq!(internal.messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn array_input_message_and_function_call_output() {
+        let json = r#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"weather?"}]},
+            {"type":"function_call_output","call_id":"call_1","output":"sunny"}
+        ]}"#;
+        let req: RespRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages[0].role, Role::User);
+        assert_eq!(internal.messages[0].text.as_deref(), Some("weather?"));
+        assert_eq!(internal.messages[1].role, Role::Tool);
+        let tr = internal.messages[1].tool_result.as_ref().unwrap();
+        assert_eq!(tr.tool_call_id, "call_1");
+        assert_eq!(tr.content, "sunny");
+    }
+
+    #[test]
+    fn flat_tools_map_to_toolspec() {
+        let json = r#"{"model":"m","input":"hi",
+            "tools":[{"type":"function","name":"get_weather","description":"w","parameters":{"type":"object"}}]}"#;
+        let req: RespRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn unknown_message_role_errors() {
+        let json = r#"{"model":"m","input":[{"type":"message","role":"frobnicate","content":"x"}]}"#;
+        let req: RespRequest = serde_json::from_str(json).unwrap();
+        assert!(to_internal(req).is_err());
+    }
+
+    #[test]
+    fn unknown_item_type_is_ignored_not_error() {
+        let json = r#"{"model":"m","input":[
+            {"type":"reasoning","summary":[]},
+            {"type":"message","role":"user","content":"hi"}
+        ]}"#;
+        let req: RespRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages.len(), 1);
+        assert_eq!(internal.messages[0].text.as_deref(), Some("hi"));
+    }
+}
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `cargo test --lib openai_responses:: 2>&1 | tail -20`
+Expected: FAIL — `to_internal` returns `Err("not implemented")`.
+
+- [ ] **Step 4: Implement `to_internal`**
+
+Replace the stub body:
+
+```rust
+pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
+    let mut messages: Vec<ChatMessage> = Vec::new();
+
+    if let Some(instr) = req.instructions.filter(|s| !s.is_empty()) {
+        messages.push(ChatMessage {
+            role: Role::System,
+            text: Some(instr),
+            tool_calls: vec![],
+            tool_result: None,
+        });
+    }
+
+    match req.input {
+        RespInput::Text(s) => messages.push(ChatMessage {
+            role: Role::User,
+            text: if s.is_empty() { None } else { Some(s) },
+            tool_calls: vec![],
+            tool_result: None,
+        }),
+        RespInput::Items(items) => {
+            for item in items {
+                match item {
+                    RespItem::Message { role, content } => {
+                        let role = match role.as_str() {
+                            "system" | "developer" => Role::System,
+                            "user" => Role::User,
+                            "assistant" => Role::Assistant,
+                            "tool" => Role::Tool,
+                            other => return Err(format!("Unknown role: {other}")),
+                        };
+                        messages.push(ChatMessage {
+                            role,
+                            text: content_to_text(content),
+                            tool_calls: vec![],
+                            tool_result: None,
+                        });
+                    }
+                    RespItem::FunctionCallOutput { call_id, output } => {
+                        messages.push(ChatMessage {
+                            role: Role::Tool,
+                            text: None,
+                            tool_calls: vec![],
+                            tool_result: Some(ToolResult { tool_call_id: call_id, content: output }),
+                        });
+                    }
+                    RespItem::Other => {} // reasoning/image/etc — ignored
+                }
+            }
+        }
+    }
+
+    let tools = req
+        .tools
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| ToolSpec { name: t.name, description: t.description, parameters: t.parameters })
+        .collect();
+
+    Ok(ChatRequest {
+        messages,
+        tools,
+        max_tokens: req.max_output_tokens,
+        temperature: req.temperature,
+        stream: req.stream.unwrap_or(false),
+        model: req.model,
+    })
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `cargo test --lib openai_responses:: 2>&1 | tail -20`
+Expected: PASS (6 tests).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/api/openai_responses.rs src/api/mod.rs
+git commit -m "feat(api): Responses request types + to_internal"
+```
+
+---
+
+### Task 3: `from_internal` — non-streaming Responses object
+
+**Files:**
+- Modify: `src/api/openai_responses.rs`
+
+**Interfaces:**
+- Produces: `pub fn from_internal(res: crate::api::common::ChatResult, model: &str) -> serde_json::Value`
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to the `tests` module in `src/api/openai_responses.rs`:
+
+```rust
+#[test]
+fn renders_output_text_message() {
+    use crate::api::common::{ChatResult, ContentPart, FinishReason};
+    let res = ChatResult {
+        content: vec![ContentPart::Text("hello".into())],
+        finish_reason: FinishReason::Stop,
+        prompt_tokens: 3,
+        completion_tokens: 2,
+    };
+    let v = from_internal(res, "m");
+    assert_eq!(v["object"], "response");
+    assert_eq!(v["status"], "completed");
+    assert_eq!(v["output"][0]["type"], "message");
+    assert_eq!(v["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(v["output"][0]["content"][0]["text"], "hello");
+    assert_eq!(v["usage"]["input_tokens"], 3);
+    assert_eq!(v["usage"]["output_tokens"], 2);
+    assert_eq!(v["usage"]["total_tokens"], 5);
+}
+
+#[test]
+fn renders_function_call_item() {
+    use crate::api::common::{ChatResult, ContentPart, FinishReason, ToolCall};
+    let res = ChatResult {
+        content: vec![ContentPart::Call(ToolCall {
+            id: "call_1".into(),
+            name: "get_weather".into(),
+            arguments: r#"{"city":"Recife"}"#.into(),
+        })],
+        finish_reason: FinishReason::ToolCalls,
+        prompt_tokens: 5,
+        completion_tokens: 4,
+    };
+    let v = from_internal(res, "m");
+    let fc = &v["output"][0];
+    assert_eq!(fc["type"], "function_call");
+    assert_eq!(fc["call_id"], "call_1");
+    assert_eq!(fc["name"], "get_weather");
+    assert_eq!(fc["arguments"], r#"{"city":"Recife"}"#);
+    assert_eq!(v["status"], "completed");
+}
+
+#[test]
+fn length_finish_marks_incomplete() {
+    use crate::api::common::{ChatResult, ContentPart, FinishReason};
+    let res = ChatResult {
+        content: vec![ContentPart::Text("partial".into())],
+        finish_reason: FinishReason::Length,
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    };
+    let v = from_internal(res, "m");
+    assert_eq!(v["status"], "incomplete");
+    assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test --lib openai_responses::tests::renders 2>&1 | tail -20`
+Expected: FAIL — `from_internal` not found.
+
+- [ ] **Step 3: Implement `from_internal`**
+
+Add to `src/api/openai_responses.rs` (above the tests):
+
+```rust
+use crate::api::common::{ChatResult, ContentPart, FinishReason};
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+
+pub fn from_internal(res: ChatResult, model: &str) -> serde_json::Value {
+    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let mut output = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+
+    for part in res.content {
+        match part {
+            ContentPart::Text(t) => text_parts.push(t),
+            ContentPart::Call(tc) => calls.push(serde_json::json!({
+                "type": "function_call",
+                "id": format!("fc_{}", Uuid::new_v4()),
+                "call_id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "status": "completed"
+            })),
+        }
+    }
+
+    if !text_parts.is_empty() {
+        output.push(serde_json::json!({
+            "type": "message",
+            "id": format!("msg_{}", Uuid::new_v4()),
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text_parts.join(""), "annotations": []}]
+        }));
+    }
+    output.extend(calls);
+
+    let (status, incomplete) = match res.finish_reason {
+        FinishReason::Length => (
+            "incomplete",
+            Some(serde_json::json!({"reason": "max_output_tokens"})),
+        ),
+        _ => ("completed", None),
+    };
+
+    let mut obj = serde_json::json!({
+        "id": format!("resp_{}", Uuid::new_v4()),
+        "object": "response",
+        "created_at": created,
+        "model": model,
+        "status": status,
+        "output": output,
+        "usage": {
+            "input_tokens": res.prompt_tokens,
+            "output_tokens": res.completion_tokens,
+            "total_tokens": res.prompt_tokens + res.completion_tokens
+        }
+    });
+    if let Some(d) = incomplete {
+        obj["incomplete_details"] = d;
+    }
+    obj
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test --lib openai_responses:: 2>&1 | tail -20`
+Expected: PASS (9 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/api/openai_responses.rs
+git commit -m "feat(api): Responses from_internal (non-streaming object)"
+```
+
+---
+
+### Task 4: Buffered streaming event renderer
+
+Replays a full `ChatResult` as the ordered Responses SSE event sequence. Returns `(event_type, json_data)` pairs; the handler wraps each in an axum `Event`.
+
+**Files:**
+- Modify: `src/api/openai_responses.rs`
+
+**Interfaces:**
+- Produces: `pub fn stream_events_from_result(res: &crate::api::common::ChatResult, resp_id: &str, model: &str) -> Vec<(&'static str, String)>`
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to the `tests` module:
+
+```rust
+fn event_types(pairs: &[(&'static str, String)]) -> Vec<&'static str> {
+    pairs.iter().map(|(t, _)| *t).collect()
+}
+
+#[test]
+fn text_stream_event_order() {
+    use crate::api::common::{ChatResult, ContentPart, FinishReason};
+    let res = ChatResult {
+        content: vec![ContentPart::Text("hi".into())],
+        finish_reason: FinishReason::Stop,
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    };
+    let ev = stream_events_from_result(&res, "resp_x", "m");
+    assert_eq!(
+        event_types(&ev),
+        vec![
+            "response.created",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+    // the delta carries the text
+    let delta = ev.iter().find(|(t, _)| *t == "response.output_text.delta").unwrap();
+    assert!(delta.1.contains("\"delta\":\"hi\""));
+    // monotonic sequence_number starting at 0
+    let first: serde_json::Value = serde_json::from_str(&ev[0].1).unwrap();
+    assert_eq!(first["sequence_number"], 0);
+}
+
+#[test]
+fn tool_stream_emits_function_call_sequence() {
+    use crate::api::common::{ChatResult, ContentPart, FinishReason, ToolCall};
+    let res = ChatResult {
+        content: vec![ContentPart::Call(ToolCall {
+            id: "call_1".into(),
+            name: "get_weather".into(),
+            arguments: "{}".into(),
+        })],
+        finish_reason: FinishReason::ToolCalls,
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    };
+    let ev = stream_events_from_result(&res, "resp_x", "m");
+    let types = event_types(&ev);
+    assert_eq!(types.first(), Some(&"response.created"));
+    assert!(types.contains(&"response.function_call_arguments.delta"));
+    assert!(types.contains(&"response.function_call_arguments.done"));
+    assert_eq!(types.last(), Some(&"response.completed"));
+    // the function_call item appears via output_item.added
+    let added = ev.iter().find(|(t, _)| *t == "response.output_item.added").unwrap();
+    assert!(added.1.contains("get_weather"));
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test --lib openai_responses::tests::text_stream 2>&1 | tail -20`
+Expected: FAIL — `stream_events_from_result` not found.
+
+- [ ] **Step 3: Implement the renderer**
+
+Add to `src/api/openai_responses.rs`:
+
+```rust
+pub fn stream_events_from_result(
+    res: &ChatResult,
+    resp_id: &str,
+    model: &str,
+) -> Vec<(&'static str, String)> {
+    let mut seq = 0u64;
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let mut push = |ty: &'static str, mut data: serde_json::Value| {
+        data["type"] = serde_json::Value::String(ty.to_string());
+        data["sequence_number"] = serde_json::json!(seq);
+        seq += 1;
+        out.push((ty, serde_json::to_string(&data).unwrap()));
+    };
+
+    let in_progress = serde_json::json!({
+        "response": {"id": resp_id, "object": "response", "model": model, "status": "in_progress"}
+    });
+    push("response.created", in_progress);
+
+    let mut output_index = 0u64;
+    for part in &res.content {
+        match part {
+            ContentPart::Text(t) => {
+                let item_id = format!("msg_{}", Uuid::new_v4());
+                push("response.output_item.added", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}
+                }));
+                push("response.content_part.added", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []}
+                }));
+                push("response.output_text.delta", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": t
+                }));
+                push("response.output_text.done", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0, "text": t
+                }));
+                push("response.content_part.done", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0,
+                    "part": {"type": "output_text", "text": t, "annotations": []}
+                }));
+                push("response.output_item.done", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "message", "id": item_id, "role": "assistant", "status": "completed",
+                             "content": [{"type": "output_text", "text": t, "annotations": []}]}
+                }));
+                output_index += 1;
+            }
+            ContentPart::Call(tc) => {
+                let item_id = format!("fc_{}", Uuid::new_v4());
+                push("response.output_item.added", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
+                             "name": tc.name, "arguments": "", "status": "in_progress"}
+                }));
+                push("response.function_call_arguments.delta", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "delta": tc.arguments
+                }));
+                push("response.function_call_arguments.done", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "arguments": tc.arguments
+                }));
+                push("response.output_item.done", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
+                             "name": tc.name, "arguments": tc.arguments, "status": "completed"}
+                }));
+                output_index += 1;
+            }
+        }
+    }
+
+    let completed = serde_json::json!({
+        "response": from_internal(res.clone(), model)
+    });
+    push("response.completed", completed);
+    out
+}
+```
+
+Note: `from_internal` takes the result by value, so the call clones `res`.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test --lib openai_responses:: 2>&1 | tail -20`
+Expected: PASS (11 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/api/openai_responses.rs
+git commit -m "feat(api): Responses buffered SSE event renderer"
+```
+
+---
+
+### Task 5: `/v1/responses` handler + route + HTTP tests
+
+**Files:**
+- Modify: `src/server.rs` (import, `handle_oai_responses`, route registration)
+- Modify: `tests/http.rs` (local non-stream, local stream, cloud-route tests)
+
+**Interfaces:**
+- Consumes: `crate::api::openai_responses::{RespRequest, to_internal, from_internal, stream_events_from_result}`; `route_decision`, `cascade_or_result` (now with `upstream_path`), `cloud::forward`.
+- Produces: route `POST /v1/responses`.
+
+- [ ] **Step 1: Write the failing HTTP tests**
+
+Append to `tests/http.rs`:
+
+```rust
+#[tokio::test]
+async fn responses_endpoint_returns_function_call() {
+    let app = localllm::router_for_test();
+    // FakeGen returns a tool call → output should carry a function_call item.
+    let body = r#"{"model":"m","input":"weather?",
+        "tools":[{"type":"function","name":"get_weather","description":"w","parameters":{"type":"object"}}]}"#;
+    let resp = localllm::axum_test_request(app, "/v1/responses", body).await;
+    assert_eq!(resp["object"], "response");
+    assert_eq!(resp["output"][0]["type"], "function_call");
+    assert_eq!(resp["output"][0]["name"], "get_weather");
+}
+
+#[tokio::test]
+async fn responses_unknown_role_returns_400() {
+    let app = localllm::router_for_test();
+    let body = r#"{"model":"m","input":[{"type":"message","role":"frob","content":"hi"}]}"#;
+    let status = localllm::axum_test_request_status(app, "/v1/responses", body).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn responses_stream_returns_event_sequence() {
+    let app = localllm::router_for_test();
+    let body = r#"{"model":"m","stream":true,"input":"hi"}"#;
+    let raw = localllm::axum_test_request_raw(app, "/v1/responses", body).await;
+    assert!(raw.contains("response.created"), "missing created: {raw}");
+    assert!(raw.contains("response.completed"), "missing completed: {raw}");
+    // no Chat-style DONE sentinel for Responses
+    assert!(!raw.contains("[DONE]"), "responses stream must not emit [DONE]: {raw}");
+}
+
+#[tokio::test]
+async fn responses_overflow_routes_to_cloud() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = ENV_LOCK.lock().await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"routed":"cloud"}"#))
+        .mount(&server)
+        .await;
+    std::env::set_var("LOCALLLM_OPENAI_BASE", server.uri());
+
+    let big = "x".repeat(8000); // overflow the tiny test window
+    let body = format!(r#"{{"model":"m","input":"{big}"}}"#);
+    let resp = localllm::axum_test_request_with_header(
+        localllm::router_for_test(),
+        "/v1/responses",
+        &body,
+        "authorization",
+        "Bearer sk-test",
+    )
+    .await;
+    assert_eq!(resp["routed"], "cloud");
+
+    std::env::remove_var("LOCALLLM_OPENAI_BASE");
+}
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `cargo test --test http responses_ 2>&1 | tail -20`
+Expected: FAIL — route `/v1/responses` returns 404 / handler missing.
+
+- [ ] **Step 3: Register the route**
+
+In `src/server.rs` `router(...)`, add next to the other `/v1` routes:
+
+```rust
+.route("/v1/responses", post(handle_oai_responses))
+```
+
+- [ ] **Step 4: Implement `handle_oai_responses`**
+
+Add after `handle_oai_chat` in `src/server.rs`. It mirrors `handle_oai_chat` but uses the Responses module and the buffered event renderer for streaming (always generate full result first):
+
+```rust
+/// POST /v1/responses  (OpenAI Responses API)
+async fn handle_oai_responses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use uuid::Uuid;
+
+    let rid = new_request_id();
+
+    let req: crate::api::openai_responses::RespRequest = match serde_json::from_slice(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "localllm::req", "{rid} [responses] 400 bad json: {e}");
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
+    let model = req.model.clone();
+    let stream_flag = req.stream.unwrap_or(false);
+
+    let internal = match crate::api::openai_responses::to_internal(req) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "localllm::req", "{rid} [responses] 400 bad request: {e}");
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
+
+    if state.manager.is_errored() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "model in error state — restart required"}))).into_response();
+    }
+    if state.manager.is_switching() {
+        return (StatusCode::SERVICE_UNAVAILABLE, [("Retry-After", "5")],
+            Json(json!({"error": "model switching, retry shortly"}))).into_response();
+    }
+
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let want_cascade = match decision {
+        crate::route::Decision::Cloud(reason) => {
+            tracing::info!(target: "localllm::req", "{rid} [responses] route=cloud reason={reason:?}");
+            match crate::cloud::forward(crate::cloud::Provider::OpenAI, "/v1/responses", &headers, raw.clone()).await {
+                crate::cloud::ForwardOutcome::Relayed(resp) => {
+                    record_cloud_success(&state, est_prompt_tokens);
+                    return resp;
+                }
+                crate::cloud::ForwardOutcome::Degrade(d) => {
+                    if let Some(resp) = handle_degrade(&state, d, reason) { return resp; }
+                    tracing::warn!(target: "localllm::req", "{rid} [responses] cloud degraded ({d:?}) → serving local");
+                    false
+                }
+            }
+        }
+        crate::route::Decision::LocalNoCreds => false,
+        crate::route::Decision::LocalThenCascade => true,
+        crate::route::Decision::Local => false,
+    };
+
+    let started_at = Instant::now();
+    let resp_id = format!("resp_{}", Uuid::new_v4());
+
+    // Buffered for both stream and non-stream: generate the full result, then
+    // either render the object or replay it as the Responses SSE sequence.
+    let result = match cascade_or_result(
+        want_cascade,
+        state.manager.generate(internal).await,
+        crate::cloud::Provider::OpenAI,
+        "/v1/responses",
+        &headers,
+        raw,
+        &state,
+        est_prompt_tokens,
+        &rid,
+        "responses",
+    ).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let secs = started_at.elapsed().as_secs_f64();
+    tracing::info!(target: "localllm::req", "{rid} [responses] done: finish={:?} completion_tok={} {secs:.1}s",
+        result.finish_reason, result.completion_tokens);
+
+    if stream_flag {
+        let events = crate::api::openai_responses::stream_events_from_result(&result, &resp_id, &model);
+        let sse_stream = futures::stream::iter(events.into_iter().map(|(ty, data)| {
+            Ok::<Event, Infallible>(Event::default().event(ty).data(data))
+        }));
+        Sse::new(sse_stream).into_response()
+    } else {
+        let v = crate::api::openai_responses::from_internal(result, &model);
+        Json(v).into_response()
+    }
+}
+```
+
+- [ ] **Step 5: Run the new HTTP tests**
+
+Run: `cargo test --test http responses_ 2>&1 | tail -20`
+Expected: PASS (4 tests).
+
+- [ ] **Step 6: Run the full suite + clippy**
+
+Run: `cargo test 2>&1 | tail -15 && cargo clippy --all-targets 2>&1 | grep -E "warning|error" | grep -v "generated " | head`
+Expected: all tests PASS; no new clippy warnings in `openai_responses.rs` / the new handler.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/server.rs tests/http.rs
+git commit -m "feat(server): POST /v1/responses handler + route + HTTP tests"
+```
+
+---
+
+## Self-Review
+
+**Spec coverage:**
+- `POST /v1/responses` non-stream + stream → Task 5. ✓
+- Request parse (string/array input, instructions, flat tools, function_call_output) → Task 2. ✓
+- Response render (message/output_text + function_call, usage, incomplete) → Task 3. ✓
+- Streaming event sequence → Task 4. ✓
+- Cloud reverse-proxy to `/v1/responses` (generalize `forward`) → Task 1 + Task 5 forward call. ✓
+- Errors: unknown item type ignored, unknown role → 400 → Tasks 2 + 5. ✓
+- Out-of-scope items (reasoning/image/state) ignored, never error → Task 2 `RespItem::Other` / `RespPart::Other`. ✓
+- Tests mirror `openai.rs` + http harness → Tasks 2-5. ✓
+
+**Placeholder scan:** none — every step has concrete code/commands.
+
+**Type consistency:** `to_internal`/`from_internal`/`stream_events_from_result` signatures match across tasks; `forward(provider, upstream_path, headers, body)` and `cascade_or_result(.., upstream_path, ..)` consistent between Task 1 definition and Task 5 use. Internal types match `common.rs` (`ChatRequest`, `ChatResult`, `ContentPart`, `FinishReason`, `ToolResult`, `ToolSpec`).
+
+**Decision recorded:** Responses streaming is buffered (full-gen then replay) for both text and tools — deviates from the spec's optional incremental-text path in favor of the framing-safe pattern already used for tool streaming; Codex consumes it fine since it reads until `response.completed`.
