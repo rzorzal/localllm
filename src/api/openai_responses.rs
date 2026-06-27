@@ -153,6 +153,69 @@ pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
     })
 }
 
+use crate::api::common::{ChatResult, ContentPart, FinishReason};
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+
+pub fn from_internal(res: ChatResult, model: &str) -> serde_json::Value {
+    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let mut output = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+
+    for part in res.content {
+        match part {
+            ContentPart::Text(t) => text_parts.push(t),
+            ContentPart::Call(tc) => calls.push(serde_json::json!({
+                "type": "function_call",
+                "id": format!("fc_{}", Uuid::new_v4()),
+                "call_id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "status": "completed"
+            })),
+        }
+    }
+
+    if !text_parts.is_empty() {
+        output.push(serde_json::json!({
+            "type": "message",
+            "id": format!("msg_{}", Uuid::new_v4()),
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text_parts.join(""), "annotations": []}]
+        }));
+    }
+    output.extend(calls);
+
+    let (status, incomplete) = match res.finish_reason {
+        FinishReason::Length => (
+            "incomplete",
+            Some(serde_json::json!({"reason": "max_output_tokens"})),
+        ),
+        _ => ("completed", None),
+    };
+
+    let mut obj = serde_json::json!({
+        "id": format!("resp_{}", Uuid::new_v4()),
+        "object": "response",
+        "created_at": created,
+        "model": model,
+        "status": status,
+        "output": output,
+        "usage": {
+            "input_tokens": res.prompt_tokens,
+            "output_tokens": res.completion_tokens,
+            "total_tokens": res.prompt_tokens + res.completion_tokens
+        }
+    });
+    if let Some(d) = incomplete {
+        obj["incomplete_details"] = d;
+    }
+    obj
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +282,61 @@ mod tests {
         let internal = to_internal(req).unwrap();
         assert_eq!(internal.messages.len(), 1);
         assert_eq!(internal.messages[0].text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn renders_output_text_message() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason};
+        let res = ChatResult {
+            content: vec![ContentPart::Text("hello".into())],
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 3,
+            completion_tokens: 2,
+        };
+        let v = from_internal(res, "m");
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert_eq!(v["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(v["output"][0]["content"][0]["text"], "hello");
+        assert_eq!(v["usage"]["input_tokens"], 3);
+        assert_eq!(v["usage"]["output_tokens"], 2);
+        assert_eq!(v["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn renders_function_call_item() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason, ToolCall};
+        let res = ChatResult {
+            content: vec![ContentPart::Call(ToolCall {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments: r#"{"city":"Recife"}"#.into(),
+            })],
+            finish_reason: FinishReason::ToolCalls,
+            prompt_tokens: 5,
+            completion_tokens: 4,
+        };
+        let v = from_internal(res, "m");
+        let fc = &v["output"][0];
+        assert_eq!(fc["type"], "function_call");
+        assert_eq!(fc["call_id"], "call_1");
+        assert_eq!(fc["name"], "get_weather");
+        assert_eq!(fc["arguments"], r#"{"city":"Recife"}"#);
+        assert_eq!(v["status"], "completed");
+    }
+
+    #[test]
+    fn length_finish_marks_incomplete() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason};
+        let res = ChatResult {
+            content: vec![ContentPart::Text("partial".into())],
+            finish_reason: FinishReason::Length,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let v = from_internal(res, "m");
+        assert_eq!(v["status"], "incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
     }
 }
