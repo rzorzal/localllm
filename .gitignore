@@ -1,5 +1,9 @@
 /target
 docs/cc-payload/
 
+# OS / scratch
+.DS_Store
+test.py
+
 # SDD scratch (briefs, reports, review packages, progress ledger)
 .superpowers/
