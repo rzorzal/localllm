@@ -71,6 +71,50 @@ pub const CATALOG: &[CatalogEntry] = &[
         repo: "bartowski/Phi-3.5-mini-instruct-GGUF", file: "Phi-3.5-mini-instruct-Q4_K_M.gguf", size_mb: 2400 },
 ];
 
+/// Parse a parameter size in billions from a model name: the first run of
+/// digits (optionally with one decimal point) immediately followed by `b`/`B`.
+/// Tries `file` first, then `repo`. `qwen2.5-7b…`→7.0, `…-8B-…`→8.0,
+/// `…-3.8b-…`→3.8, names without an `<N>b` token → None.
+pub fn params_b_from_name(repo: &str, file: &str) -> Option<f32> {
+    fn scan(s: &str) -> Option<f32> {
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i].is_ascii_digit() {
+                let start = i;
+                let mut seen_dot = false;
+                while i < b.len()
+                    && (b[i].is_ascii_digit()
+                        || (b[i] == b'.' && !seen_dot && i + 1 < b.len() && b[i + 1].is_ascii_digit()))
+                {
+                    if b[i] == b'.' {
+                        seen_dot = true;
+                    }
+                    i += 1;
+                }
+                if i < b.len() && (b[i] == b'b' || b[i] == b'B') {
+                    if let Ok(v) = s[start..i].parse::<f32>() {
+                        return Some(v);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        None
+    }
+    scan(file).or_else(|| scan(repo))
+}
+
+/// Capability (parameter billions) of the active model: an exact CATALOG match
+/// wins; else parse the name; else `0.0` (unknown → neutral routing).
+pub fn active_params_b(repo: &str, file: &str) -> f32 {
+    if let Some(e) = CATALOG.iter().find(|e| e.repo == repo && e.file == file) {
+        return e.params_b;
+    }
+    params_b_from_name(repo, file).unwrap_or(0.0)
+}
+
 /// Annotate the catalog for this machine + the active model. Pure.
 pub fn catalog_view(
     entries: &[CatalogEntry],
@@ -223,5 +267,27 @@ mod tests {
         assert!(CATALOG.iter().any(|e|
             e.repo == "Qwen/Qwen2.5-3B-Instruct-GGUF"
             && e.file == "qwen2.5-3b-instruct-q4_k_m.gguf"));
+    }
+
+    #[test]
+    fn params_b_from_name_parses_size() {
+        assert_eq!(super::params_b_from_name("Qwen/Qwen2.5-7B-Instruct-GGUF", "qwen2.5-7b-instruct-q4_k_m.gguf"), Some(7.0));
+        assert_eq!(super::params_b_from_name("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), Some(8.0));
+        // decimal sizes
+        assert_eq!(super::params_b_from_name("x/y", "model-3.8b-q4.gguf"), Some(3.8));
+        // no "<N>b" token anywhere → None
+        assert_eq!(super::params_b_from_name("x/Phi-3.5-mini-instruct-GGUF", "Phi-3.5-mini-instruct-Q4_K_M.gguf"), None);
+        // falls back to the repo when the file lacks it
+        assert_eq!(super::params_b_from_name("org/thing-13b", "weights.gguf"), Some(13.0));
+    }
+
+    #[test]
+    fn active_params_b_catalog_then_name_then_neutral() {
+        // a real CATALOG entry → its params_b
+        assert_eq!(super::active_params_b("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-instruct-q4_k_m.gguf"), 3.0);
+        // not in catalog but parseable name
+        assert_eq!(super::active_params_b("foo/bar", "model-13b.gguf"), 13.0);
+        // unknown → neutral 0.0
+        assert_eq!(super::active_params_b("foo/bar", "model.gguf"), 0.0);
     }
 }
