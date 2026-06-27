@@ -292,11 +292,23 @@ mod tests {
         assert_eq!(decide(&mid_sig(3.0), &p), Decision::Cloud(RouteReason::Difficulty));
     }
 
+    // A request scoring ~0.615: ctx 700/1000=0.7→0.42, 9 tools→0.1875, 1 msg→~0.0075.
+    // This sits ABOVE the 7B/neutral threshold (0.60) but BELOW the 14B one (0.81),
+    // so a strong model is what flips it Cloud→Local.
+    fn high_sig(cap: f32) -> Signals {
+        Signals {
+            prompt_tokens: 700, local_ctx_window: 1000, n_tools: 9,
+            n_messages: 1, has_cloud_creds: true, local_capability_b: cap,
+        }
+    }
+
     #[test]
     fn strong_local_raises_threshold_to_local() {
-        let p = Profile::Balanced.policy();
-        // 14B: adj +0.21 → effective 0.81 → 0.55 < 0.81 → stays local.
-        assert_eq!(decide(&mid_sig(14.0), &p), Decision::LocalThenCascade);
+        let p = Profile::Balanced.policy(); // threshold 0.6
+        // Score ~0.615: at 7B (effective 0.60) → Cloud; at 14B (effective 0.81) → local.
+        // This proves the strong model RAISES the cutoff enough to flip the decision.
+        assert_eq!(decide(&high_sig(7.0), &p), Decision::Cloud(RouteReason::Difficulty));
+        assert_eq!(decide(&high_sig(14.0), &p), Decision::LocalThenCascade);
     }
 
     #[test]
