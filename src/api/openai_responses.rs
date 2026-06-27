@@ -216,6 +216,85 @@ pub fn from_internal(res: ChatResult, model: &str) -> serde_json::Value {
     obj
 }
 
+pub fn stream_events_from_result(
+    res: &ChatResult,
+    resp_id: &str,
+    model: &str,
+) -> Vec<(&'static str, String)> {
+    let mut seq = 0u64;
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let mut push = |ty: &'static str, mut data: serde_json::Value| {
+        data["type"] = serde_json::Value::String(ty.to_string());
+        data["sequence_number"] = serde_json::json!(seq);
+        seq += 1;
+        out.push((ty, serde_json::to_string(&data).unwrap()));
+    };
+
+    let in_progress = serde_json::json!({
+        "response": {"id": resp_id, "object": "response", "model": model, "status": "in_progress"}
+    });
+    push("response.created", in_progress);
+
+    let mut output_index = 0u64;
+    for part in &res.content {
+        match part {
+            ContentPart::Text(t) => {
+                let item_id = format!("msg_{}", Uuid::new_v4());
+                push("response.output_item.added", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}
+                }));
+                push("response.content_part.added", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []}
+                }));
+                push("response.output_text.delta", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": t
+                }));
+                push("response.output_text.done", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0, "text": t
+                }));
+                push("response.content_part.done", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0,
+                    "part": {"type": "output_text", "text": t, "annotations": []}
+                }));
+                push("response.output_item.done", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "message", "id": item_id, "role": "assistant", "status": "completed",
+                             "content": [{"type": "output_text", "text": t, "annotations": []}]}
+                }));
+                output_index += 1;
+            }
+            ContentPart::Call(tc) => {
+                let item_id = format!("fc_{}", Uuid::new_v4());
+                push("response.output_item.added", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
+                             "name": tc.name, "arguments": "", "status": "in_progress"}
+                }));
+                push("response.function_call_arguments.delta", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "delta": tc.arguments
+                }));
+                push("response.function_call_arguments.done", serde_json::json!({
+                    "item_id": item_id, "output_index": output_index, "arguments": tc.arguments
+                }));
+                push("response.output_item.done", serde_json::json!({
+                    "output_index": output_index,
+                    "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
+                             "name": tc.name, "arguments": tc.arguments, "status": "completed"}
+                }));
+                output_index += 1;
+            }
+        }
+    }
+
+    let completed = serde_json::json!({
+        "response": from_internal(res.clone(), model)
+    });
+    push("response.completed", completed);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +417,64 @@ mod tests {
         let v = from_internal(res, "m");
         assert_eq!(v["status"], "incomplete");
         assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    fn event_types(pairs: &[(&'static str, String)]) -> Vec<&'static str> {
+        pairs.iter().map(|(t, _)| *t).collect()
+    }
+
+    #[test]
+    fn text_stream_event_order() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason};
+        let res = ChatResult {
+            content: vec![ContentPart::Text("hi".into())],
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let ev = stream_events_from_result(&res, "resp_x", "m");
+        assert_eq!(
+            event_types(&ev),
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        // the delta carries the text
+        let delta = ev.iter().find(|(t, _)| *t == "response.output_text.delta").unwrap();
+        assert!(delta.1.contains("\"delta\":\"hi\""));
+        // monotonic sequence_number starting at 0
+        let first: serde_json::Value = serde_json::from_str(&ev[0].1).unwrap();
+        assert_eq!(first["sequence_number"], 0);
+    }
+
+    #[test]
+    fn tool_stream_emits_function_call_sequence() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason, ToolCall};
+        let res = ChatResult {
+            content: vec![ContentPart::Call(ToolCall {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments: "{}".into(),
+            })],
+            finish_reason: FinishReason::ToolCalls,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let ev = stream_events_from_result(&res, "resp_x", "m");
+        let types = event_types(&ev);
+        assert_eq!(types.first(), Some(&"response.created"));
+        assert!(types.contains(&"response.function_call_arguments.delta"));
+        assert!(types.contains(&"response.function_call_arguments.done"));
+        assert_eq!(types.last(), Some(&"response.completed"));
+        // the function_call item appears via output_item.added
+        let added = ev.iter().find(|(t, _)| *t == "response.output_item.added").unwrap();
+        assert!(added.1.contains("get_weather"));
     }
 }
