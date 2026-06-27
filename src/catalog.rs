@@ -57,6 +57,11 @@ pub struct FamilyView {
 /// download sizes (MB) used only for the RAM estimate; verify against the repo
 /// when editing. The default model MUST appear here.
 pub const CATALOG: &[CatalogEntry] = &[
+    // --- Qwen2.5: tiny → large, the default lives here (3B) ---
+    CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 0.5B Instruct", params: "0.5B", params_b: 0.5, quant: "Q4_K_M",
+        repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF", file: "qwen2.5-0.5b-instruct-q4_k_m.gguf", size_mb: 469 },
+    CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 1.5B Instruct", params: "1.5B", params_b: 1.5, quant: "Q4_K_M",
+        repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF", file: "qwen2.5-1.5b-instruct-q4_k_m.gguf", size_mb: 1066 },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 3B Instruct", params: "3B", params_b: 3.0, quant: "Q4_K_M",
         repo: "Qwen/Qwen2.5-3B-Instruct-GGUF", file: "qwen2.5-3b-instruct-q4_k_m.gguf", size_mb: 2000 },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 7B Instruct", params: "7B", params_b: 7.0, quant: "Q4_K_M",
@@ -65,10 +70,49 @@ pub const CATALOG: &[CatalogEntry] = &[
         repo: "Qwen/Qwen2.5-14B-Instruct-GGUF", file: "qwen2.5-14b-instruct-q4_k_m.gguf", size_mb: 9000 },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 32B Instruct", params: "32B", params_b: 32.0, quant: "Q4_K_M",
         repo: "Qwen/Qwen2.5-32B-Instruct-GGUF", file: "qwen2.5-32b-instruct-q4_k_m.gguf", size_mb: 20000 },
-    CatalogEntry { family: "Llama 3.1", display_name: "Llama 3.1 8B Instruct", params: "8B", params_b: 8.0, quant: "Q4_K_M",
+    // --- Qwen3 (2025/2026): newer generation, tiny → large ---
+    CatalogEntry { family: "Qwen3", display_name: "Qwen3 0.6B", params: "0.6B", params_b: 0.6, quant: "Q4_K_M",
+        repo: "bartowski/Qwen_Qwen3-0.6B-GGUF", file: "Qwen_Qwen3-0.6B-Q4_K_M.gguf", size_mb: 462 },
+    CatalogEntry { family: "Qwen3", display_name: "Qwen3 1.7B", params: "1.7B", params_b: 1.7, quant: "Q4_K_M",
+        repo: "bartowski/Qwen_Qwen3-1.7B-GGUF", file: "Qwen_Qwen3-1.7B-Q4_K_M.gguf", size_mb: 1223 },
+    CatalogEntry { family: "Qwen3", display_name: "Qwen3 4B Instruct", params: "4B", params_b: 4.0, quant: "Q4_K_M",
+        repo: "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF", file: "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf", size_mb: 2382 },
+    CatalogEntry { family: "Qwen3", display_name: "Qwen3 8B", params: "8B", params_b: 8.0, quant: "Q4_K_M",
+        repo: "bartowski/Qwen_Qwen3-8B-GGUF", file: "Qwen_Qwen3-8B-Q4_K_M.gguf", size_mb: 4794 },
+    // --- Llama: 3.2 small models + 3.1 8B, grouped as one family ---
+    CatalogEntry { family: "Llama", display_name: "Llama 3.2 1B Instruct", params: "1B", params_b: 1.0, quant: "Q4_K_M",
+        repo: "bartowski/Llama-3.2-1B-Instruct-GGUF", file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf", size_mb: 770 },
+    CatalogEntry { family: "Llama", display_name: "Llama 3.2 3B Instruct", params: "3B", params_b: 3.0, quant: "Q4_K_M",
+        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF", file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf", size_mb: 1926 },
+    CatalogEntry { family: "Llama", display_name: "Llama 3.1 8B Instruct", params: "8B", params_b: 8.0, quant: "Q4_K_M",
         repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", file: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", size_mb: 4900 },
+    // --- Gemma 2: 2B → 27B ---
+    CatalogEntry { family: "Gemma 2", display_name: "Gemma 2 2B Instruct", params: "2B", params_b: 2.0, quant: "Q4_K_M",
+        repo: "bartowski/gemma-2-2b-it-GGUF", file: "gemma-2-2b-it-Q4_K_M.gguf", size_mb: 1629 },
+    CatalogEntry { family: "Gemma 2", display_name: "Gemma 2 9B Instruct", params: "9B", params_b: 9.0, quant: "Q4_K_M",
+        repo: "bartowski/gemma-2-9b-it-GGUF", file: "gemma-2-9b-it-Q4_K_M.gguf", size_mb: 5494 },
+    CatalogEntry { family: "Gemma 2", display_name: "Gemma 2 27B Instruct", params: "27B", params_b: 27.0, quant: "Q4_K_M",
+        repo: "bartowski/gemma-2-27b-it-GGUF", file: "gemma-2-27b-it-Q4_K_M.gguf", size_mb: 15875 },
+    // --- Gemma 3 (2025): newer generation, 1B → 27B ---
+    CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 1B Instruct", params: "1B", params_b: 1.0, quant: "Q4_K_M",
+        repo: "bartowski/google_gemma-3-1b-it-GGUF", file: "google_gemma-3-1b-it-Q4_K_M.gguf", size_mb: 769 },
+    CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 4B Instruct", params: "4B", params_b: 4.0, quant: "Q4_K_M",
+        repo: "bartowski/google_gemma-3-4b-it-GGUF", file: "google_gemma-3-4b-it-Q4_K_M.gguf", size_mb: 2374 },
+    CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 12B Instruct", params: "12B", params_b: 12.0, quant: "Q4_K_M",
+        repo: "bartowski/google_gemma-3-12b-it-GGUF", file: "google_gemma-3-12b-it-Q4_K_M.gguf", size_mb: 6962 },
+    CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 27B Instruct", params: "27B", params_b: 27.0, quant: "Q4_K_M",
+        repo: "bartowski/google_gemma-3-27b-it-GGUF", file: "google_gemma-3-27b-it-Q4_K_M.gguf", size_mb: 15780 },
+    // --- Phi 3.5 ---
     CatalogEntry { family: "Phi 3.5", display_name: "Phi 3.5 Mini Instruct", params: "3.8B", params_b: 3.8, quant: "Q4_K_M",
         repo: "bartowski/Phi-3.5-mini-instruct-GGUF", file: "Phi-3.5-mini-instruct-Q4_K_M.gguf", size_mb: 2400 },
+    // --- Phi-4 (Microsoft, 2025) ---
+    CatalogEntry { family: "Phi-4", display_name: "Phi-4 Mini Instruct", params: "3.8B", params_b: 3.8, quant: "Q4_K_M",
+        repo: "bartowski/microsoft_Phi-4-mini-instruct-GGUF", file: "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf", size_mb: 2376 },
+    CatalogEntry { family: "Phi-4", display_name: "Phi-4 (14B)", params: "14B", params_b: 14.0, quant: "Q4_K_M",
+        repo: "bartowski/phi-4-GGUF", file: "phi-4-Q4_K_M.gguf", size_mb: 8634 },
+    // --- Mistral ---
+    CatalogEntry { family: "Mistral", display_name: "Mistral 7B Instruct v0.3", params: "7B", params_b: 7.0, quant: "Q4_K_M",
+        repo: "bartowski/Mistral-7B-Instruct-v0.3-GGUF", file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf", size_mb: 4170 },
 ];
 
 /// Parse a parameter size in billions from a model name: the first run of
