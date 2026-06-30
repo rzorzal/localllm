@@ -88,10 +88,10 @@ impl ClientInjector for ClaudeCode {
 
     fn disable(&self, prior: &ClientPrior) -> anyhow::Result<()> {
         let path = self.path();
-        if !path.exists() {
+        let mut root = read_object(&path)?;
+        if root.is_empty() {
             return Ok(());
         }
-        let mut root = read_object(&path)?;
         if let Some(env) = root.get_mut("env").and_then(|v| v.as_object_mut()) {
             for (full_key, name) in [
                 (BASE_URL_KEY, "ANTHROPIC_BASE_URL"),
@@ -195,6 +195,25 @@ mod tests {
         assert!(ClaudeCode::with_base(home.clone()).detect());
         let empty = std::env::temp_dir().join(format!("llm-none-{}", uuid::Uuid::new_v4()));
         assert!(!ClaudeCode::with_base(empty).detect());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn disable_on_absent_file_creates_no_file() {
+        let home = temp_home();
+        let cc = ClaudeCode::with_base(home.clone());
+        let prior = ClientPrior::default();
+        cc.disable(&prior).unwrap();
+        assert!(!cc.path().exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn non_object_json_errors() {
+        let home = temp_home();
+        let cc = ClaudeCode::with_base(home.clone());
+        std::fs::write(cc.path(), b"[]").unwrap();
+        assert!(cc.enable(31415).is_err());
         std::fs::remove_dir_all(&home).ok();
     }
 }
