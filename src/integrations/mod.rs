@@ -60,6 +60,66 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     result
 }
 
+use claude_code::ClaudeCode;
+use codex::Codex;
+
+/// Summary of which clients were (un)wired and which failed.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct WireSummary {
+    pub wired: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Result of enabling: the priors to persist plus a human summary.
+#[derive(Debug, Default)]
+pub struct EnableOutcome {
+    pub priors: BTreeMap<String, ClientPrior>,
+    pub summary: WireSummary,
+}
+
+/// The built-in injectors, pointed at the real home dir.
+pub fn injectors_default() -> Vec<Box<dyn ClientInjector>> {
+    vec![Box::new(ClaudeCode::default()), Box::new(Codex::default())]
+}
+
+/// Enable every detected client; record each one's prior. Undetected clients
+/// are skipped; an injector whose `enable` fails is reported in `failed` and
+/// contributes no prior (nothing to revert later).
+pub fn enable_all(port: u16, injectors: &[Box<dyn ClientInjector>]) -> EnableOutcome {
+    let mut out = EnableOutcome::default();
+    for inj in injectors {
+        if !inj.detect() {
+            continue;
+        }
+        match inj.enable(port) {
+            Ok(prior) => {
+                out.priors.insert(inj.id().to_string(), prior);
+                out.summary.wired.push(inj.display_name().to_string());
+            }
+            Err(e) => out.summary.failed.push((inj.id().to_string(), e.to_string())),
+        }
+    }
+    out
+}
+
+/// Disable every client that has a recorded prior, restoring its config.
+pub fn disable_all(
+    priors: &BTreeMap<String, ClientPrior>,
+    injectors: &[Box<dyn ClientInjector>],
+) -> WireSummary {
+    let mut summary = WireSummary::default();
+    for inj in injectors {
+        let Some(prior) = priors.get(inj.id()) else {
+            continue;
+        };
+        match inj.disable(prior) {
+            Ok(()) => summary.wired.push(inj.display_name().to_string()),
+            Err(e) => summary.failed.push((inj.id().to_string(), e.to_string())),
+        }
+    }
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +164,66 @@ mod tests {
         atomic_write(&target, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    use std::cell::RefCell;
+
+    // A fake injector that records calls and is always "detected" unless told not.
+    struct Fake {
+        id: &'static str,
+        detected: bool,
+        fail_enable: bool,
+        log: std::rc::Rc<RefCell<Vec<String>>>,
+    }
+    impl ClientInjector for Fake {
+        fn id(&self) -> &'static str { self.id }
+        fn display_name(&self) -> &'static str { self.id }
+        fn detect(&self) -> bool { self.detected }
+        fn enable(&self, port: u16) -> anyhow::Result<ClientPrior> {
+            self.log.borrow_mut().push(format!("enable:{}:{port}", self.id));
+            if self.fail_enable {
+                anyhow::bail!("boom");
+            }
+            let mut keys = BTreeMap::new();
+            keys.insert("k".to_string(), None);
+            Ok(ClientPrior { keys })
+        }
+        fn disable(&self, _prior: &ClientPrior) -> anyhow::Result<()> {
+            self.log.borrow_mut().push(format!("disable:{}", self.id));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn enable_all_skips_undetected_and_collects_failures() {
+        let log = std::rc::Rc::new(RefCell::new(vec![]));
+        let injectors: Vec<Box<dyn ClientInjector>> = vec![
+            Box::new(Fake { id: "a", detected: true, fail_enable: false, log: log.clone() }),
+            Box::new(Fake { id: "b", detected: false, fail_enable: false, log: log.clone() }),
+            Box::new(Fake { id: "c", detected: true, fail_enable: true, log: log.clone() }),
+        ];
+        let outcome = enable_all(31415, &injectors);
+        // a wired with a prior; b skipped; c detected-but-failed
+        assert_eq!(outcome.summary.wired, vec!["a".to_string()]);
+        assert_eq!(outcome.priors.keys().collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(outcome.summary.failed.len(), 1);
+        assert_eq!(outcome.summary.failed[0].0, "c");
+        // b's enable was never called
+        assert!(!log.borrow().iter().any(|l| l == "enable:b:31415"));
+    }
+
+    #[test]
+    fn disable_all_calls_disable_for_recorded_priors_only() {
+        let log = std::rc::Rc::new(RefCell::new(vec![]));
+        let injectors: Vec<Box<dyn ClientInjector>> = vec![
+            Box::new(Fake { id: "a", detected: true, fail_enable: false, log: log.clone() }),
+            Box::new(Fake { id: "b", detected: true, fail_enable: false, log: log.clone() }),
+        ];
+        let mut priors = BTreeMap::new();
+        priors.insert("a".to_string(), ClientPrior::default());
+        let summary = disable_all(&priors, &injectors);
+        assert_eq!(summary.wired, vec!["a".to_string()]);
+        assert!(log.borrow().iter().any(|l| l == "disable:a"));
+        assert!(!log.borrow().iter().any(|l| l == "disable:b"));
     }
 }
