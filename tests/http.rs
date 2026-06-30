@@ -479,13 +479,14 @@ async fn responses_stream_returns_event_sequence() {
 
 #[tokio::test]
 async fn responses_overflow_routes_to_cloud() {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let _guard = ENV_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer sk-test"))
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"routed":"cloud"}"#))
         .mount(&server)
         .await;

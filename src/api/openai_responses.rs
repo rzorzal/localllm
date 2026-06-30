@@ -1,6 +1,6 @@
 // OpenAI Responses API translation layer (stateless subset for Codex).
 use serde::Deserialize;
-use crate::api::common::{ChatMessage, ChatRequest, Role, ToolResult, ToolSpec};
+use crate::api::common::{ChatMessage, ChatRequest, Role, ToolCall, ToolResult, ToolSpec};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RespRequest {
@@ -36,6 +36,13 @@ pub enum RespItem {
     },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput { call_id: String, output: String },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        arguments: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -119,6 +126,17 @@ pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
                             role,
                             text: content_to_text(content),
                             tool_calls: vec![],
+                            tool_result: None,
+                        });
+                    }
+                    RespItem::FunctionCall { call_id, name, arguments } => {
+                        // Assistant's prior tool call, replayed in a stateless multi-turn
+                        // tool loop. Preserve it so its function_call_output has a matching
+                        // preceding call (orphaned tool results break chat templates).
+                        messages.push(ChatMessage {
+                            role: Role::Assistant,
+                            text: None,
+                            tool_calls: vec![ToolCall { id: call_id, name, arguments }],
                             tool_result: None,
                         });
                     }
@@ -288,9 +306,11 @@ pub fn stream_events_from_result(
         }
     }
 
-    let completed = serde_json::json!({
-        "response": from_internal(res.clone(), model)
-    });
+    // Reuse the non-streaming render for the terminal payload, but override the
+    // freshly-minted id so it matches the resp_id announced in response.created.
+    let mut resp_obj = from_internal(res.clone(), model);
+    resp_obj["id"] = serde_json::Value::String(resp_id.to_string());
+    let completed = serde_json::json!({ "response": resp_obj });
     push("response.completed", completed);
     out
 }
@@ -333,6 +353,26 @@ mod tests {
         let tr = internal.messages[1].tool_result.as_ref().unwrap();
         assert_eq!(tr.tool_call_id, "call_1");
         assert_eq!(tr.content, "sunny");
+    }
+
+    #[test]
+    fn assistant_function_call_item_becomes_assistant_tool_call() {
+        // Codex replays the prior assistant function_call alongside its output in a
+        // stateless tool loop; the call must be preserved before its result.
+        let json = r#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"weather?"}]},
+            {"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Recife\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"sunny"}
+        ]}"#;
+        let req: RespRequest = serde_json::from_str(json).unwrap();
+        let internal = to_internal(req).unwrap();
+        assert_eq!(internal.messages.len(), 3);
+        assert_eq!(internal.messages[1].role, Role::Assistant);
+        let tc = &internal.messages[1].tool_calls[0];
+        assert_eq!(tc.id, "call_1");
+        assert_eq!(tc.name, "get_weather");
+        assert_eq!(tc.arguments, r#"{"city":"Recife"}"#);
+        assert_eq!(internal.messages[2].role, Role::Tool);
     }
 
     #[test]
@@ -452,6 +492,42 @@ mod tests {
         // monotonic sequence_number starting at 0
         let first: serde_json::Value = serde_json::from_str(&ev[0].1).unwrap();
         assert_eq!(first["sequence_number"], 0);
+    }
+
+    #[test]
+    fn created_and_completed_share_response_id() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason};
+        let res = ChatResult {
+            content: vec![ContentPart::Text("hi".into())],
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let ev = stream_events_from_result(&res, "resp_fixed", "m");
+        let created: serde_json::Value =
+            serde_json::from_str(&ev.iter().find(|(t, _)| *t == "response.created").unwrap().1)
+                .unwrap();
+        let completed: serde_json::Value =
+            serde_json::from_str(&ev.iter().find(|(t, _)| *t == "response.completed").unwrap().1)
+                .unwrap();
+        assert_eq!(created["response"]["id"], "resp_fixed");
+        assert_eq!(completed["response"]["id"], "resp_fixed");
+    }
+
+    #[test]
+    fn sequence_numbers_are_monotonic() {
+        use crate::api::common::{ChatResult, ContentPart, FinishReason};
+        let res = ChatResult {
+            content: vec![ContentPart::Text("hi".into())],
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let ev = stream_events_from_result(&res, "resp_x", "m");
+        for (i, (_, data)) in ev.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(data).unwrap();
+            assert_eq!(v["sequence_number"], i as u64);
+        }
     }
 
     #[test]

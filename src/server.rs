@@ -793,8 +793,9 @@ async fn handle_oai_responses(
         Err(resp) => return resp,
     };
     let secs = started_at.elapsed().as_secs_f64();
-    tracing::info!(target: "localllm::req", "{rid} [responses] done: finish={:?} completion_tok={} {secs:.1}s",
-        result.finish_reason, result.completion_tokens);
+    let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+    tracing::info!(target: "localllm::req", "{rid} [responses] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s",
+        result.finish_reason, result.prompt_tokens, result.completion_tokens);
 
     if stream_flag {
         let events = crate::api::openai_responses::stream_events_from_result(&result, &resp_id, &model);
