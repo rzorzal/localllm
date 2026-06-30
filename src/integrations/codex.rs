@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
-use toml_edit::{value, DocumentMut};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use super::{atomic_write, ClientInjector, ClientPrior};
 
@@ -67,11 +67,16 @@ impl ClientInjector for Codex {
         prior.keys.insert(PROVIDER_KEY.to_string(), prior_provider);
 
         doc[PROVIDER_KEY] = value("localllm");
-        let p = &mut doc["model_providers"]["localllm"];
-        p["name"] = value("localllm");
-        p["base_url"] = value(format!("http://127.0.0.1:{port}/v1"));
-        p["wire_api"] = value("responses");
-        p["env_key"] = value("OPENAI_API_KEY");
+
+        // Build explicit standard table for model_providers.localllm
+        let mut localllm = Table::new();
+        localllm["name"] = value("localllm");
+        localllm["base_url"] = value(format!("http://127.0.0.1:{port}/v1"));
+        localllm["wire_api"] = value("responses");
+        localllm["env_key"] = value("OPENAI_API_KEY");
+        let mut providers = Table::new();
+        providers.insert("localllm", Item::Table(localllm));
+        doc.insert("model_providers", Item::Table(providers));
 
         atomic_write(&path, doc.to_string().as_bytes())?;
         Ok(prior)
@@ -80,7 +85,7 @@ impl ClientInjector for Codex {
     fn disable(&self, prior: &ClientPrior) -> anyhow::Result<()> {
         let path = self.path();
         let mut doc = read_doc(&path)?;
-        if doc.to_string().trim().is_empty() {
+        if doc.is_empty() {
             return Ok(());
         }
 
@@ -92,27 +97,11 @@ impl ClientInjector for Codex {
         }
 
         // Remove our provider table; drop the parent table if it became empty.
-        // Handle both regular tables and inline tables (which result from serialization).
-        let should_remove_providers = {
-            if let Some(item) = doc.get_mut("model_providers") {
-                let is_empty = if let Some(providers) = item.as_table_mut() {
-                    // Regular table
-                    providers.remove("localllm");
-                    providers.is_empty()
-                } else if let Some(providers) = item.as_inline_table_mut() {
-                    // Inline table (from serialization)
-                    providers.remove("localllm");
-                    providers.is_empty()
-                } else {
-                    false
-                };
-                is_empty
-            } else {
-                false
+        if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+            providers.remove("localllm");
+            if providers.is_empty() {
+                doc.remove("model_providers");
             }
-        };
-        if should_remove_providers {
-            doc.remove("model_providers");
         }
 
         atomic_write(&path, doc.to_string().as_bytes())?;
@@ -135,9 +124,12 @@ mod tests {
         let home = temp_home();
         let cx = Codex::with_base(home.clone());
         let prior = cx.enable(31415).unwrap();
-        let doc = std::fs::read_to_string(cx.path()).unwrap().parse::<DocumentMut>().unwrap();
+        let text = std::fs::read_to_string(cx.path()).unwrap();
+        assert!(text.contains("[model_providers.localllm]"), "expected standard table, got:\n{text}");
+        let doc = text.parse::<DocumentMut>().unwrap();
         assert_eq!(doc["model_provider"].as_str(), Some("localllm"));
         let p = &doc["model_providers"]["localllm"];
+        assert_eq!(p["name"].as_str(), Some("localllm"));
         assert_eq!(p["base_url"].as_str(), Some("http://127.0.0.1:31415/v1"));
         assert_eq!(p["wire_api"].as_str(), Some("responses"));
         assert_eq!(p["env_key"].as_str(), Some("OPENAI_API_KEY"));
@@ -189,6 +181,16 @@ mod tests {
         let cx = Codex::with_base(home.clone());
         std::fs::write(cx.path(), b"this is = = not toml").unwrap();
         assert!(cx.enable(31415).is_err());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn disable_with_malformed_toml_errors() {
+        let home = temp_home();
+        let cx = Codex::with_base(home.clone());
+        std::fs::write(cx.path(), b"this is = = not toml").unwrap();
+        let prior = ClientPrior::default();
+        assert!(cx.disable(&prior).is_err());
         std::fs::remove_dir_all(&home).ok();
     }
 
