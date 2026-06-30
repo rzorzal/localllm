@@ -33,14 +33,6 @@ impl Provider {
                 .unwrap_or_else(|_| "https://api.openai.com".to_string()),
         }
     }
-
-    /// Upstream request path for this provider's chat endpoint.
-    pub fn path(&self) -> &'static str {
-        match self {
-            Provider::Anthropic => "/v1/messages",
-            Provider::OpenAI => "/v1/chat/completions",
-        }
-    }
 }
 
 /// Hop-by-hop / connection headers that must not be forwarded verbatim;
@@ -77,9 +69,14 @@ pub fn degrade_error(reason: crate::usage::DegradeReason) -> Response {
 /// (including its credential) unchanged. Returns `Relayed` with the streamed
 /// response on success, or `Degrade(reason)` on a failure the caller should
 /// handle by falling back to local. Credentials are never logged.
-pub async fn forward(provider: Provider, headers: &HeaderMap, body: Bytes) -> ForwardOutcome {
+pub async fn forward(
+    provider: Provider,
+    upstream_path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> ForwardOutcome {
     use crate::usage::DegradeReason;
-    let url = format!("{}{}", provider.base_url(), provider.path());
+    let url = format!("{}{}", provider.base_url(), upstream_path);
 
     let mut fwd = HeaderMap::new();
     for (name, value) in headers.iter() {
@@ -151,7 +148,7 @@ mod tests {
         headers.insert("x-api-key", "sk-test".parse().unwrap());
         let body = Bytes::from_static(br#"{"model":"claude","messages":[]}"#);
 
-        let outcome = forward(Provider::Anthropic, &headers, body).await;
+        let outcome = forward(Provider::Anthropic, "/v1/messages", &headers, body).await;
         let resp = match outcome {
             ForwardOutcome::Relayed(r) => r,
             ForwardOutcome::Degrade(d) => panic!("expected relay, got degrade {d:?}"),
@@ -170,7 +167,7 @@ mod tests {
     async fn unreachable_upstream_degrades_offline() {
         let _guard = ENV_LOCK.lock().await;
         std::env::set_var("LOCALLLM_OPENAI_BASE", "http://127.0.0.1:1"); // nothing listening
-        let outcome = forward(Provider::OpenAI, &HeaderMap::new(), Bytes::new()).await;
+        let outcome = forward(Provider::OpenAI, "/v1/chat/completions", &HeaderMap::new(), Bytes::new()).await;
         assert!(matches!(
             outcome,
             ForwardOutcome::Degrade(crate::usage::DegradeReason::Offline)
@@ -187,7 +184,7 @@ mod tests {
             .mount(&server)
             .await;
         std::env::set_var("LOCALLLM_OPENAI_BASE", server.uri());
-        let out = forward(Provider::OpenAI, &HeaderMap::new(), Bytes::new()).await;
+        let out = forward(Provider::OpenAI, "/v1/chat/completions", &HeaderMap::new(), Bytes::new()).await;
         std::env::remove_var("LOCALLLM_OPENAI_BASE");
         out
     }

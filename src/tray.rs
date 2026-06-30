@@ -309,6 +309,27 @@ fn status_menu_label(s: &crate::model_manager::SwitchStatus) -> String {
     }
 }
 
+/// Format the tray "Wired:" sub-line from persisted integration state.
+fn wired_label(state: &crate::settings::IntegrationState) -> String {
+    if !state.enabled {
+        return "Apps: direct to provider".to_string();
+    }
+    if state.priors.is_empty() {
+        return "Wired: none (no client configs found)".to_string();
+    }
+    // Map known ids to display names for the line.
+    let names: Vec<&str> = state
+        .priors
+        .keys()
+        .map(|id| match id.as_str() {
+            "claude-code" => "Claude Code",
+            "codex" => "Codex",
+            other => other,
+        })
+        .collect();
+    format!("Wired: {}", names.join(", "))
+}
+
 // ---------------------------------------------------------------------------
 // Tray entry point
 // ---------------------------------------------------------------------------
@@ -410,6 +431,12 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let mut manager_id: Option<tray_icon::menu::MenuId> = None;
     let mut manager_window: Option<window::ModelManagerWindow> = None;
 
+    // Integration toggle state: the CheckMenuItem and wired sub-line handles,
+    // populated in Init and mutated in the click handler.
+    let mut toggle_id: Option<tray_icon::menu::MenuId> = None;
+    let mut toggle_item_handle: Option<CheckMenuItem> = None;
+    let mut wired_handle: Option<MenuItem> = None;
+
     // Poll interval for the menu-event channel.
     let poll_interval = Duration::from_millis(100);
 
@@ -464,6 +491,22 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 );
                 routing_status = Some(routing_line.clone());
 
+                let init_state = crate::settings::load_integrations();
+                let toggle_item = CheckMenuItem::new(
+                    "Route apps through localllm",
+                    true,
+                    init_state.enabled,
+                    None,
+                );
+                toggle_id = Some(toggle_item.id().clone());
+                toggle_item_handle = Some(toggle_item.clone());
+                let wired_line = MenuItem::new(
+                    wired_label(&init_state),
+                    false,
+                    None,
+                );
+                wired_handle = Some(wired_line.clone());
+
                 menu.append(&title).expect("append title");
                 menu.append(&status).expect("append status");
                 menu.append(&PredefinedMenuItem::separator()).expect("sep");
@@ -476,6 +519,9 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&routing_line).expect("append routing line");
                 menu.append(&routing_submenu).expect("append routing submenu");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator");
+                menu.append(&toggle_item).expect("append toggle item");
+                menu.append(&wired_line).expect("append wired line");
+                menu.append(&PredefinedMenuItem::separator()).expect("append separator2");
                 menu.append(&logs_item).expect("append logs item");
                 menu.append(&manager_item).expect("append manager item");
                 menu.append(&quit_item).expect("append quit item");
@@ -547,6 +593,32 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                             s.set_text(format!("Routing: {}", chosen.label()));
                         }
                         tracing::info!("routing profile set via tray: {chosen:?}");
+                    } else if toggle_id.as_ref() == Some(&menu_event.id) {
+                        let injectors = crate::integrations::injectors_default();
+                        let mut state = crate::settings::load_integrations();
+                        if state.enabled {
+                            let summary = crate::integrations::disable_all(&state.priors, &injectors);
+                            for (id, _e) in &summary.failed {
+                                tracing::warn!(target: "localllm", "failed to revert client {id}");
+                            }
+                            let failed_ids: std::collections::HashSet<&String> =
+                                summary.failed.iter().map(|(id, _)| id).collect();
+                            state.priors.retain(|id, _| failed_ids.contains(id));
+                            state.enabled = !state.priors.is_empty();
+                        } else {
+                            let outcome = crate::integrations::enable_all(port, &injectors);
+                            for (id, _e) in &outcome.summary.failed {
+                                tracing::warn!(target: "localllm", "failed to wire client {id}");
+                            }
+                            state = crate::settings::IntegrationState { enabled: !outcome.priors.is_empty(), priors: outcome.priors };
+                        }
+                        let _ = crate::settings::save_integrations(&state);
+                        if let Some(item) = &toggle_item_handle {
+                            item.set_checked(state.enabled);
+                        }
+                        if let Some(line) = &wired_handle {
+                            line.set_text(wired_label(&state));
+                        }
                     } else if manager_id.as_ref() == Some(&menu_event.id) {
                         match &manager_window {
                             Some(w) => {

@@ -12,6 +12,7 @@ pub mod usage;
 pub mod server;
 pub mod tscg;
 pub mod tray;
+pub mod integrations;
 
 // ---------------------------------------------------------------------------
 // Shared server startup logic
