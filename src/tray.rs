@@ -491,17 +491,17 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 );
                 routing_status = Some(routing_line.clone());
 
-                let integrations_enabled = crate::settings::load_integrations().enabled;
+                let init_state = crate::settings::load_integrations();
                 let toggle_item = CheckMenuItem::new(
                     "Route apps through localllm",
                     true,
-                    integrations_enabled,
+                    init_state.enabled,
                     None,
                 );
                 toggle_id = Some(toggle_item.id().clone());
                 toggle_item_handle = Some(toggle_item.clone());
                 let wired_line = MenuItem::new(
-                    wired_label(&crate::settings::load_integrations()),
+                    wired_label(&init_state),
                     false,
                     None,
                 );
@@ -597,14 +597,20 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                         let injectors = crate::integrations::injectors_default();
                         let mut state = crate::settings::load_integrations();
                         if state.enabled {
-                            let _ = crate::integrations::disable_all(&state.priors, &injectors);
-                            state = crate::settings::IntegrationState::default();
+                            let summary = crate::integrations::disable_all(&state.priors, &injectors);
+                            for (id, _e) in &summary.failed {
+                                tracing::warn!(target: "localllm", "failed to revert client {id}");
+                            }
+                            let failed_ids: std::collections::HashSet<&String> =
+                                summary.failed.iter().map(|(id, _)| id).collect();
+                            state.priors.retain(|id, _| failed_ids.contains(id));
+                            state.enabled = !state.priors.is_empty();
                         } else {
                             let outcome = crate::integrations::enable_all(port, &injectors);
-                            state = crate::settings::IntegrationState {
-                                enabled: true,
-                                priors: outcome.priors,
-                            };
+                            for (id, _e) in &outcome.summary.failed {
+                                tracing::warn!(target: "localllm", "failed to wire client {id}");
+                            }
+                            state = crate::settings::IntegrationState { enabled: !outcome.priors.is_empty(), priors: outcome.priors };
                         }
                         let _ = crate::settings::save_integrations(&state);
                         if let Some(item) = &toggle_item_handle {

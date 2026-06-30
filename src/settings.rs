@@ -1,4 +1,4 @@
-//! Persisted user settings (currently just the routing profile).
+//! Persisted user settings: routing profile and client-integration toggle state.
 //!
 //! Stored as JSON at `<config-dir>/localllm/settings.json` (e.g.
 //! `~/Library/Application Support/localllm/settings.json` on macOS). The path
@@ -58,7 +58,7 @@ fn save_settings(s: &Settings) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(s)?;
-    std::fs::write(&path, json)?;
+    crate::integrations::atomic_write(&path, json.as_bytes())?;
     Ok(())
 }
 

@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use toml_edit::{value, DocumentMut, Item, Table};
 
 use super::{atomic_write, ClientInjector, ClientPrior};
@@ -68,15 +70,19 @@ impl ClientInjector for Codex {
 
         doc[PROVIDER_KEY] = value("localllm");
 
-        // Build explicit standard table for model_providers.localllm
+        // Build explicit standard table for model_providers.localllm, inserting
+        // into the existing parent table so sibling providers are preserved.
         let mut localllm = Table::new();
         localllm["name"] = value("localllm");
         localllm["base_url"] = value(format!("http://127.0.0.1:{port}/v1"));
         localllm["wire_api"] = value("responses");
         localllm["env_key"] = value("OPENAI_API_KEY");
-        let mut providers = Table::new();
+        let providers = doc
+            .entry("model_providers")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("model_providers is not a table in {}", path.display()))?;
         providers.insert("localllm", Item::Table(localllm));
-        doc.insert("model_providers", Item::Table(providers));
 
         atomic_write(&path, doc.to_string().as_bytes())?;
         Ok(prior)
@@ -191,6 +197,41 @@ mod tests {
         std::fs::write(cx.path(), b"this is = = not toml").unwrap();
         let prior = ClientPrior::default();
         assert!(cx.disable(&prior).is_err());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn enable_preserves_sibling_providers_and_disable_restores() {
+        let home = temp_home();
+        let cx = Codex::with_base(home.clone());
+        // Config already has model_provider = "openai" and a [model_providers.openai] block.
+        std::fs::write(
+            cx.path(),
+            "model_provider = \"openai\"\n\n[model_providers.openai]\nname = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n",
+        )
+        .unwrap();
+        let prior = cx.enable(31415).unwrap();
+        let text = std::fs::read_to_string(cx.path()).unwrap();
+        // Our block is present as a standard table header.
+        assert!(text.contains("[model_providers.localllm]"), "localllm block missing:\n{text}");
+        // The sibling openai block and its field must survive.
+        assert!(text.contains("[model_providers.openai]"), "openai block clobbered:\n{text}");
+        assert!(text.contains("base_url = \"https://api.openai.com/v1\""), "openai field clobbered:\n{text}");
+        assert_eq!(prior.keys["model_provider"], Some(serde_json::json!("openai")));
+
+        cx.disable(&prior).unwrap();
+        let doc = std::fs::read_to_string(cx.path()).unwrap().parse::<DocumentMut>().unwrap();
+        // model_provider restored to "openai".
+        assert_eq!(doc["model_provider"].as_str(), Some("openai"));
+        // localllm entry gone.
+        assert!(doc["model_providers"].get("localllm").is_none(), "localllm not removed after disable");
+        // openai sibling still present with its field.
+        assert!(doc["model_providers"].get("openai").is_some(), "openai sibling removed after disable");
+        assert_eq!(
+            doc["model_providers"]["openai"]["base_url"].as_str(),
+            Some("https://api.openai.com/v1"),
+            "openai field lost after disable"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
