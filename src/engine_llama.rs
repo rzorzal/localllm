@@ -215,7 +215,7 @@ impl LlamaEngine {
 // Worker thread
 // ---------------------------------------------------------------------------
 
-/// Route llama.cpp / ggml / Metal logs into Rust `tracing` (target `llama_cpp_2`)
+/// Route llama.cpp / ggml / Metal logs into Rust `tracing` (target `llama-cpp-2`)
 /// so they land in our file log instead of only on C `stderr` — which the tray
 /// app (no terminal) silently drops. This is what surfaces the real reason
 /// behind a decode failure (e.g. Metal `Insufficient Memory`), not just our
