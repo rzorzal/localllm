@@ -173,6 +173,40 @@ function renderDetail(fam, m) {
     <span>Repo</span><b>${m.repo}</b>`;
   wrap.append(specs);
 
+  // --- Context window control (per-model ctx override) ---
+  const ctxBox = el("div", "ctxbox");
+  ctxBox.append(el("div", "ctxtitle", "Context window"));
+  if (m.ctx_max === 0) {
+    ctxBox.append(el("div", "ctxnote", "não cabe nesta máquina"));
+  } else {
+    const row = el("div", "ctxrow");
+    const input = el("input", "ctxinput");
+    input.type = "number";
+    input.min = m.ctx_min;
+    input.max = m.ctx_max;
+    input.step = 256;
+    input.value = m.ctx_current;
+    row.append(input);
+    row.append(el("span", "ctxbounds", `min ${m.ctx_min} · max ${m.ctx_max}`));
+    ctxBox.append(row);
+    ctxBox.append(el("div", "ctxhint", `suggested default: ${m.ctx_default}`));
+
+    const ctxActions = el("div", "actions");
+    const saveBtn = el("button", "btn primary", "Salvar");
+    const defBtn = el("button", "btn", `Usar padrão (${m.ctx_default})`);
+    const valid = () => {
+      const v = Number(input.value);
+      return Number.isInteger(v) && v >= m.ctx_min && v <= m.ctx_max && v !== m.ctx_current;
+    };
+    saveBtn.disabled = true;
+    input.oninput = () => { saveBtn.disabled = !valid(); };
+    saveBtn.onclick = () => saveCtx(m, Number(input.value), wrap);
+    defBtn.onclick = () => saveCtx(m, 0, wrap);
+    ctxActions.append(saveBtn, defBtn);
+    ctxBox.append(ctxActions);
+  }
+  wrap.append(ctxBox);
+
   const actions = el("div", "actions");
   const switchBtn = el("button", "btn primary", m.status === "in_use" ? "Active" : "Switch to this model");
   switchBtn.disabled = m.status === "in_use";
@@ -218,6 +252,28 @@ function startPolling(fill, phase) {
   }, 1000);
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+async function saveCtx(m, ctx, wrap) {
+  let res;
+  try {
+    res = await api("POST", "/admin/model/ctx", { repo: m.repo, file: m.file, ctx });
+  } catch (e) {
+    return toast(e.message, true);
+  }
+  if (res && res.reloading) {
+    // Active model is reloading at the new ctx — show the same progress UI as a switch.
+    toast("recarregando…");
+    const prog = el("div", "progress");
+    const bar = el("div", "bar"); const fill = el("div", "fill"); bar.append(fill);
+    const phase = el("div", "phase", "reloading…");
+    prog.append(bar, phase); wrap.append(prog);
+    startPolling(fill, phase);
+  } else {
+    toast(res && res.cleared ? "Voltou ao padrão" : "Contexto salvo");
+    await refresh().catch(() => {});
+    currentView();
+  }
+}
 
 async function doDelete(m) {
   if (!confirm(`Delete ${m.display_name} from disk?`)) return;
