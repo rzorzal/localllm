@@ -402,6 +402,7 @@ pub fn router(
         .route("/health", get(handle_health))
         .route("/admin/model", post(handle_admin_switch))
         .route("/admin/model/status", get(handle_admin_status))
+        .route("/admin/model/ctx", post(handle_model_set_ctx))
         .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
@@ -435,6 +436,13 @@ fn check_admin(headers: &HeaderMap, state: &AppState) -> Option<axum::response::
 struct AdminSwitchBody {
     repo: String,
     file: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AdminCtxBody {
+    repo: String,
+    file: String,
+    ctx: u32,
 }
 
 /// A model `file` must be a bare filename (no path components), so it can never
@@ -549,6 +557,64 @@ async fn handle_model_delete(
             Json(json!({"error": format!("delete failed: {e}")})),
         )
             .into_response(),
+    }
+}
+
+/// POST /admin/model/ctx — set (or clear, ctx=0) a model's per-model context.
+/// Validates against the model's [min,max]; reloads the model if it is active.
+async fn handle_model_set_ctx(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: AdminCtxBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    if body.repo.is_empty() || !is_safe_model_file(&body.file) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and a valid (non-path) file are required"}))).into_response();
+    }
+    let Some(entry) = crate::catalog::CATALOG.iter().find(|e| e.repo == body.repo && e.file == body.file) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown model"}))).into_response();
+    };
+
+    let key = crate::settings::model_ctx_key(&body.repo, &body.file);
+    if body.ctx == 0 {
+        if let Err(e) = crate::settings::clear_model_ctx(&key) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    } else {
+        let budget_mb = crate::fit::device_budget_mb(state.total_ram_mb, true);
+        let kv_per_token = crate::fit::est_kv_bytes_per_token(entry.params_b, state.kv_kind);
+        let bounds = crate::fit::ctx_bounds(entry.size_mb, kv_per_token, budget_mb, entry.ctx_train);
+        if bounds.max == 0 || body.ctx < bounds.min || body.ctx > bounds.max {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": format!("ctx must be in the range {}..{}", bounds.min, bounds.max)
+            }))).into_response();
+        }
+        if let Err(e) = crate::settings::save_model_ctx(&key, body.ctx) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    }
+
+    // Reload if this is the active model so the new ctx takes effect now.
+    let active = state.manager.status().current;
+    if active.repo == body.repo && active.file == body.file {
+        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file };
+        match state.manager.start_switch(spec) {
+            Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
+            Err(crate::model_manager::SwitchError::AlreadySwitching) => {
+                (StatusCode::CONFLICT, Json(json!({"error": "a switch is already in progress"}))).into_response()
+            }
+        }
+    } else {
+        (StatusCode::OK, Json(json!({"saved": true}))).into_response()
     }
 }
 

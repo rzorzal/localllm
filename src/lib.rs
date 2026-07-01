@@ -94,10 +94,13 @@ pub async fn run_server_with_ready_policy_token(
                 kv_cache_dir,
                 cfg.no_kv_persist
             );
+            let requested_ctx = crate::settings::load_model_ctx(
+                &crate::settings::model_ctx_key(&cfg.model_id, &cfg.gguf_files[0]),
+            ).unwrap_or(cfg.ctx_len as u32) as usize;
             let llama = LlamaEngine::load(
                 &cfg.model_id,
                 &cfg.gguf_files,
-                cfg.ctx_len,
+                requested_ctx,
                 kv_cache_type,
                 kv_cache_dir,
                 total_ram_mb,
@@ -150,8 +153,11 @@ pub async fn run_server_with_ready_policy_token(
                 },
             )
             .await?;
+            let requested_ctx = crate::settings::load_model_ctx(
+                &crate::settings::model_ctx_key(&spec.repo, &spec.file),
+            ).unwrap_or(b_ctx_len as u32) as usize;
             let engine =
-                LlamaEngine::load(&spec.repo, &[spec.file], b_ctx_len, b_kv_type, kv_dir, b_total_ram_mb).await?;
+                LlamaEngine::load(&spec.repo, &[spec.file], requested_ctx, b_kv_type, kv_dir, b_total_ram_mb).await?;
             Ok(Arc::new(engine) as Arc<dyn Generator>)
         })
     });
