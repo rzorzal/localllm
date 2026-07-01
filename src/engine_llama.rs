@@ -64,6 +64,7 @@ use llama_cpp_2::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
+    context::LlamaContext,
     context::params::{KvCacheType, LlamaContextParams},
     sampling::LlamaSampler,
     token::LlamaToken,
@@ -203,6 +204,77 @@ impl LlamaEngine {
 // Worker thread
 // ---------------------------------------------------------------------------
 
+/// Route llama.cpp / ggml / Metal logs into Rust `tracing` (target `llama_cpp_2`)
+/// so they land in our file log instead of only on C `stderr` — which the tray
+/// app (no terminal) silently drops. This is what surfaces the real reason
+/// behind a decode failure (e.g. Metal `Insufficient Memory`), not just our
+/// generic wrapper message. Idempotent: only the first call installs the hook.
+fn init_llama_logging() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        llama_cpp_2::send_logs_to_tracing(
+            llama_cpp_2::LogOptions::default().with_logs_enabled(true),
+        );
+    });
+}
+
+/// Build the context params for a given context length + KV type. Extracted so
+/// the worker can rebuild an identical context during error recovery.
+///
+/// `n_batch = ctx_len` lets a large prompt (e.g. Claude Code's ~26k prefix) be
+/// prefilled in one decode without tripping the `n_tokens_all <= n_batch`
+/// assertion. Quantized (non-F16) KV requires Flash Attention on Metal, else
+/// context creation errors. `n_ubatch` (capped 2048) bounds the compute buffer.
+fn make_ctx_params(ctx_len: u32, kv_cache_type: KvCacheType) -> LlamaContextParams {
+    let use_flash_attn = kv_cache_type != KvCacheType::F16;
+    let flash_attn_policy = if use_flash_attn {
+        llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED
+    } else {
+        llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO
+    };
+    let n_ubatch = ctx_len.min(2048);
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(ctx_len))
+        .with_n_batch(ctx_len)
+        .with_n_ubatch(n_ubatch)
+        .with_type_k(kv_cache_type)
+        .with_type_v(kv_cache_type)
+        .with_flash_attention_policy(flash_attn_policy)
+}
+
+/// Recover the worker's context after a failed decode. A Metal command-buffer
+/// OOM leaves the backend in an **unrecoverable error state** — llama.cpp itself
+/// says "recreate the backend to recover", and `clear_kv_cache` does NOT reset
+/// it. Without this, one failing request bricks the persistent context and every
+/// later request fails until restart. We rebuild a fresh context; if the rebuild
+/// also fails (e.g. the context is fundamentally too large for the device), we
+/// fall back to clearing KV and log it — the next request will surface the error
+/// again rather than silently succeeding on stale state.
+fn recover_context<'a>(
+    model: &'a LlamaModel,
+    backend: &LlamaBackend,
+    ctx: &mut LlamaContext<'a>,
+    cached_tokens: &mut Vec<LlamaToken>,
+    ctx_len: u32,
+    kv_cache_type: KvCacheType,
+) {
+    cached_tokens.clear();
+    match model.new_context(backend, make_ctx_params(ctx_len, kv_cache_type)) {
+        Ok(fresh) => {
+            *ctx = fresh;
+            tracing::info!(target: "localllm::llama", "context rebuilt after decode failure");
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "localllm::llama",
+                "context rebuild failed ({e}); clearing KV as fallback — worker may be degraded",
+            );
+            ctx.clear_kv_cache();
+        }
+    }
+}
+
 /// The persistent worker thread. Owns `LlamaBackend`, `LlamaModel`, and ONE
 /// `LlamaContext` for the entire process lifetime.
 ///
@@ -216,6 +288,10 @@ fn worker_thread(
     rx: std_mpsc::Receiver<Job>,
     load_tx: tokio::sync::oneshot::Sender<Result<()>>,
 ) {
+    // Route llama.cpp/ggml/Metal logs into tracing before anything loads, so
+    // even backend/model-load diagnostics reach the file log.
+    init_llama_logging();
+
     // --- Init backend ---
     let backend = match LlamaBackend::init().context("LlamaBackend::init failed") {
         Ok(b) => b,
@@ -242,29 +318,14 @@ fn worker_thread(
     // enabled; without it llama.cpp will error at context creation time.
     // We enable LLAMA_FLASH_ATTN_TYPE_ENABLED whenever kv_cache_type != F16.
     let use_flash_attn = kv_cache_type != KvCacheType::F16;
-    let flash_attn_policy = if use_flash_attn {
-        llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED
-    } else {
-        llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO
-    };
     tracing::info!(
         target: "localllm::llama",
-        "KV cache type: {:?}, flash attention: {}",
+        "KV cache type: {:?}, flash attention: {}, ctx_len: {}",
         kv_cache_type,
         if use_flash_attn { "enabled" } else { "auto" },
+        ctx_len,
     );
-    // n_ubatch is the physical micro-batch the GPU processes at once during
-    // prefill. The default (512) serializes a 21k-token prefix into ~41 steps.
-    // Raising it lets Metal prefill more tokens in parallel → faster cold start.
-    // Capped at 2048 to bound the compute buffer; clamped to ctx_len.
-    let n_ubatch = ctx_len.min(2048);
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(ctx_len))
-        .with_n_batch(ctx_len)
-        .with_n_ubatch(n_ubatch)
-        .with_type_k(kv_cache_type)
-        .with_type_v(kv_cache_type)
-        .with_flash_attention_policy(flash_attn_policy);
+    let ctx_params = make_ctx_params(ctx_len, kv_cache_type);
     let mut ctx = match model.new_context(&backend, ctx_params)
         .context("new_context failed")
     {
@@ -352,10 +413,9 @@ fn worker_thread(
                     Err(_payload) => {
                         tracing::warn!(
                             target: "localllm::llama",
-                            "inference panicked — resetting KV cache, continuing worker",
+                            "inference panicked — rebuilding context, continuing worker",
                         );
-                        cached_tokens.clear();
-                        ctx.clear_kv_cache();
+                        recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                         Err(anyhow::anyhow!("inference panicked"))
                     }
                 };
@@ -373,10 +433,10 @@ fn worker_thread(
                         completion_tokens: gen_tokens,
                     }
                 });
-                // On error, clear the cache state so the next request starts clean.
+                // On error, rebuild the context so the next request starts on a
+                // fresh backend (a Metal OOM leaves it unrecoverable otherwise).
                 if chat_result.is_err() {
-                    cached_tokens.clear();
-                    ctx.clear_kv_cache();
+                    recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                 }
                 let _ = reply.send(chat_result);
             }
@@ -409,17 +469,16 @@ fn worker_thread(
                     Err(_payload) => {
                         tracing::warn!(
                             target: "localllm::llama",
-                            "inference panicked (stream) — resetting KV cache, continuing worker",
+                            "inference panicked (stream) — rebuilding context, continuing worker",
                         );
-                        cached_tokens.clear();
-                        ctx.clear_kv_cache();
+                        recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                         Err(anyhow::anyhow!("inference panicked"))
                     }
                 };
-                // On error, clear the cache state so the next request starts clean.
+                // On error, rebuild the context so the next request starts on a
+                // fresh backend (a Metal OOM leaves it unrecoverable otherwise).
                 if result.is_err() {
-                    cached_tokens.clear();
-                    ctx.clear_kv_cache();
+                    recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                 }
                 // Terminal delta.
                 match result {
@@ -669,6 +728,7 @@ pub async fn dump_prompt(
         .await
         .context("ensure_model failed")?;
     let path = paths.into_iter().next().context("no model path")?;
+    init_llama_logging();
     let backend = LlamaBackend::init().context("LlamaBackend::init failed")?;
     let model = LlamaModel::load_from_file(
         &backend,
