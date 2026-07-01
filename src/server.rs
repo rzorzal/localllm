@@ -155,6 +155,7 @@ fn route_decision(
     state: &AppState,
     internal: &ChatRequest,
     headers: &axum::http::HeaderMap,
+    rid: &str,
 ) -> (crate::route::Decision, usize) {
     let has_cloud_creds =
         headers.contains_key("x-api-key") || headers.contains_key("authorization");
@@ -170,7 +171,24 @@ fn route_decision(
         local_capability_b,
     };
     let policy = *state.policy.read().unwrap();
-    (crate::route::decide(&signals, &policy), prompt_tokens)
+    let decision = crate::route::decide(&signals, &policy);
+
+    // Log WHY this decision was made: the difficulty score and its inputs, the
+    // capability-adjusted threshold, and the outcome — so the log explains each
+    // local-vs-cloud choice.
+    let score = crate::route::difficulty_score(&signals);
+    let threshold = crate::route::effective_threshold(&policy, local_capability_b);
+    tracing::info!(
+        target: "localllm::req",
+        "{rid} route: {decision:?} score={score:.3} threshold={threshold:.3} \
+         (prompt_tok={prompt_tokens} ctx_window={} fill={:.2} tools={} msgs={} cap_b={local_capability_b:.1} creds={has_cloud_creds})",
+        signals.local_ctx_window,
+        if signals.local_ctx_window == 0 { 1.0 } else { (prompt_tokens as f64 / signals.local_ctx_window as f64).min(1.0) },
+        signals.n_tools,
+        signals.n_messages,
+    );
+
+    (decision, prompt_tokens)
 }
 
 /// Record a successful cloud call and fire the one-shot high-usage alert if the
@@ -575,7 +593,7 @@ async fn handle_oai_chat(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
@@ -751,7 +769,7 @@ async fn handle_oai_responses(
             Json(json!({"error": "model switching, retry shortly"}))).into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [responses] route=cloud reason={reason:?}");
@@ -856,7 +874,7 @@ async fn handle_anth_messages(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
