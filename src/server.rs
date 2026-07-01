@@ -338,6 +338,10 @@ pub struct AppState {
     pub admin_token: Arc<str>,
     /// Total physical RAM in MB (read once at startup), for catalog fit/recommend.
     pub total_ram_mb: u64,
+    /// Requested context ceiling passed to catalog_view for per-model ctx bounds.
+    pub requested_ctx_ceiling: u32,
+    /// KV cache kind used for catalog RAM estimates.
+    pub kv_kind: crate::fit::KvKind,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -372,6 +376,8 @@ pub fn router(
     cloud_token_alert: usize,
     admin_token: Arc<str>,
     total_ram_mb: u64,
+    requested_ctx_ceiling: u32,
+    kv_kind: crate::fit::KvKind,
 ) -> Router {
     let state = Arc::new(AppState {
         manager,
@@ -382,6 +388,8 @@ pub fn router(
         cloud_token_alert,
         admin_token,
         total_ram_mb,
+        requested_ctx_ceiling,
+        kv_kind,
     });
     // Large prompts must reach the routing layer to be forwarded to cloud;
     // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
@@ -496,8 +504,11 @@ async fn handle_models_catalog(
     let view = crate::catalog::catalog_view(
         crate::catalog::CATALOG,
         state.total_ram_mb,
+        state.requested_ctx_ceiling,
+        state.kv_kind,
         Some(&active),
         |r, f| crate::download::cache_path(r, f).exists(),
+        |r, f| crate::settings::load_model_ctx(&crate::settings::model_ctx_key(r, f)),
     );
     Json(view).into_response()
 }

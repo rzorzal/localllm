@@ -173,6 +173,12 @@ pub async fn run_server_with_ready_policy_token(
         cfg.cloud_token_alert,
         admin_token.clone(),
         total_ram_mb,
+        cfg.ctx_len as u32,
+        match cfg.kv_type {
+            crate::config::KvType::Q8 => crate::fit::KvKind::Q8,
+            crate::config::KvType::Q4 => crate::fit::KvKind::Q4,
+            crate::config::KvType::F16 => crate::fit::KvKind::F16,
+        },
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
@@ -320,6 +326,8 @@ pub fn router_for_test_with(
         200_000,
         Arc::from("test-token"),
         16384,
+        32768,
+        crate::fit::KvKind::Q8,
     )
 }
 
