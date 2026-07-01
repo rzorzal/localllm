@@ -585,7 +585,8 @@ async fn handle_model_set_ctx(
     };
 
     let key = crate::settings::model_ctx_key(&body.repo, &body.file);
-    if body.ctx == 0 {
+    let cleared = body.ctx == 0;
+    if cleared {
         if let Err(e) = crate::settings::clear_model_ctx(&key) {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
         }
@@ -613,6 +614,8 @@ async fn handle_model_set_ctx(
                 (StatusCode::CONFLICT, Json(json!({"error": "a switch is already in progress"}))).into_response()
             }
         }
+    } else if cleared {
+        (StatusCode::OK, Json(json!({"cleared": true}))).into_response()
     } else {
         (StatusCode::OK, Json(json!({"saved": true}))).into_response()
     }

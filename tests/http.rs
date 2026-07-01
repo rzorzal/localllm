@@ -457,6 +457,15 @@ async fn set_ctx_unknown_model_returns_400() {
     )
     .await;
     assert!(resp["error"].is_string());
+    let status = localllm::axum_test_request_status_with_header(
+        localllm::router_for_test(),
+        "/admin/model/ctx",
+        r#"{"repo":"nope","file":"nope.gguf","ctx":8192}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
+    assert_eq!(status, 400);
 }
 
 #[tokio::test]
@@ -472,6 +481,15 @@ async fn set_ctx_out_of_range_returns_400() {
     .await;
     assert!(resp["error"].as_str().unwrap().contains("range")
         || resp["error"].as_str().unwrap().contains("between"));
+    let status = localllm::axum_test_request_status_with_header(
+        localllm::router_for_test(),
+        "/admin/model/ctx",
+        r#"{"repo":"Qwen/Qwen2.5-3B-Instruct-GGUF","file":"qwen2.5-3b-instruct-q4_k_m.gguf","ctx":999999}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
+    assert_eq!(status, 400);
 }
 
 #[tokio::test]

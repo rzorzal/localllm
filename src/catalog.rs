@@ -331,7 +331,11 @@ mod tests {
         // above 6500 but below 8500 → Tight.
         let cat = vec![entry("F", "M", 5.0, "r", "f", 6000)];
         let view = catalog_view(&cat, 10000, 32768, KvKind::Q8, None, |_, _| false, |_, _| None);
-        assert_eq!(view[0].models[0].fit, FitVerdict::Tight);
+        let m = &view[0].models[0];
+        assert_eq!(m.fit, FitVerdict::Tight);
+        // Pin the estimate to the Tight band so a shift in the fit constants
+        // can't silently reclassify this to Fits/WontFit while still "passing".
+        assert!(m.est_ram_mb > 6500 && m.est_ram_mb <= 8500, "est {}", m.est_ram_mb);
     }
 
     #[test]
@@ -393,9 +397,11 @@ mod tests {
         assert_eq!(m.ctx_current, 16384);       // min(32768 ceiling, 16384 max)
         assert_eq!(m.ctx_min, crate::fit::MIN_CTX);
         assert_eq!(m.ctx_default, crate::fit::DEFAULT_SMALL_CTX.min(16384));
-        // weights 8634 + KV(16384)≈1700 + headroom 1024 ≈ 11.4k < 65% of 16384 (10649)?
-        // 11358 > 10649 → Tight, not Fits. Assert it is at least not WontFit.
-        assert_ne!(m.fit, FitVerdict::WontFit);
+        // weights 8634 + KV(16384) + headroom 1024 lands above 65% of 16384
+        // (10649) but under 85% (13926) → Tight. Pin both the verdict and the
+        // estimate so a KV-heuristic shift can't silently reclassify it.
+        assert_eq!(m.fit, FitVerdict::Tight);
+        assert!(m.est_ram_mb > 10649, "est {}", m.est_ram_mb);
     }
 
     #[test]
