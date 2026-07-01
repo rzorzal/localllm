@@ -160,6 +160,7 @@ fn route_decision(
     let has_cloud_creds =
         headers.contains_key("x-api-key") || headers.contains_key("authorization");
     let prompt_tokens = crate::route::estimate_prompt_tokens(internal);
+    let last_turn_tokens = crate::route::estimate_last_turn_tokens(internal);
     let active = state.manager.status().current;
     let local_capability_b = crate::catalog::active_params_b(&active.repo, &active.file);
     let signals = crate::route::Signals {
@@ -167,6 +168,7 @@ fn route_decision(
         local_ctx_window: state.local_ctx_window,
         n_tools: internal.tools.len(),
         n_messages: internal.messages.len(),
+        last_turn_tokens,
         has_cloud_creds,
         local_capability_b,
     };
@@ -181,11 +183,11 @@ fn route_decision(
     tracing::info!(
         target: "localllm::req",
         "{rid} route: {decision:?} score={score:.3} threshold={threshold:.3} \
-         (prompt_tok={prompt_tokens} ctx_window={} fill={:.2} tools={} msgs={} cap_b={local_capability_b:.1} creds={has_cloud_creds})",
+         (last_turn_tok={last_turn_tokens} msgs={} prompt_tok={prompt_tokens} ctx_window={} fill={:.2} tools={} cap_b={local_capability_b:.1} creds={has_cloud_creds})",
+        signals.n_messages,
         signals.local_ctx_window,
         if signals.local_ctx_window == 0 { 1.0 } else { (prompt_tokens as f64 / signals.local_ctx_window as f64).min(1.0) },
         signals.n_tools,
-        signals.n_messages,
     );
 
     (decision, prompt_tokens)
