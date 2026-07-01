@@ -125,12 +125,19 @@ enum Job {
 pub struct LlamaEngine {
     /// Channel sender to the worker thread. `std_mpsc::SyncSender` is `Send+Sync`.
     tx: std_mpsc::SyncSender<Job>,
+    /// The context length the worker actually created (after any fit clamp).
+    ctx_window: usize,
 }
 
 // SyncSender<Job> is Send+Sync (Job: Send via ChatRequest + tokio senders).
 // Auto-derivation is sound; no manual unsafe impls needed.
 
 impl LlamaEngine {
+    /// The context length the worker actually created (after any fit clamp).
+    pub fn ctx_window(&self) -> usize {
+        self.ctx_window
+    }
+
     /// Load a GGUF model from HuggingFace (or local cache), spawn the persistent
     /// worker thread, and return a ready-to-use `LlamaEngine`.
     ///
@@ -145,6 +152,7 @@ impl LlamaEngine {
         ctx_len: usize,
         kv_cache_type: KvCacheType,
         kv_cache_dir: Option<PathBuf>,
+        total_ram_mb: u64,
     ) -> Result<Self> {
         // Download (or skip if cached) and get local paths.
         let paths: Vec<PathBuf> =
@@ -164,7 +172,8 @@ impl LlamaEngine {
         let (tx, rx) = std_mpsc::sync_channel::<Job>(4);
 
         // Oneshot to receive the load result back from the worker thread.
-        let (load_tx, load_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+        // Carries the effective ctx after any fit clamp.
+        let (load_tx, load_rx) = tokio::sync::oneshot::channel::<Result<u32>>();
 
         // Compute a compact provenance tag for .kvstate filename validation.
         // Format: "{sanitized_model_id}-{kv_tag}-{ctx_len}"
@@ -184,19 +193,21 @@ impl LlamaEngine {
         // the provenance tag so a .kvstate saved by an older prompt format is
         // never warm-loaded against an incompatible new prompt (it would diff to
         // ~0 common and waste a load). Stable builds keep this constant → warm.
-        let provenance_prefix = format!("{}-{}-{}-pf{}", model_tag, kv_tag, ctx_len, PROMPT_FORMAT_VERSION);
+        // provenance_base excludes ctx — the worker appends -ctx{effective_ctx} after clamping.
+        let provenance_base = format!("{}-{}-pf{}", model_tag, kv_tag, PROMPT_FORMAT_VERSION);
 
         // Spawn the persistent worker thread. It owns backend + model + context.
         std::thread::spawn(move || {
-            worker_thread(path, ctx_len_u32, kv_cache_type, provenance_prefix, kv_cache_dir, rx, load_tx);
+            worker_thread(path, ctx_len_u32, kv_cache_type, provenance_base, kv_cache_dir, total_ram_mb, rx, load_tx);
         });
 
         // Wait for the worker to signal successful model load (or an error).
-        load_rx
+        // The worker sends back the effective context length after any fit clamp.
+        let effective_ctx = load_rx
             .await
             .context("worker thread dropped load channel without signalling")??;
 
-        Ok(LlamaEngine { tx })
+        Ok(LlamaEngine { tx, ctx_window: effective_ctx as usize })
     }
 }
 
@@ -283,10 +294,11 @@ fn worker_thread(
     model_path: PathBuf,
     ctx_len: u32,
     kv_cache_type: KvCacheType,
-    provenance_prefix: String,
+    provenance_base: String,
     kv_cache_dir: Option<PathBuf>,
+    total_ram_mb: u64,
     rx: std_mpsc::Receiver<Job>,
-    load_tx: tokio::sync::oneshot::Sender<Result<()>>,
+    load_tx: tokio::sync::oneshot::Sender<Result<u32>>,
 ) {
     // Route llama.cpp/ggml/Metal logs into tracing before anything loads, so
     // even backend/model-load diagnostics reach the file log.
@@ -306,6 +318,50 @@ fn worker_thread(
         Ok(m) => m,
         Err(e) => { let _ = load_tx.send(Err(e)); return; }
     };
+
+    // --- Fit the requested context to the device memory budget ---
+    // Compute the largest context that fits (weights + KV + compute headroom)
+    // and clamp the request down to it, instead of OOMing at decode time.
+    let n_head = model.n_head();
+    let head_dim = if n_head > 0 { model.n_embd() as u32 / n_head } else { 0 };
+    let kv_kind = match kv_cache_type {
+        KvCacheType::Q8_0 => crate::fit::KvKind::Q8,
+        KvCacheType::Q4_0 => crate::fit::KvKind::Q4,
+        _ => crate::fit::KvKind::F16,
+    };
+    let kv_per_token = crate::fit::kv_bytes_per_token(
+        model.n_layer(),
+        model.n_head_kv(),
+        head_dim,
+        kv_kind,
+    );
+    let weights_mb = std::fs::metadata(&model_path)
+        .map(|m| (m.len() / (1024 * 1024)) as u32)
+        .unwrap_or(0);
+    // n_gpu_layers is u32::MAX (all layers on GPU) → Metal budget applies.
+    let budget_mb = crate::fit::device_budget_mb(total_ram_mb, true);
+    let bounds = crate::fit::ctx_bounds(weights_mb, kv_per_token, budget_mb, model.n_ctx_train());
+    if bounds.max == 0 {
+        let _ = load_tx.send(Err(anyhow::anyhow!(
+            "model needs more memory than is available even at the minimum context \
+             (budget {budget_mb} MB, weights {weights_mb} MB): pick a smaller model or free RAM"
+        )));
+        return;
+    }
+    let effective_ctx = ctx_len.clamp(bounds.min, bounds.max);
+    if effective_ctx < ctx_len {
+        tracing::warn!(
+            target: "localllm::llama",
+            "ctx {ctx_len} → {effective_ctx} to fit memory budget \
+             (budget {budget_mb} MB, weights {weights_mb} MB, KV {kv_per_token} B/tok)",
+        );
+        crate::usage::notify(
+            "localllm — context reduced",
+            &format!("Context reduced to {effective_ctx} tokens to fit available memory."),
+        );
+    }
+    let provenance_prefix = format!("{provenance_base}-ctx{effective_ctx}");
+    let ctx_len = effective_ctx; // shadow: all downstream uses the fitted value
 
     // --- Create the ONE persistent context ---
     // Set n_batch = ctx_len so large prompts (e.g. 26k-token Claude Code prefix)
@@ -333,8 +389,8 @@ fn worker_thread(
         Err(e) => { let _ = load_tx.send(Err(e)); return; }
     };
 
-    // Signal successful load.
-    if load_tx.send(Ok(())).is_err() {
+    // Signal successful load, sending back the effective context length.
+    if load_tx.send(Ok(ctx_len)).is_err() {
         // Receiver already dropped; nothing to do.
         return;
     }
@@ -1183,12 +1239,19 @@ pub async fn run_smoke_test() -> Result<()> {
     use crate::api::common::{ChatMessage, ToolSpec};
 
     println!("[smoke] Loading Qwen2.5-3B via LlamaEngine …");
+    let total_ram_mb = {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory() / (1024 * 1024)
+    };
     let engine = LlamaEngine::load(
         "Qwen/Qwen2.5-3B-Instruct-GGUF",
         &["qwen2.5-3b-instruct-q4_k_m.gguf".to_string()],
         4096,
         KvCacheType::Q8_0,
         None, // no disk persistence for smoke test
+        total_ram_mb,
     )
     .await?;
 
