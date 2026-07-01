@@ -19,6 +19,10 @@ pub struct Signals {
     pub local_ctx_window: usize,
     pub n_tools: usize,
     pub n_messages: usize,
+    /// Estimated tokens in just the latest turn (the last message) — the
+    /// incremental ask, used as the difficulty signal instead of the whole
+    /// (mostly static/cached) prompt.
+    pub last_turn_tokens: usize,
     /// Whether the incoming request carries cloud credentials we can forward.
     pub has_cloud_creds: bool,
     /// Active local model's parameter size in billions (0.0 = unknown/neutral).
@@ -52,24 +56,26 @@ pub enum Decision {
     LocalNoCreds,
 }
 
+/// Tokens in the latest turn that count as a "full-difficulty" ask.
+const TURN_BUDGET_TOKENS: f64 = 2000.0;
+
 /// Cheap pre-generation difficulty score in `[0.0, 1.0]`. Higher means the
 /// request is harder/bigger and more likely to need the cloud model.
 ///
-/// Transparent heuristic blend (weights sum to 1.0); context fill dominates:
-/// - context fill: how full the local window is (prompt_tokens / window)
-/// - tool load: tool count, saturating at 12 (agentic complexity)
+/// Scored from the LATEST turn's size + conversation depth (weights sum to 1.0):
+/// - latest turn: the new ask, tokens / `TURN_BUDGET_TOKENS`, saturating at 1.0
 /// - depth: message count, saturating at 20 (long multi-turn is harder)
 ///
-/// A learned router could replace this later; the `decide` interface is unchanged.
+/// It deliberately ignores the total prompt size and the available-tool count.
+/// Those measure the *client's fixed overhead*, not task difficulty: Claude
+/// Code sends a ~26k static prefix and dozens of tools on every request, which
+/// made a trivial "ls" score as high as a big refactor and always route to
+/// cloud. Near-overflow is still handled separately by the hard context gate in
+/// `decide`; a local answer that comes back weak still escalates via cascade.
 pub fn difficulty_score(s: &Signals) -> f64 {
-    let ctx_fill = if s.local_ctx_window == 0 {
-        1.0
-    } else {
-        (s.prompt_tokens as f64 / s.local_ctx_window as f64).min(1.0)
-    };
-    let tool_load = (s.n_tools as f64 / 12.0).min(1.0);
+    let turn = (s.last_turn_tokens as f64 / TURN_BUDGET_TOKENS).min(1.0);
     let depth = (s.n_messages as f64 / 20.0).min(1.0);
-    0.6 * ctx_fill + 0.25 * tool_load + 0.15 * depth
+    0.8 * turn + 0.2 * depth
 }
 
 /// Capability adjustment to the escalation threshold: a stronger-than-7B local
@@ -136,20 +142,37 @@ pub fn is_weak_result(r: &crate::api::common::ChatResult) -> bool {
 pub fn estimate_prompt_tokens(req: &ChatRequest) -> usize {
     let mut chars = 0usize;
     for m in &req.messages {
-        if let Some(t) = &m.text {
-            chars += t.len();
-        }
-        for c in &m.tool_calls {
-            chars += c.name.len() + c.arguments.len();
-        }
-        if let Some(tr) = &m.tool_result {
-            chars += tr.content.len();
-        }
+        chars += message_chars(m);
     }
     for t in &req.tools {
         chars += t.name.len() + t.description.len() + t.parameters.to_string().len();
     }
     chars / 4
+}
+
+/// Character count of a single message's content (text + tool-call args +
+/// tool-result content).
+fn message_chars(m: &crate::api::common::ChatMessage) -> usize {
+    let mut chars = 0usize;
+    if let Some(t) = &m.text {
+        chars += t.len();
+    }
+    for c in &m.tool_calls {
+        chars += c.name.len() + c.arguments.len();
+    }
+    if let Some(tr) = &m.tool_result {
+        chars += tr.content.len();
+    }
+    chars
+}
+
+/// Estimate the tokens in just the latest turn (the last message). This is the
+/// difficulty signal — the incremental ask — NOT the whole prompt. Claude Code
+/// sends a ~26k static prefix + dozens of tools on every request; scoring the
+/// full prompt made a trivial "ls" look as hard as a large refactor. The last
+/// turn reflects the actual new work.
+pub fn estimate_last_turn_tokens(req: &ChatRequest) -> usize {
+    req.messages.last().map(|m| message_chars(m) / 4).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -167,6 +190,8 @@ mod tests {
             local_ctx_window: window,
             n_tools: 0,
             n_messages: 1,
+            // The whole prompt is one turn in these small fixtures.
+            last_turn_tokens: prompt_tokens,
             has_cloud_creds: has_creds,
             local_capability_b: 0.0,
         }
@@ -190,15 +215,16 @@ mod tests {
 
     #[test]
     fn high_difficulty_in_window_routes_cloud() {
-        // Balanced threshold 0.6; a nearly-full window pushes the score over it.
+        // Balanced threshold 0.6; a large NEW turn pushes the score over it.
         let p = Profile::Balanced.policy();
-        // 850/1000 = 0.85 ctx fill (under the 0.9 ctx_gate, so NOT overflow),
-        // score = 0.6*0.85 = 0.51 from ctx alone; add tools to clear 0.6.
+        // last_turn 1600 → turn 0.8 → 0.8*0.8 = 0.64; +depth ~0.01 → 0.65 > 0.6.
+        // The prompt still fits the window (no overflow gate).
         let s = Signals {
-            prompt_tokens: 850,
-            local_ctx_window: 1000,
+            prompt_tokens: 1600,
+            local_ctx_window: 32768,
             n_tools: 12,
             n_messages: 1,
+            last_turn_tokens: 1600,
             has_cloud_creds: true,
             local_capability_b: 0.0,
         };
@@ -207,18 +233,39 @@ mod tests {
 
     #[test]
     fn max_quality_routes_nontrivial_to_cloud() {
-        // MaxQuality threshold 0.2; a modest request clears it.
+        // MaxQuality threshold 0.2; a modest NEW turn clears it.
         let p = Profile::MaxQuality.policy();
         let s = Signals {
-            prompt_tokens: 400,
-            local_ctx_window: 1000,
+            prompt_tokens: 600,
+            local_ctx_window: 32768,
             n_tools: 0,
             n_messages: 1,
+            last_turn_tokens: 600,
             has_cloud_creds: true,
             local_capability_b: 0.0,
         };
-        // ctx_fill 0.4 → 0.6*0.4 = 0.24 > 0.2 → cloud.
+        // turn 600/2000 = 0.3 → 0.8*0.3 = 0.24 > 0.2 → cloud.
         assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::Difficulty));
+    }
+
+    #[test]
+    fn agentic_overhead_stays_local_when_new_turn_is_small() {
+        // The regression this heuristic fixes: a Claude-Code-shaped request — a
+        // huge static prefix (~26k tokens) filling most of the window and dozens
+        // of available tools — but a trivial new ask ("ls"). Must stay LOCAL on
+        // Balanced (the old ctx_fill+tool_count formula always sent this cloud).
+        let p = Profile::Balanced.policy();
+        let s = Signals {
+            prompt_tokens: 26000,
+            local_ctx_window: 32768, // fill 0.79 (under the 0.9 gate)
+            n_tools: 35,
+            n_messages: 7,
+            last_turn_tokens: 4, // "ls"
+            has_cloud_creds: true,
+            local_capability_b: 8.0,
+        };
+        // score = 0.8*(4/2000) + 0.2*(7/20) = 0.0016 + 0.07 ≈ 0.07 << threshold.
+        assert_eq!(decide(&s, &p), Decision::LocalThenCascade);
     }
 
     #[test]
@@ -232,17 +279,20 @@ mod tests {
     fn difficulty_score_is_low_for_trivial_and_high_for_full() {
         let trivial = Signals {
             prompt_tokens: 10, local_ctx_window: 1000, n_tools: 0,
-            n_messages: 1, has_cloud_creds: true, local_capability_b: 0.0,
+            n_messages: 1, last_turn_tokens: 10, has_cloud_creds: true, local_capability_b: 0.0,
         };
         let full = Signals {
-            prompt_tokens: 1000, local_ctx_window: 1000, n_tools: 12,
-            n_messages: 20, has_cloud_creds: true, local_capability_b: 0.0,
+            prompt_tokens: 2000, local_ctx_window: 32768, n_tools: 12,
+            n_messages: 20, last_turn_tokens: 2000, has_cloud_creds: true, local_capability_b: 0.0,
         };
         assert!(difficulty_score(&trivial) < 0.1);
         assert!(difficulty_score(&full) > 0.95);
-        // monotonic in tool count
-        let more_tools = Signals { n_tools: 6, ..trivial };
-        assert!(difficulty_score(&more_tools) > difficulty_score(&trivial));
+        // monotonic in the size of the latest turn
+        let bigger_turn = Signals { last_turn_tokens: 800, ..trivial };
+        assert!(difficulty_score(&bigger_turn) > difficulty_score(&trivial));
+        // NOT sensitive to available-tool count (that's client overhead)
+        let more_tools = Signals { n_tools: 30, ..trivial };
+        assert_eq!(difficulty_score(&more_tools), difficulty_score(&trivial));
     }
 
     #[test]
@@ -283,11 +333,26 @@ mod tests {
         assert_eq!(estimate_prompt_tokens(&req), 100);
     }
 
-    // A request scoring ~0.55: ctx 700/1000=0.7→0.42, 6 tools→0.125, 1 msg→~0.0075.
+    #[test]
+    fn last_turn_tokens_counts_only_the_final_message() {
+        let msg = |s: &str| ChatMessage {
+            role: Role::User, text: Some(s.to_string()), tool_calls: vec![], tool_result: None,
+        };
+        let req = ChatRequest {
+            messages: vec![msg(&"a".repeat(40000)), msg("run ls")], // huge prefix, tiny last turn
+            tools: vec![],
+            max_tokens: None, temperature: None, stream: false, model: "m".into(),
+        };
+        // Only the last message ("run ls", 6 chars) counts → 1 token, not the 40k prefix.
+        assert_eq!(estimate_last_turn_tokens(&req), 6 / 4);
+        assert!(estimate_prompt_tokens(&req) > 9000); // prompt is huge, but the turn is tiny
+    }
+
+    // A request scoring ~0.55: last_turn 1350/2000=0.675→0.8*0.675=0.54, 1 msg→~0.01.
     fn mid_sig(cap: f32) -> Signals {
         Signals {
-            prompt_tokens: 700, local_ctx_window: 1000, n_tools: 6,
-            n_messages: 1, has_cloud_creds: true, local_capability_b: cap,
+            prompt_tokens: 1350, local_ctx_window: 32768, n_tools: 6,
+            n_messages: 1, last_turn_tokens: 1350, has_cloud_creds: true, local_capability_b: cap,
         }
     }
 
@@ -301,13 +366,13 @@ mod tests {
         assert_eq!(decide(&mid_sig(3.0), &p), Decision::Cloud(RouteReason::Difficulty));
     }
 
-    // A request scoring ~0.615: ctx 700/1000=0.7→0.42, 9 tools→0.1875, 1 msg→~0.0075.
+    // A request scoring ~0.65: last_turn 1600/2000=0.8→0.8*0.8=0.64, 1 msg→~0.01.
     // This sits ABOVE the 7B/neutral threshold (0.60) but BELOW the 14B one (0.81),
     // so a strong model is what flips it Cloud→Local.
     fn high_sig(cap: f32) -> Signals {
         Signals {
-            prompt_tokens: 700, local_ctx_window: 1000, n_tools: 9,
-            n_messages: 1, has_cloud_creds: true, local_capability_b: cap,
+            prompt_tokens: 1600, local_ctx_window: 32768, n_tools: 9,
+            n_messages: 1, last_turn_tokens: 1600, has_cloud_creds: true, local_capability_b: cap,
         }
     }
 
@@ -324,7 +389,7 @@ mod tests {
     fn capability_never_overrides_context_gate() {
         // Over-window even with a huge model → still ContextOverflow.
         let s = Signals { prompt_tokens: 5000, local_ctx_window: 1000, n_tools: 0,
-            n_messages: 1, has_cloud_creds: true, local_capability_b: 32.0 };
+            n_messages: 1, last_turn_tokens: 5000, has_cloud_creds: true, local_capability_b: 32.0 };
         assert_eq!(decide(&s, &Profile::SaveTokens.policy()), Decision::Cloud(RouteReason::ContextOverflow));
     }
 
