@@ -235,7 +235,10 @@ async function doSwitch(m, wrap) {
   startPolling(fill, phase);
 }
 
-function startPolling(fill, phase) {
+// Polls the switch/reload status. `onDone(s)` (optional) overrides the default
+// terminal behaviour (toast "Model switched" + navigate to families) so a ctx
+// reload can keep the user on the detail pane with its own message.
+function startPolling(fill, phase, onDone) {
   stopPolling();
   pollTimer = setInterval(async () => {
     const s = await refreshStatusHeader();
@@ -244,9 +247,10 @@ function startPolling(fill, phase) {
     if (phase) phase.textContent = `${s.phase} — ${s.progress || 0}%`;
     if (s.state !== "switching") {
       stopPolling();
+      await refresh().catch(() => {});
+      if (onDone) { onDone(s); return; }
       if (s.state === "error") toast(s.error || "switch failed", true);
       else toast("Model switched");
-      await refresh().catch(() => {});
       renderFamilies();
     }
   }, 1000);
@@ -267,7 +271,10 @@ async function saveCtx(m, ctx, wrap) {
     const bar = el("div", "bar"); const fill = el("div", "fill"); bar.append(fill);
     const phase = el("div", "phase", "reloading…");
     prog.append(bar, phase); wrap.append(prog);
-    startPolling(fill, phase);
+    startPolling(fill, phase, (s) => {
+      toast(s.state === "error" ? (s.error || "reload failed") : "Contexto aplicado", s.state === "error");
+      currentView();
+    });
   } else {
     toast(res && res.cleared ? "Voltou ao padrão" : "Contexto salvo");
     await refresh().catch(() => {});
