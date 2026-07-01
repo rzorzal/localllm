@@ -196,9 +196,12 @@ function renderDetail(fam, m) {
     const defBtn = el("button", "btn", `Usar padrão (${m.ctx_default})`);
     const valid = () => {
       const v = Number(input.value);
-      return Number.isInteger(v) && v >= m.ctx_min && v <= m.ctx_max && v !== m.ctx_current;
+      return Number.isInteger(v) && v >= m.ctx_min && v <= m.ctx_max
+        && v % 256 === 0 && v !== m.ctx_current;
     };
     saveBtn.disabled = true;
+    // Already on the default → nothing to reset.
+    defBtn.disabled = m.ctx_current === m.ctx_default;
     input.oninput = () => { saveBtn.disabled = !valid(); };
     saveBtn.onclick = () => saveCtx(m, Number(input.value), wrap);
     defBtn.onclick = () => saveCtx(m, 0, wrap);
