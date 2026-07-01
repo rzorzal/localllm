@@ -54,7 +54,7 @@ pub fn max_ctx_fit(weights_mb: u32, kv_per_token_bytes: u64, budget_mb: u32, n_c
         return 0;
     }
     let avail_bytes = avail_mb as u64 * 1024 * 1024;
-    let by_mem = (avail_bytes / kv_per_token_bytes) as u64;
+    let by_mem = avail_bytes / kv_per_token_bytes;
     let cap = by_mem.min(n_ctx_train as u64).min(GLOBAL_MAX_CTX as u64);
     let rounded = (cap / 256) * 256; // floor to a multiple of 256
     if rounded < MIN_CTX as u64 {
