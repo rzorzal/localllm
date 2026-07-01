@@ -74,7 +74,17 @@ pub async fn run_server_with_ready_policy_token(
 
     tracing::info!("loading model {} (backend={:?})…", cfg.model_id, cfg.backend);
 
-    let engine: Arc<dyn Generator> = match cfg.backend {
+    let total_ram_mb = {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory() / (1024 * 1024) // bytes → MB
+    };
+    if total_ram_mb == 0 {
+        tracing::warn!("sysinfo reported 0 total RAM; catalog fit verdicts will use budget=0");
+    }
+
+    let (engine, effective_ctx): (Arc<dyn Generator>, usize) = match cfg.backend {
         Backend::Llama => {
             let kv_cache_type = cfg.llama_kv_cache_type();
             let kv_cache_dir = cfg.resolved_kv_cache_dir();
@@ -84,18 +94,22 @@ pub async fn run_server_with_ready_policy_token(
                 kv_cache_dir,
                 cfg.no_kv_persist
             );
-            Arc::new(
-                LlamaEngine::load(
-                    &cfg.model_id,
-                    &cfg.gguf_files,
-                    cfg.ctx_len,
-                    kv_cache_type,
-                    kv_cache_dir,
-                )
-                .await?,
+            let llama = LlamaEngine::load(
+                &cfg.model_id,
+                &cfg.gguf_files,
+                cfg.ctx_len,
+                kv_cache_type,
+                kv_cache_dir,
+                total_ram_mb,
             )
+            .await?;
+            let eff = llama.ctx_window();
+            (Arc::new(llama) as Arc<dyn Generator>, eff)
         }
-        Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
+        Backend::Mistralrs => (
+            Arc::new(Engine::load(&cfg.engine_config()).await?) as Arc<dyn Generator>,
+            cfg.ctx_len,
+        ),
     };
 
     crate::usage::enable_notifications();
@@ -113,6 +127,7 @@ pub async fn run_server_with_ready_policy_token(
     let b_ctx_len = cfg.ctx_len;
     let b_kv_type = cfg.llama_kv_cache_type();
     let b_kv_dir = cfg.resolved_kv_cache_dir();
+    let b_total_ram_mb = total_ram_mb;
     let manager_slot: Arc<std::sync::OnceLock<std::sync::Weak<ModelManager>>> =
         Arc::new(std::sync::OnceLock::new());
     let slot_for_builder = manager_slot.clone();
@@ -136,7 +151,7 @@ pub async fn run_server_with_ready_policy_token(
             )
             .await?;
             let engine =
-                LlamaEngine::load(&spec.repo, &[spec.file], b_ctx_len, b_kv_type, kv_dir).await?;
+                LlamaEngine::load(&spec.repo, &[spec.file], b_ctx_len, b_kv_type, kv_dir, b_total_ram_mb).await?;
             Ok(Arc::new(engine) as Arc<dyn Generator>)
         })
     });
@@ -149,21 +164,11 @@ pub async fn run_server_with_ready_policy_token(
 
     crate::server::write_admin_token_file(&admin_token);
 
-    let total_ram_mb = {
-        use sysinfo::System;
-        let mut sys = System::new();
-        sys.refresh_memory();
-        sys.total_memory() / (1024 * 1024) // bytes → MB
-    };
-    if total_ram_mb == 0 {
-        tracing::warn!("sysinfo reported 0 total RAM; catalog fit verdicts will use budget=0");
-    }
-
     let app = router(
         manager,
         cfg.model_id.clone(),
         policy,
-        cfg.ctx_len,
+        effective_ctx,
         usage,
         cfg.cloud_token_alert,
         admin_token.clone(),
