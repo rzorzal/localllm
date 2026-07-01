@@ -5,6 +5,7 @@ pub mod config;
 pub mod download;
 pub mod engine;
 pub mod engine_llama;
+pub mod fit;
 pub mod model_manager;
 pub mod route;
 pub mod settings;
