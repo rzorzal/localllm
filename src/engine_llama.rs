@@ -230,6 +230,26 @@ fn init_llama_logging() {
     });
 }
 
+/// The process-wide llama.cpp backend, initialized exactly once and shared by
+/// every worker thread.
+///
+/// `LlamaBackend::init()` flips a global `AtomicBool` and errors with
+/// `BackendAlreadyInitialized` on any second call; its `Drop` flips it back.
+/// Initializing (and owning) the backend per worker made a model **switch**
+/// fail: the new model's worker calls `init()` while the previous model's
+/// backend is still alive (its worker thread tears down asynchronously) →
+/// `BackendAlreadyInitialized` → "model switch failed". A single never-dropped
+/// backend removes the second `init()` entirely, so switching just works.
+/// `LlamaBackend` is a zero-sized marker (Send + Sync); `get_or_init` guarantees
+/// the single `init()` call across threads.
+fn shared_backend() -> &'static LlamaBackend {
+    use std::sync::OnceLock;
+    static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+    BACKEND.get_or_init(|| {
+        LlamaBackend::init().expect("llama backend init (once, process-global)")
+    })
+}
+
 /// Build the context params for a given context length + KV type. Extracted so
 /// the worker can rebuild an identical context during error recovery.
 ///
@@ -304,15 +324,12 @@ fn worker_thread(
     // even backend/model-load diagnostics reach the file log.
     init_llama_logging();
 
-    // --- Init backend ---
-    let backend = match LlamaBackend::init().context("LlamaBackend::init failed") {
-        Ok(b) => b,
-        Err(e) => { let _ = load_tx.send(Err(e)); return; }
-    };
+    // --- Backend (process-global, shared; see shared_backend) ---
+    let backend = shared_backend();
 
     // --- Load model ---
     let model_params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
-    let model = match LlamaModel::load_from_file(&backend, &model_path, &model_params)
+    let model = match LlamaModel::load_from_file(backend, &model_path, &model_params)
         .context("LlamaModel::load_from_file failed")
     {
         Ok(m) => m,
@@ -382,7 +399,7 @@ fn worker_thread(
         ctx_len,
     );
     let ctx_params = make_ctx_params(ctx_len, kv_cache_type);
-    let mut ctx = match model.new_context(&backend, ctx_params)
+    let mut ctx = match model.new_context(backend, ctx_params)
         .context("new_context failed")
     {
         Ok(c) => c,
@@ -471,7 +488,7 @@ fn worker_thread(
                             target: "localllm::llama",
                             "inference panicked — rebuilding context, continuing worker",
                         );
-                        recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                        recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                         Err(anyhow::anyhow!("inference panicked"))
                     }
                 };
@@ -492,7 +509,7 @@ fn worker_thread(
                 // On error, rebuild the context so the next request starts on a
                 // fresh backend (a Metal OOM leaves it unrecoverable otherwise).
                 if chat_result.is_err() {
-                    recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                    recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                 }
                 let _ = reply.send(chat_result);
             }
@@ -527,14 +544,14 @@ fn worker_thread(
                             target: "localllm::llama",
                             "inference panicked (stream) — rebuilding context, continuing worker",
                         );
-                        recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                        recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                         Err(anyhow::anyhow!("inference panicked"))
                     }
                 };
                 // On error, rebuild the context so the next request starts on a
                 // fresh backend (a Metal OOM leaves it unrecoverable otherwise).
                 if result.is_err() {
-                    recover_context(&model, &backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                    recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
                 }
                 // Terminal delta.
                 match result {
@@ -785,9 +802,9 @@ pub async fn dump_prompt(
         .context("ensure_model failed")?;
     let path = paths.into_iter().next().context("no model path")?;
     init_llama_logging();
-    let backend = LlamaBackend::init().context("LlamaBackend::init failed")?;
+    let backend = shared_backend();
     let model = LlamaModel::load_from_file(
-        &backend,
+        backend,
         &path,
         &LlamaModelParams::default().with_n_gpu_layers(u32::MAX),
     )
