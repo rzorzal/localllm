@@ -101,3 +101,40 @@ body {
   padding: 12px 18px; box-shadow: var(--shadow); max-width: 80%;
 }
 .toast.err { border-color: rgba(248,81,73,.5); color: var(--red); }
+
+.ctxbox {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.ctxtitle {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.ctxrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ctxinput {
+  width: 8em;
+  padding: 6px 8px;
+  font: inherit;
+  background: var(--panel-2);
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.ctxbounds {
+  opacity: 0.7;
+  font-size: 0.9em;
+}
+.ctxhint {
+  opacity: 0.6;
+  font-size: 0.85em;
+  margin: 6px 0 10px;
+}
+.ctxnote {
+  opacity: 0.7;
+  font-style: italic;
+}

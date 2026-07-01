@@ -155,6 +155,7 @@ fn route_decision(
     state: &AppState,
     internal: &ChatRequest,
     headers: &axum::http::HeaderMap,
+    rid: &str,
 ) -> (crate::route::Decision, usize) {
     let has_cloud_creds =
         headers.contains_key("x-api-key") || headers.contains_key("authorization");
@@ -170,7 +171,24 @@ fn route_decision(
         local_capability_b,
     };
     let policy = *state.policy.read().unwrap();
-    (crate::route::decide(&signals, &policy), prompt_tokens)
+    let decision = crate::route::decide(&signals, &policy);
+
+    // Log WHY this decision was made: the difficulty score and its inputs, the
+    // capability-adjusted threshold, and the outcome — so the log explains each
+    // local-vs-cloud choice.
+    let score = crate::route::difficulty_score(&signals);
+    let threshold = crate::route::effective_threshold(&policy, local_capability_b);
+    tracing::info!(
+        target: "localllm::req",
+        "{rid} route: {decision:?} score={score:.3} threshold={threshold:.3} \
+         (prompt_tok={prompt_tokens} ctx_window={} fill={:.2} tools={} msgs={} cap_b={local_capability_b:.1} creds={has_cloud_creds})",
+        signals.local_ctx_window,
+        if signals.local_ctx_window == 0 { 1.0 } else { (prompt_tokens as f64 / signals.local_ctx_window as f64).min(1.0) },
+        signals.n_tools,
+        signals.n_messages,
+    );
+
+    (decision, prompt_tokens)
 }
 
 /// Record a successful cloud call and fire the one-shot high-usage alert if the
@@ -320,6 +338,10 @@ pub struct AppState {
     pub admin_token: Arc<str>,
     /// Total physical RAM in MB (read once at startup), for catalog fit/recommend.
     pub total_ram_mb: u64,
+    /// Requested context ceiling passed to catalog_view for per-model ctx bounds.
+    pub requested_ctx_ceiling: u32,
+    /// KV cache kind used for catalog RAM estimates.
+    pub kv_kind: crate::fit::KvKind,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -354,6 +376,8 @@ pub fn router(
     cloud_token_alert: usize,
     admin_token: Arc<str>,
     total_ram_mb: u64,
+    requested_ctx_ceiling: u32,
+    kv_kind: crate::fit::KvKind,
 ) -> Router {
     let state = Arc::new(AppState {
         manager,
@@ -364,6 +388,8 @@ pub fn router(
         cloud_token_alert,
         admin_token,
         total_ram_mb,
+        requested_ctx_ceiling,
+        kv_kind,
     });
     // Large prompts must reach the routing layer to be forwarded to cloud;
     // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
@@ -376,6 +402,7 @@ pub fn router(
         .route("/health", get(handle_health))
         .route("/admin/model", post(handle_admin_switch))
         .route("/admin/model/status", get(handle_admin_status))
+        .route("/admin/model/ctx", post(handle_model_set_ctx))
         .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
@@ -409,6 +436,13 @@ fn check_admin(headers: &HeaderMap, state: &AppState) -> Option<axum::response::
 struct AdminSwitchBody {
     repo: String,
     file: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AdminCtxBody {
+    repo: String,
+    file: String,
+    ctx: u32,
 }
 
 /// A model `file` must be a bare filename (no path components), so it can never
@@ -478,8 +512,11 @@ async fn handle_models_catalog(
     let view = crate::catalog::catalog_view(
         crate::catalog::CATALOG,
         state.total_ram_mb,
+        state.requested_ctx_ceiling,
+        state.kv_kind,
         Some(&active),
         |r, f| crate::download::cache_path(r, f).exists(),
+        |r, f| crate::settings::load_model_ctx(&crate::settings::model_ctx_key(r, f)),
     );
     Json(view).into_response()
 }
@@ -520,6 +557,67 @@ async fn handle_model_delete(
             Json(json!({"error": format!("delete failed: {e}")})),
         )
             .into_response(),
+    }
+}
+
+/// POST /admin/model/ctx — set (or clear, ctx=0) a model's per-model context.
+/// Validates against the model's [min,max]; reloads the model if it is active.
+async fn handle_model_set_ctx(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: AdminCtxBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    if body.repo.is_empty() || !is_safe_model_file(&body.file) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and a valid (non-path) file are required"}))).into_response();
+    }
+    let Some(entry) = crate::catalog::CATALOG.iter().find(|e| e.repo == body.repo && e.file == body.file) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown model"}))).into_response();
+    };
+
+    let key = crate::settings::model_ctx_key(&body.repo, &body.file);
+    let cleared = body.ctx == 0;
+    if cleared {
+        if let Err(e) = crate::settings::clear_model_ctx(&key) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    } else {
+        let budget_mb = crate::fit::device_budget_mb(state.total_ram_mb, true);
+        let kv_per_token = crate::fit::est_kv_bytes_per_token(entry.params_b, state.kv_kind);
+        let bounds = crate::fit::ctx_bounds(entry.size_mb, kv_per_token, budget_mb, entry.ctx_train);
+        if bounds.max == 0 || body.ctx < bounds.min || body.ctx > bounds.max {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": format!("ctx must be in the range {}..{}", bounds.min, bounds.max)
+            }))).into_response();
+        }
+        if let Err(e) = crate::settings::save_model_ctx(&key, body.ctx) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    }
+
+    // Reload if this is the active model so the new ctx takes effect now.
+    let active = state.manager.status().current;
+    if active.repo == body.repo && active.file == body.file {
+        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file };
+        match state.manager.start_switch(spec) {
+            Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
+            Err(crate::model_manager::SwitchError::AlreadySwitching) => {
+                (StatusCode::CONFLICT, Json(json!({"error": "a switch is already in progress"}))).into_response()
+            }
+        }
+    } else if cleared {
+        (StatusCode::OK, Json(json!({"cleared": true}))).into_response()
+    } else {
+        (StatusCode::OK, Json(json!({"saved": true}))).into_response()
     }
 }
 
@@ -575,7 +673,7 @@ async fn handle_oai_chat(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
@@ -751,7 +849,7 @@ async fn handle_oai_responses(
             Json(json!({"error": "model switching, retry shortly"}))).into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [responses] route=cloud reason={reason:?}");
@@ -856,7 +954,7 @@ async fn handle_anth_messages(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");

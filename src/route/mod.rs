@@ -72,6 +72,23 @@ pub fn difficulty_score(s: &Signals) -> f64 {
     0.6 * ctx_fill + 0.25 * tool_load + 0.15 * depth
 }
 
+/// Capability adjustment to the escalation threshold: a stronger-than-7B local
+/// model raises the cutoff (keeps more local), a weaker one lowers it (more
+/// cloud). Unknown capability (`0.0`) is neutral. Clamped to ±0.3.
+pub fn capability_adjustment(cap_b: f32) -> f64 {
+    if cap_b > 0.0 {
+        ((cap_b - 7.0) as f64 * 0.03).clamp(-0.3, 0.3)
+    } else {
+        0.0
+    }
+}
+
+/// The profile's escalation threshold after the capability adjustment, clamped
+/// to `[0, 1]`. A request whose difficulty score exceeds this goes to cloud.
+pub fn effective_threshold(p: &RoutingPolicy, cap_b: f32) -> f64 {
+    (p.escalation_threshold + capability_adjustment(cap_b)).clamp(0.0, 1.0)
+}
+
 /// Decide where a request runs from cheap signals and the active policy.
 ///
 /// Order: (1) hard context gate, (2) cloud-impossible shortcut, (3) difficulty
@@ -93,15 +110,7 @@ pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
     }
 
     // 3. Difficulty above the *capability-adjusted* threshold → cloud now.
-    //    Weaker local model (cap < 7B) lowers the cutoff (more cloud); stronger
-    //    (cap > 7B) raises it (more local); unknown (0.0) → no change.
-    let adj = if s.local_capability_b > 0.0 {
-        ((s.local_capability_b - 7.0) as f64 * 0.03).clamp(-0.3, 0.3)
-    } else {
-        0.0
-    };
-    let effective_threshold = (p.escalation_threshold + adj).clamp(0.0, 1.0);
-    if difficulty_score(s) > effective_threshold {
+    if difficulty_score(s) > effective_threshold(p, s.local_capability_b) {
         return Decision::Cloud(RouteReason::Difficulty);
     }
 

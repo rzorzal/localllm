@@ -37,9 +37,17 @@ struct MainArgs {
 fn main() -> anyhow::Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-    // Respect RUST_LOG when set; otherwise default to info for our crate.
+    // Respect RUST_LOG when set; otherwise default to info for our crate plus
+    // the llama.cpp/ggml/Metal backend (routed into tracing via
+    // send_logs_to_tracing), so the file log captures the real backend
+    // diagnostics — buffer sizes, KV allocation, and errors like Metal
+    // "Insufficient Memory" — not just our generic wrapper messages.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("localllm=info,mistralrs_core=info"));
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "localllm=info,mistralrs_core=info,llama-cpp-2=info",
+            )
+        });
 
     // Always mirror logs to a file so the tray app (which has no terminal) can
     // be inspected. Path overridable via LOCALLLM_LOG; default /tmp/localllm.log.

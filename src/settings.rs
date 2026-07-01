@@ -26,6 +26,8 @@ struct Settings {
     profile: Profile,
     #[serde(default)]
     integrations: IntegrationState,
+    #[serde(default)]
+    model_ctx: std::collections::BTreeMap<String, u32>,
 }
 
 /// Resolve the settings file path. `LOCALLLM_SETTINGS` (full file path) wins;
@@ -89,6 +91,30 @@ pub fn load_integrations() -> IntegrationState {
 pub fn save_integrations(state: &IntegrationState) -> anyhow::Result<()> {
     let mut s = load_settings();
     s.integrations = state.clone();
+    save_settings(&s)
+}
+
+/// Settings key for a model's per-model ctx override: `"{repo}/{file}"`.
+pub fn model_ctx_key(repo: &str, file: &str) -> String {
+    format!("{repo}/{file}")
+}
+
+/// Load a model's persisted ctx override, or `None` if unset.
+pub fn load_model_ctx(key: &str) -> Option<u32> {
+    load_settings().model_ctx.get(key).copied()
+}
+
+/// Persist a model's ctx override, preserving the rest of settings.
+pub fn save_model_ctx(key: &str, ctx: u32) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.model_ctx.insert(key.to_string(), ctx);
+    save_settings(&s)
+}
+
+/// Remove a model's ctx override, preserving the rest of settings.
+pub fn clear_model_ctx(key: &str) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.model_ctx.remove(key);
     save_settings(&s)
 }
 
@@ -196,6 +222,41 @@ mod tests {
     fn load_integrations_missing_returns_default() {
         with_temp_settings(|| {
             assert_eq!(load_integrations(), IntegrationState::default());
+        });
+    }
+
+    #[test]
+    fn model_ctx_round_trip() {
+        with_temp_settings(|| {
+            let k = model_ctx_key("bartowski/phi-4-GGUF", "phi-4-Q4_K_M.gguf");
+            assert_eq!(k, "bartowski/phi-4-GGUF/phi-4-Q4_K_M.gguf");
+            assert_eq!(load_model_ctx(&k), None);
+            save_model_ctx(&k, 16384).unwrap();
+            assert_eq!(load_model_ctx(&k), Some(16384));
+        });
+    }
+
+    #[test]
+    fn saving_model_ctx_preserves_profile_and_integrations() {
+        with_temp_settings(|| {
+            save_profile(Profile::MaxQuality).unwrap();
+            let state = IntegrationState { enabled: true, priors: Default::default() };
+            save_integrations(&state).unwrap();
+            save_model_ctx("r/f", 8192).unwrap();
+            assert_eq!(load_profile(), Profile::MaxQuality);
+            assert!(load_integrations().enabled);
+            assert_eq!(load_model_ctx("r/f"), Some(8192));
+        });
+    }
+
+    #[test]
+    fn clear_model_ctx_removes_only_that_key() {
+        with_temp_settings(|| {
+            save_model_ctx("a/1", 4096).unwrap();
+            save_model_ctx("b/2", 8192).unwrap();
+            clear_model_ctx("a/1").unwrap();
+            assert_eq!(load_model_ctx("a/1"), None);
+            assert_eq!(load_model_ctx("b/2"), Some(8192));
         });
     }
 }

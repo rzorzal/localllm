@@ -5,6 +5,7 @@ pub mod config;
 pub mod download;
 pub mod engine;
 pub mod engine_llama;
+pub mod fit;
 pub mod model_manager;
 pub mod route;
 pub mod settings;
@@ -73,7 +74,17 @@ pub async fn run_server_with_ready_policy_token(
 
     tracing::info!("loading model {} (backend={:?})…", cfg.model_id, cfg.backend);
 
-    let engine: Arc<dyn Generator> = match cfg.backend {
+    let total_ram_mb = {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory() / (1024 * 1024) // bytes → MB
+    };
+    if total_ram_mb == 0 {
+        tracing::warn!("sysinfo reported 0 total RAM; catalog fit verdicts will use budget=0");
+    }
+
+    let (engine, effective_ctx): (Arc<dyn Generator>, usize) = match cfg.backend {
         Backend::Llama => {
             let kv_cache_type = cfg.llama_kv_cache_type();
             let kv_cache_dir = cfg.resolved_kv_cache_dir();
@@ -83,18 +94,25 @@ pub async fn run_server_with_ready_policy_token(
                 kv_cache_dir,
                 cfg.no_kv_persist
             );
-            Arc::new(
-                LlamaEngine::load(
-                    &cfg.model_id,
-                    &cfg.gguf_files,
-                    cfg.ctx_len,
-                    kv_cache_type,
-                    kv_cache_dir,
-                )
-                .await?,
+            let requested_ctx = crate::settings::load_model_ctx(
+                &crate::settings::model_ctx_key(&cfg.model_id, &cfg.gguf_files[0]),
+            ).unwrap_or(cfg.ctx_len as u32) as usize;
+            let llama = LlamaEngine::load(
+                &cfg.model_id,
+                &cfg.gguf_files,
+                requested_ctx,
+                kv_cache_type,
+                kv_cache_dir,
+                total_ram_mb,
             )
+            .await?;
+            let eff = llama.ctx_window();
+            (Arc::new(llama) as Arc<dyn Generator>, eff)
         }
-        Backend::Mistralrs => Arc::new(Engine::load(&cfg.engine_config()).await?),
+        Backend::Mistralrs => (
+            Arc::new(Engine::load(&cfg.engine_config()).await?) as Arc<dyn Generator>,
+            cfg.ctx_len,
+        ),
     };
 
     crate::usage::enable_notifications();
@@ -112,6 +130,7 @@ pub async fn run_server_with_ready_policy_token(
     let b_ctx_len = cfg.ctx_len;
     let b_kv_type = cfg.llama_kv_cache_type();
     let b_kv_dir = cfg.resolved_kv_cache_dir();
+    let b_total_ram_mb = total_ram_mb;
     let manager_slot: Arc<std::sync::OnceLock<std::sync::Weak<ModelManager>>> =
         Arc::new(std::sync::OnceLock::new());
     let slot_for_builder = manager_slot.clone();
@@ -134,8 +153,11 @@ pub async fn run_server_with_ready_policy_token(
                 },
             )
             .await?;
+            let requested_ctx = crate::settings::load_model_ctx(
+                &crate::settings::model_ctx_key(&spec.repo, &spec.file),
+            ).unwrap_or(b_ctx_len as u32) as usize;
             let engine =
-                LlamaEngine::load(&spec.repo, &[spec.file], b_ctx_len, b_kv_type, kv_dir).await?;
+                LlamaEngine::load(&spec.repo, &[spec.file], requested_ctx, b_kv_type, kv_dir, b_total_ram_mb).await?;
             Ok(Arc::new(engine) as Arc<dyn Generator>)
         })
     });
@@ -148,25 +170,21 @@ pub async fn run_server_with_ready_policy_token(
 
     crate::server::write_admin_token_file(&admin_token);
 
-    let total_ram_mb = {
-        use sysinfo::System;
-        let mut sys = System::new();
-        sys.refresh_memory();
-        sys.total_memory() / (1024 * 1024) // bytes → MB
-    };
-    if total_ram_mb == 0 {
-        tracing::warn!("sysinfo reported 0 total RAM; catalog fit verdicts will use budget=0");
-    }
-
     let app = router(
         manager,
         cfg.model_id.clone(),
         policy,
-        cfg.ctx_len,
+        effective_ctx,
         usage,
         cfg.cloud_token_alert,
         admin_token.clone(),
         total_ram_mb,
+        cfg.ctx_len as u32,
+        match cfg.kv_type {
+            crate::config::KvType::Q8 => crate::fit::KvKind::Q8,
+            crate::config::KvType::Q4 => crate::fit::KvKind::Q4,
+            crate::config::KvType::F16 => crate::fit::KvKind::F16,
+        },
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
@@ -314,6 +332,8 @@ pub fn router_for_test_with(
         200_000,
         Arc::from("test-token"),
         16384,
+        32768,
+        crate::fit::KvKind::Q8,
     )
 }
 
