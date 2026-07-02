@@ -48,6 +48,8 @@ struct Settings {
     model_ctx: std::collections::BTreeMap<String, u32>,
     #[serde(default)]
     model_profiles: std::collections::BTreeMap<String, ExecProfile>,
+    #[serde(default)]
+    tool_filters: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Resolve the settings file path. `LOCALLLM_SETTINGS` (full file path) wins;
@@ -166,6 +168,22 @@ pub fn clear_model_ctx(key: &str) -> anyhow::Result<()> {
     let mut p = load_model_profile(key);
     p.ctx = None;
     save_model_profile(key, &p)
+}
+
+/// Load a surface's disabled-tool blocklist, or an empty list if unset.
+pub fn load_tool_filter(surface: &str) -> Vec<String> {
+    load_settings().tool_filters.get(surface).cloned().unwrap_or_default()
+}
+
+/// Persist a surface's blocklist (empty list clears it), preserving the rest.
+pub fn save_tool_filter(surface: &str, disabled: &[String]) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    if disabled.is_empty() {
+        s.tool_filters.remove(surface);
+    } else {
+        s.tool_filters.insert(surface.to_string(), disabled.to_vec());
+    }
+    save_settings(&s)
 }
 
 #[cfg(test)]
@@ -358,6 +376,30 @@ mod tests {
             let p = ExecProfile { quant: Some("Q5_K_M".into()), ..Default::default() };
             save_model_profile(&k, &p).unwrap();
             assert_eq!(load_model_profile(&k).quant, Some("Q5_K_M".to_string()));
+        });
+    }
+
+    #[test]
+    fn tool_filter_round_trips_and_clears() {
+        with_temp_settings(|| {
+            assert!(load_tool_filter("anthropic").is_empty());
+            save_tool_filter("anthropic", &["Read".to_string(), "Glob".to_string()]).unwrap();
+            assert_eq!(load_tool_filter("anthropic"), vec!["Read".to_string(), "Glob".to_string()]);
+            // other surface unaffected
+            assert!(load_tool_filter("openai").is_empty());
+            // empty list clears
+            save_tool_filter("anthropic", &[]).unwrap();
+            assert!(load_tool_filter("anthropic").is_empty());
+        });
+    }
+
+    #[test]
+    fn saving_tool_filter_preserves_profile() {
+        with_temp_settings(|| {
+            save_profile(Profile::MaxQuality).unwrap();
+            save_tool_filter("openai", &["Foo".to_string()]).unwrap();
+            assert_eq!(load_profile(), Profile::MaxQuality);
+            assert_eq!(load_tool_filter("openai"), vec!["Foo".to_string()]);
         });
     }
 }
