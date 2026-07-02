@@ -460,6 +460,8 @@ fn check_admin(headers: &HeaderMap, state: &AppState) -> Option<axum::response::
 struct AdminSwitchBody {
     repo: String,
     file: String,
+    #[serde(default)]
+    quant: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -481,6 +483,8 @@ struct SetProfileBody {
     gpu_layers: Option<u32>,
     #[serde(default)]
     history_turns: Option<u32>,
+    #[serde(default)]
+    quant: Option<String>,
 }
 
 /// A model `file` must be a bare filename (no path components), so it can never
@@ -514,7 +518,7 @@ async fn handle_admin_switch(
         )
             .into_response();
     }
-    let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: None };
+    let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: body.quant };
     match state.manager.start_switch(spec) {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state": "switching"}))).into_response(),
         Err(crate::model_manager::SwitchError::AlreadySwitching) => (
@@ -589,14 +593,16 @@ async fn handle_model_delete(
         )
             .into_response();
     }
-    match crate::download::delete_cached(&body.repo, &body.file) {
-        Ok(deleted) => Json(json!({"deleted": deleted})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("delete failed: {e}")})),
-        )
-            .into_response(),
+    let entry = crate::catalog::CATALOG.iter().find(|e| e.repo == body.repo && e.file == body.file);
+    let files: Vec<String> = match (&body.quant, entry) {
+        (Some(q), Some(e)) => crate::catalog::files_for_quant(e, q).unwrap_or_else(|| vec![body.file.clone()]),
+        _ => vec![body.file.clone()],
+    };
+    let mut any = false;
+    for f in &files {
+        any |= crate::download::delete_cached(&body.repo, f).unwrap_or(false);
     }
+    Json(json!({"deleted": any})).into_response()
 }
 
 /// POST /admin/model/ctx — set (or clear, ctx=0) a model's per-model context.
@@ -714,6 +720,14 @@ async fn handle_model_set_profile(
     if let Some(g) = body.gpu_layers { prof.gpu_layers = if g == u32::MAX { None } else { Some(g) }; }
     if let Some(h) = body.history_turns { prof.history_turns = if h == 0 { None } else { Some(h) }; }
 
+    if let Some(q) = body.quant {
+        let ok = crate::catalog::variants_for(entry).iter().any(|v| v.quant.eq_ignore_ascii_case(&q));
+        if !ok {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("unknown quant '{q}' for this model")}))).into_response();
+        }
+        prof.quant = Some(q);
+    }
+
     if let Err(e) = crate::settings::save_model_profile(&key, &prof) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
@@ -721,7 +735,7 @@ async fn handle_model_set_profile(
     // Reload if this is the active model so the new profile takes effect now.
     let active = state.manager.status().current;
     if active.repo == body.repo && active.file == body.file {
-        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: None };
+        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: prof.quant.clone() };
         match state.manager.start_switch(spec) {
             Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
             Err(crate::model_manager::SwitchError::AlreadySwitching) => {
@@ -1326,6 +1340,84 @@ mod tests {
         let prof = crate::settings::load_model_profile(&key);
         assert_eq!(prof.kv_type, Some(KvType::Q4), "kv_type should be Q4");
         assert_eq!(prof.history_turns, Some(3), "history_turns should be 3");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&settings_file);
+        std::env::remove_var("LOCALLLM_SETTINGS");
+    }
+
+    /// POST /admin/model/profile — quant field is persisted when valid, 400 when unknown.
+    #[tokio::test]
+    async fn set_model_profile_persists_and_validates_quant() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        // Isolate settings storage so this test never touches the real file.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let settings_file = std::env::temp_dir()
+            .join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
+        std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
+
+        // Use the first CATALOG entry — guaranteed to exist and Q4_K_M is always valid.
+        let entry = &crate::catalog::CATALOG[0];
+        let key = crate::settings::model_ctx_key(entry.repo, entry.file);
+
+        let app = crate::router_for_test_with(
+            std::sync::Arc::new(crate::test_support::TaggedGen("test")),
+            crate::route::Profile::default().policy(),
+            1000,
+        );
+
+        // --- Happy path: valid quant Q4_K_M ---
+        let body = serde_json::json!({
+            "repo": entry.repo,
+            "file": entry.file,
+            "quant": "Q4_K_M"
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/model/profile")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let resp_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "expected 200, got {status}: {resp_body}");
+        assert_eq!(resp_body.get("saved"), Some(&serde_json::Value::Bool(true)));
+
+        // Assert quant was persisted.
+        let prof = crate::settings::load_model_profile(&key);
+        assert_eq!(prof.quant, Some("Q4_K_M".to_string()), "quant should be Q4_K_M");
+
+        // --- Sad path: unknown quant Q9_NOPE → 400 ---
+        let app2 = crate::router_for_test_with(
+            std::sync::Arc::new(crate::test_support::TaggedGen("test")),
+            crate::route::Profile::default().policy(),
+            1000,
+        );
+        let body2 = serde_json::json!({
+            "repo": entry.repo,
+            "file": entry.file,
+            "quant": "Q9_NOPE"
+        });
+        let request2 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/model/profile")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-token")
+            .body(Body::from(body2.to_string()))
+            .unwrap();
+        let response2 = app2.oneshot(request2).await.unwrap();
+        let status2 = response2.status().as_u16();
+        let bytes2 = response2.into_body().collect().await.unwrap().to_bytes();
+        let resp_body2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(status2, 400, "expected 400 for unknown quant, got {status2}: {resp_body2}");
+        assert!(resp_body2.get("error").and_then(|v| v.as_str()).map(|s| s.contains("Q9_NOPE")).unwrap_or(false),
+            "error should mention Q9_NOPE: {resp_body2}");
 
         // Cleanup.
         let _ = std::fs::remove_file(&settings_file);
