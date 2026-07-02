@@ -200,7 +200,7 @@ mod window {
     //! the tray. Cross-platform (macOS WKWebView / Linux WebKitGTK / Windows WebView2).
     pub(crate) struct ModelManagerWindow {
         pub window: tao::window::Window,
-        _webview: wry::WebView,
+        webview: wry::WebView,
     }
 
     impl ModelManagerWindow {
@@ -214,7 +214,7 @@ mod window {
             use tao::dpi::LogicalSize;
             use tao::window::WindowBuilder;
             let window = WindowBuilder::new()
-                .with_title("localllm \u{2014} Model Manager")
+                .with_title("localllm \u{2014} Config")
                 .with_inner_size(LogicalSize::new(900.0_f64, 640.0_f64))
                 .build(target)?;
             let url = format!("http://127.0.0.1:{port}/manager");
@@ -222,7 +222,13 @@ mod window {
                 .with_url(&url)
                 .with_initialization_script(&crate::server::manager_init_script(admin_token))
                 .build()?;
-            Ok(Self { window, _webview: webview })
+            Ok(Self { window, webview })
+        }
+
+        /// Navigate the SPA to a hash route (e.g. "#/dashboard") without a reload.
+        pub fn navigate(&self, route: &str) {
+            let js = format!("location.hash = {:?};", route);
+            let _ = self.webview.evaluate_script(&js);
         }
     }
 }
@@ -427,16 +433,18 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let log_path = std::env::var("LOCALLLM_LOG")
         .unwrap_or_else(|_| "/tmp/localllm.log".to_string());
 
-    // Model Manager window state: None until first open, then single-instance.
+    // Config window state: None until first open, then single-instance. The
+    // Config submenu items each open/show it and navigate to their SPA route.
     // admin_token (function param) is captured by the closure for window injection.
-    let mut manager_id: Option<tray_icon::menu::MenuId> = None;
+    let mut config_models_id: Option<tray_icon::menu::MenuId> = None;
+    let mut config_tools_id: Option<tray_icon::menu::MenuId> = None;
+    let mut config_dash_id: Option<tray_icon::menu::MenuId> = None;
     let mut manager_window: Option<window::ModelManagerWindow> = None;
 
-    // Integration toggle state: the CheckMenuItem and wired sub-line handles,
-    // populated in Init and mutated in the click handler.
-    let mut toggle_id: Option<tray_icon::menu::MenuId> = None;
-    let mut toggle_item_handle: Option<CheckMenuItem> = None;
+    // Read-only wired sub-line: reflects the integration state toggled from the
+    // Config page. last_wired avoids redundant set_text on every poll tick.
     let mut wired_handle: Option<MenuItem> = None;
+    let mut last_wired: Option<String> = None;
 
     // Poll interval for the menu-event channel.
     let poll_interval = Duration::from_millis(100);
@@ -468,8 +476,16 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let backend_line = MenuItem::new(format!("Backend: {info_backend}"), false, None);
                 let logs_item = MenuItem::new("Open Logs", true, None);
                 logs_id = Some(logs_item.id().clone());
-                let manager_item = MenuItem::new("Open Model Manager", true, None);
-                manager_id = Some(manager_item.id().clone());
+                let config_submenu = Submenu::new("Config", true);
+                let cfg_models = MenuItem::new("Models", true, None);
+                let cfg_tools = MenuItem::new("Tools", true, None);
+                let cfg_dash = MenuItem::new("Dashboard", true, None);
+                config_models_id = Some(cfg_models.id().clone());
+                config_tools_id = Some(cfg_tools.id().clone());
+                config_dash_id = Some(cfg_dash.id().clone());
+                config_submenu.append(&cfg_models).expect("append config models");
+                config_submenu.append(&cfg_tools).expect("append config tools");
+                config_submenu.append(&cfg_dash).expect("append config dashboard");
                 let quit_item = MenuItem::new("Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
@@ -493,14 +509,6 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 routing_status = Some(routing_line.clone());
 
                 let init_state = crate::settings::load_integrations();
-                let toggle_item = CheckMenuItem::new(
-                    "Route apps through localllm",
-                    true,
-                    init_state.enabled,
-                    None,
-                );
-                toggle_id = Some(toggle_item.id().clone());
-                toggle_item_handle = Some(toggle_item.clone());
                 let wired_line = MenuItem::new(
                     wired_label(&init_state),
                     false,
@@ -520,11 +528,10 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&routing_line).expect("append routing line");
                 menu.append(&routing_submenu).expect("append routing submenu");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator");
-                menu.append(&toggle_item).expect("append toggle item");
                 menu.append(&wired_line).expect("append wired line");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator2");
                 menu.append(&logs_item).expect("append logs item");
-                menu.append(&manager_item).expect("append manager item");
+                menu.append(&config_submenu).expect("append config submenu");
                 menu.append(&quit_item).expect("append quit item");
 
                 _tray_keeper.push(
@@ -568,9 +575,32 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     }
                 }
 
+                // Keep the read-only wired line in sync with the Config-page toggle.
+                {
+                    let st = crate::settings::load_integrations();
+                    let label = wired_label(&st);
+                    if last_wired.as_deref() != Some(label.as_str()) {
+                        if let Some(line) = &wired_handle {
+                            line.set_text(&label);
+                        }
+                        last_wired = Some(label);
+                    }
+                }
+
                 while let Ok(menu_event) = MenuEvent::receiver().try_recv() {
                     if quit_id.as_ref() == Some(&menu_event.id) {
-                        tracing::info!("quit requested via tray menu — shutting down");
+                        tracing::info!("quit requested via tray menu — unwiring integrations");
+                        let st = crate::settings::load_integrations();
+                        if st.enabled {
+                            let injectors = crate::integrations::injectors_default();
+                            let summary = crate::integrations::disable_all(&st.priors, &injectors);
+                            let failed: std::collections::HashSet<&String> =
+                                summary.failed.iter().map(|(id, _)| id).collect();
+                            let mut new_state = st.clone();
+                            new_state.priors.retain(|id, _| failed.contains(id));
+                            new_state.enabled = !new_state.priors.is_empty();
+                            let _ = crate::settings::save_integrations(&new_state);
+                        }
                         std::process::exit(0);
                     } else if logs_id.as_ref() == Some(&menu_event.id) {
                         platform::open_path(&log_path);
@@ -594,42 +624,30 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                             s.set_text(format!("Routing: {}", chosen.label()));
                         }
                         tracing::info!("routing profile set via tray: {chosen:?}");
-                    } else if toggle_id.as_ref() == Some(&menu_event.id) {
-                        let injectors = crate::integrations::injectors_default();
-                        let mut state = crate::settings::load_integrations();
-                        if state.enabled {
-                            let summary = crate::integrations::disable_all(&state.priors, &injectors);
-                            for (id, _e) in &summary.failed {
-                                tracing::warn!(target: "localllm", "failed to revert client {id}");
-                            }
-                            let failed_ids: std::collections::HashSet<&String> =
-                                summary.failed.iter().map(|(id, _)| id).collect();
-                            state.priors.retain(|id, _| failed_ids.contains(id));
-                            state.enabled = !state.priors.is_empty();
+                    } else if config_models_id.as_ref() == Some(&menu_event.id)
+                        || config_tools_id.as_ref() == Some(&menu_event.id)
+                        || config_dash_id.as_ref() == Some(&menu_event.id)
+                    {
+                        let route = if config_models_id.as_ref() == Some(&menu_event.id) {
+                            "#/models"
+                        } else if config_tools_id.as_ref() == Some(&menu_event.id) {
+                            "#/tools"
                         } else {
-                            let outcome = crate::integrations::enable_all(port, &injectors);
-                            for (id, _e) in &outcome.summary.failed {
-                                tracing::warn!(target: "localllm", "failed to wire client {id}");
-                            }
-                            state = crate::settings::IntegrationState { enabled: !outcome.priors.is_empty(), priors: outcome.priors };
-                        }
-                        let _ = crate::settings::save_integrations(&state);
-                        if let Some(item) = &toggle_item_handle {
-                            item.set_checked(state.enabled);
-                        }
-                        if let Some(line) = &wired_handle {
-                            line.set_text(wired_label(&state));
-                        }
-                    } else if manager_id.as_ref() == Some(&menu_event.id) {
+                            "#/dashboard"
+                        };
                         match &manager_window {
                             Some(w) => {
                                 w.window.set_visible(true);
                                 w.window.set_focus();
+                                w.navigate(route);
                             }
                             None => match window::ModelManagerWindow::open(target, port, &admin_token) {
-                                Ok(w) => manager_window = Some(w),
+                                Ok(w) => {
+                                    w.navigate(route);
+                                    manager_window = Some(w);
+                                }
                                 Err(e) => tracing::error!(
-                                    "Model Manager window failed: {e} (needs WebView2/WebKitGTK)"
+                                    "Config window failed: {e} (needs WebView2/WebKitGTK)"
                                 ),
                             },
                         }
@@ -637,9 +655,22 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 }
             }
 
-            // Hide (don't destroy) the Model Manager window on close.
+            // Hide (don't destroy) the Config window on close.
             Event::WindowEvent {
                 event: tao::event::WindowEvent::CloseRequested,
+                window_id,
+                ..
+            } => {
+                if let Some(w) = &manager_window {
+                    if w.window.id() == window_id {
+                        w.window.set_visible(false);
+                    }
+                }
+            }
+
+            // Hide the Config window when it loses focus (blur) to save memory.
+            Event::WindowEvent {
+                event: tao::event::WindowEvent::Focused(false),
                 window_id,
                 ..
             } => {
