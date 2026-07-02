@@ -307,15 +307,26 @@ pub fn catalog_view(
             Some(t) => kv_to_kind(t).1,
             None => kv_kind_tag(kv),
         };
+        // Resolve the selected quant and the size it implies BEFORE row-level
+        // bounds so that size_mb/est_ram_mb/fit on the row match the selection.
+        let quant_selected = prof.quant.clone().unwrap_or_else(|| e.quant.to_string());
+        let raw_variants = crate::catalog::variants_for(e);
+        let row_size_mb = raw_variants
+            .iter()
+            .find(|v| v.quant.eq_ignore_ascii_case(&quant_selected))
+            .map(|v| v.size_mb)
+            .unwrap_or(e.size_mb);
+
+        // kv_per_token is constant per entry — hoist out of the variants closure.
         let kv_per_token = crate::fit::est_kv_bytes_per_token(e.params_b, eff_kv_kind);
-        let bounds = crate::fit::ctx_bounds(e.size_mb, kv_per_token, budget_mb, e.ctx_train);
+        let bounds = crate::fit::ctx_bounds(row_size_mb, kv_per_token, budget_mb, e.ctx_train);
         let ctx_current = if bounds.max == 0 {
             0
         } else {
             ctx_override(e.repo, e.file).unwrap_or_else(|| requested_ctx_ceiling.min(bounds.max))
         };
         let kv_mb = (kv_per_token * ctx_current as u64 / (1024 * 1024)) as u32;
-        let est = e.size_mb + kv_mb + crate::fit::COMPUTE_HEADROOM_MB;
+        let est = row_size_mb + kv_mb + crate::fit::COMPUTE_HEADROOM_MB;
 
         let fit = if bounds.max == 0 {
             FitVerdict::WontFit
@@ -335,13 +346,12 @@ pub fn catalog_view(
             ModelStatus::NeedsDownload
         };
 
-        let quant_selected = prof.quant.clone().unwrap_or_else(|| e.quant.to_string());
-        let variants: Vec<VariantView> = crate::catalog::variants_for(e)
+        let variants: Vec<VariantView> = raw_variants
             .into_iter()
             .map(|rv| {
-                let vkv = crate::fit::est_kv_bytes_per_token(e.params_b, eff_kv_kind);
-                let vbounds = crate::fit::ctx_bounds(rv.size_mb, vkv, budget_mb, e.ctx_train);
-                let vkv_mb = (vkv * ctx_current as u64 / (1024 * 1024)) as u32;
+                // kv_per_token hoisted above (constant per entry, same params + eff_kv_kind).
+                let vbounds = crate::fit::ctx_bounds(rv.size_mb, kv_per_token, budget_mb, e.ctx_train);
+                let vkv_mb = (kv_per_token * ctx_current as u64 / (1024 * 1024)) as u32;
                 let vest = rv.size_mb + vkv_mb + crate::fit::COMPUTE_HEADROOM_MB;
                 let vfit = if vbounds.max == 0 {
                     FitVerdict::WontFit
@@ -384,7 +394,7 @@ pub fn catalog_view(
             quant: e.quant.to_string(),
             repo: e.repo.to_string(),
             file: e.file.to_string(),
-            size_mb: e.size_mb,
+            size_mb: row_size_mb,
             est_ram_mb: est,
             status,
             fit,
@@ -627,5 +637,19 @@ mod tests {
         assert!(m.variants[0].selected);
         assert_eq!(m.variants[0].status, ModelStatus::Downloaded); // is_downloaded → true
         assert!(m.variants[0].est_ram_mb > m.variants[0].size_mb); // KV-aware est
+    }
+
+    #[test]
+    fn row_size_reflects_selected_variant() {
+        use crate::settings::ExecProfile;
+        let cat = vec![entry("Qwen2.5", "Qwen 7B", 7.0, "q/7b", "7b-q4_k_m.gguf", 4700)];
+        let none = |_r: &str, _f: &str| ExecProfile::default();
+        let v = catalog_view(&cat, 16384, 32768, KvKind::Q8, None, |_, _| true, |_, _| None, none);
+        let m = &v[0].models[0];
+        let sel = m.variants.iter().find(|x| x.selected).unwrap();
+        // Row-level fields must derive from the selected variant (not hardcoded e.size_mb).
+        assert_eq!(m.size_mb, sel.size_mb);
+        assert_eq!(m.est_ram_mb, sel.est_ram_mb);
+        assert_eq!(m.fit, sel.fit);
     }
 }
