@@ -672,6 +672,10 @@ async function renderDashboard() {
   // the button and the second click actually clears + reloads.
   const bar = el("div", "dash-bar");
   bar.append(el("div", "dash-bar-title", "Dashboard"));
+  const barActions = el("div", "dash-bar-actions");
+  const refreshBtn = el("button", "btn", "↻ Atualizar");
+  refreshBtn.onclick = () => renderDashboard();
+  barActions.append(refreshBtn);
   const clearBtn = el("button", "btn danger", "Limpar dados");
   let armed = false, armTimer = null;
   clearBtn.onclick = async () => {
@@ -698,7 +702,8 @@ async function renderDashboard() {
       clearBtn.classList.remove("armed");
     }
   };
-  bar.append(clearBtn);
+  barActions.append(clearBtn);
+  bar.append(barActions);
   wrap.append(bar);
 
   const m = d.month || { tokens_saved: 0, tokens_if_all_cloud: 0, local_count: 0, cloud_count: 0 };
