@@ -39,6 +39,16 @@ pub enum FitVerdict {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct VariantView {
+    pub quant: String,
+    pub size_mb: u32,
+    pub est_ram_mb: u32,
+    pub fit: FitVerdict,
+    pub status: ModelStatus,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelView {
     pub display_name: String,
     pub params: String,
@@ -59,6 +69,8 @@ pub struct ModelView {
     pub gpu_layers_current: Option<u32>,
     pub history_turns_current: Option<u32>,
     pub history_turns_default: Option<u32>,
+    pub variants: Vec<VariantView>,
+    pub quant_selected: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -323,6 +335,33 @@ pub fn catalog_view(
             ModelStatus::NeedsDownload
         };
 
+        let quant_selected = prof.quant.clone().unwrap_or_else(|| e.quant.to_string());
+        let variants: Vec<VariantView> = crate::catalog::variants_for(e)
+            .into_iter()
+            .map(|rv| {
+                let vkv = crate::fit::est_kv_bytes_per_token(e.params_b, eff_kv_kind);
+                let vbounds = crate::fit::ctx_bounds(rv.size_mb, vkv, budget_mb, e.ctx_train);
+                let vkv_mb = (vkv * ctx_current as u64 / (1024 * 1024)) as u32;
+                let vest = rv.size_mb + vkv_mb + crate::fit::COMPUTE_HEADROOM_MB;
+                let vfit = if vbounds.max == 0 {
+                    FitVerdict::WontFit
+                } else if (vest as u64) <= budget {
+                    FitVerdict::Fits
+                } else if (vest as u64) <= tight_ceiling {
+                    FitVerdict::Tight
+                } else {
+                    FitVerdict::WontFit
+                };
+                let vstatus = if rv.files.iter().all(|f| is_downloaded(e.repo, f)) {
+                    ModelStatus::Downloaded
+                } else {
+                    ModelStatus::NeedsDownload
+                };
+                let selected = rv.quant.eq_ignore_ascii_case(&quant_selected);
+                VariantView { quant: rv.quant, size_mb: rv.size_mb, est_ram_mb: vest, fit: vfit, status: vstatus, selected }
+            })
+            .collect();
+
         if fit == FitVerdict::Fits {
             let better = match best_fit {
                 None => true,
@@ -359,6 +398,8 @@ pub fn catalog_view(
             gpu_layers_current: prof.gpu_layers.or(e.rec_gpu_layers),
             history_turns_current: prof.history_turns.or(e.rec_history_turns),
             history_turns_default: e.rec_history_turns,
+            variants,
+            quant_selected,
         });
     }
 
@@ -570,5 +611,21 @@ mod tests {
         let e = entry("Qwen2.5", "Qwen 3B", 3.0, "q/absent", "model-q4_k_m.gguf", 2000);
         assert_eq!(files_for_quant(&e, "q4_k_m"), Some(vec!["model-q4_k_m.gguf".to_string()]));
         assert_eq!(files_for_quant(&e, "Q8_0"), None); // not available for this (fallback) model
+    }
+
+    #[test]
+    fn catalog_view_exposes_variants_and_selection() {
+        use crate::settings::ExecProfile;
+        let cat = vec![entry("Qwen2.5", "Qwen 7B", 7.0, "q/7b", "7b-q4_k_m.gguf", 4700)];
+        // no saved profile quant → selected is the default (entry) quant
+        let none = |_r: &str, _f: &str| ExecProfile::default();
+        let v = catalog_view(&cat, 16384, 32768, KvKind::Q8, None, |_, _| true, |_, _| None, none);
+        let m = &v[0].models[0];
+        assert_eq!(m.quant_selected, "Q4_K_M");
+        assert_eq!(m.variants.len(), 1);              // fallback single variant
+        assert_eq!(m.variants[0].quant, "Q4_K_M");
+        assert!(m.variants[0].selected);
+        assert_eq!(m.variants[0].status, ModelStatus::Downloaded); // is_downloaded → true
+        assert!(m.variants[0].est_ram_mb > m.variants[0].size_mb); // KV-aware est
     }
 }
