@@ -7,6 +7,7 @@ pub mod engine;
 pub mod engine_llama;
 pub mod fit;
 pub mod model_manager;
+pub mod profile;
 pub mod route;
 pub mod settings;
 pub mod usage;
