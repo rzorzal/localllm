@@ -519,6 +519,7 @@ async fn handle_models_catalog(
         Some(&active),
         |r, f| crate::download::cache_path(r, f).exists(),
         |r, f| crate::settings::load_model_ctx(&crate::settings::model_ctx_key(r, f)),
+        |r, f| crate::settings::load_model_profile(&crate::settings::model_ctx_key(r, f)),
     );
     Json(view).into_response()
 }

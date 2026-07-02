@@ -16,6 +16,10 @@ pub struct CatalogEntry {
     pub file: &'static str,
     pub size_mb: u32,
     pub ctx_train: u32,
+    /// Recommended per-model overrides. `None` = use the global default.
+    pub rec_kv: Option<crate::config::KvType>,
+    pub rec_gpu_layers: Option<u32>,
+    pub rec_history_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -50,6 +54,11 @@ pub struct ModelView {
     pub ctx_default: u32,
     pub ctx_max: u32,
     pub ctx_current: u32,
+    pub kv_current: String,
+    pub kv_default: String,
+    pub gpu_layers_current: Option<u32>,
+    pub history_turns_current: Option<u32>,
+    pub history_turns_default: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -64,60 +73,84 @@ pub struct FamilyView {
 pub const CATALOG: &[CatalogEntry] = &[
     // --- Qwen2.5: tiny → large, the default lives here (3B) ---
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 0.5B Instruct", params: "0.5B", params_b: 0.5, quant: "Q4_K_M",
-        repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF", file: "qwen2.5-0.5b-instruct-q4_k_m.gguf", size_mb: 469, ctx_train: 32768 },
+        repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF", file: "qwen2.5-0.5b-instruct-q4_k_m.gguf", size_mb: 469, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 1.5B Instruct", params: "1.5B", params_b: 1.5, quant: "Q4_K_M",
-        repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF", file: "qwen2.5-1.5b-instruct-q4_k_m.gguf", size_mb: 1066, ctx_train: 32768 },
+        repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF", file: "qwen2.5-1.5b-instruct-q4_k_m.gguf", size_mb: 1066, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 3B Instruct", params: "3B", params_b: 3.0, quant: "Q4_K_M",
-        repo: "Qwen/Qwen2.5-3B-Instruct-GGUF", file: "qwen2.5-3b-instruct-q4_k_m.gguf", size_mb: 2000, ctx_train: 32768 },
+        repo: "Qwen/Qwen2.5-3B-Instruct-GGUF", file: "qwen2.5-3b-instruct-q4_k_m.gguf", size_mb: 2000, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 7B Instruct", params: "7B", params_b: 7.0, quant: "Q4_K_M",
-        repo: "Qwen/Qwen2.5-7B-Instruct-GGUF", file: "qwen2.5-7b-instruct-q4_k_m.gguf", size_mb: 4700, ctx_train: 32768 },
+        repo: "Qwen/Qwen2.5-7B-Instruct-GGUF", file: "qwen2.5-7b-instruct-q4_k_m.gguf", size_mb: 4700, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 14B Instruct", params: "14B", params_b: 14.0, quant: "Q4_K_M",
-        repo: "Qwen/Qwen2.5-14B-Instruct-GGUF", file: "qwen2.5-14b-instruct-q4_k_m.gguf", size_mb: 9000, ctx_train: 32768 },
+        repo: "Qwen/Qwen2.5-14B-Instruct-GGUF", file: "qwen2.5-14b-instruct-q4_k_m.gguf", size_mb: 9000, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen2.5", display_name: "Qwen2.5 32B Instruct", params: "32B", params_b: 32.0, quant: "Q4_K_M",
-        repo: "Qwen/Qwen2.5-32B-Instruct-GGUF", file: "qwen2.5-32b-instruct-q4_k_m.gguf", size_mb: 20000, ctx_train: 32768 },
+        repo: "Qwen/Qwen2.5-32B-Instruct-GGUF", file: "qwen2.5-32b-instruct-q4_k_m.gguf", size_mb: 20000, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     // --- Qwen3 (2025/2026): newer generation, tiny → large ---
     CatalogEntry { family: "Qwen3", display_name: "Qwen3 0.6B", params: "0.6B", params_b: 0.6, quant: "Q4_K_M",
-        repo: "bartowski/Qwen_Qwen3-0.6B-GGUF", file: "Qwen_Qwen3-0.6B-Q4_K_M.gguf", size_mb: 462, ctx_train: 32768 },
+        repo: "bartowski/Qwen_Qwen3-0.6B-GGUF", file: "Qwen_Qwen3-0.6B-Q4_K_M.gguf", size_mb: 462, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen3", display_name: "Qwen3 1.7B", params: "1.7B", params_b: 1.7, quant: "Q4_K_M",
-        repo: "bartowski/Qwen_Qwen3-1.7B-GGUF", file: "Qwen_Qwen3-1.7B-Q4_K_M.gguf", size_mb: 1223, ctx_train: 32768 },
+        repo: "bartowski/Qwen_Qwen3-1.7B-GGUF", file: "Qwen_Qwen3-1.7B-Q4_K_M.gguf", size_mb: 1223, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen3", display_name: "Qwen3 4B Instruct", params: "4B", params_b: 4.0, quant: "Q4_K_M",
-        repo: "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF", file: "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf", size_mb: 2382, ctx_train: 32768 },
+        repo: "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF", file: "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf", size_mb: 2382, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Qwen3", display_name: "Qwen3 8B", params: "8B", params_b: 8.0, quant: "Q4_K_M",
-        repo: "bartowski/Qwen_Qwen3-8B-GGUF", file: "Qwen_Qwen3-8B-Q4_K_M.gguf", size_mb: 4794, ctx_train: 32768 },
+        repo: "bartowski/Qwen_Qwen3-8B-GGUF", file: "Qwen_Qwen3-8B-Q4_K_M.gguf", size_mb: 4794, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     // --- Llama: 3.2 small models + 3.1 8B, grouped as one family ---
     CatalogEntry { family: "Llama", display_name: "Llama 3.2 1B Instruct", params: "1B", params_b: 1.0, quant: "Q4_K_M",
-        repo: "bartowski/Llama-3.2-1B-Instruct-GGUF", file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf", size_mb: 770, ctx_train: 131072 },
+        repo: "bartowski/Llama-3.2-1B-Instruct-GGUF", file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf", size_mb: 770, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Llama", display_name: "Llama 3.2 3B Instruct", params: "3B", params_b: 3.0, quant: "Q4_K_M",
-        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF", file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf", size_mb: 1926, ctx_train: 131072 },
+        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF", file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf", size_mb: 1926, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Llama", display_name: "Llama 3.1 8B Instruct", params: "8B", params_b: 8.0, quant: "Q4_K_M",
-        repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", file: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", size_mb: 4900, ctx_train: 131072 },
+        repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", file: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", size_mb: 4900, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     // --- Gemma 2: 2B → 27B ---
     CatalogEntry { family: "Gemma 2", display_name: "Gemma 2 2B Instruct", params: "2B", params_b: 2.0, quant: "Q4_K_M",
-        repo: "bartowski/gemma-2-2b-it-GGUF", file: "gemma-2-2b-it-Q4_K_M.gguf", size_mb: 1629, ctx_train: 8192 },
+        repo: "bartowski/gemma-2-2b-it-GGUF", file: "gemma-2-2b-it-Q4_K_M.gguf", size_mb: 1629, ctx_train: 8192,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Gemma 2", display_name: "Gemma 2 9B Instruct", params: "9B", params_b: 9.0, quant: "Q4_K_M",
-        repo: "bartowski/gemma-2-9b-it-GGUF", file: "gemma-2-9b-it-Q4_K_M.gguf", size_mb: 5494, ctx_train: 8192 },
+        repo: "bartowski/gemma-2-9b-it-GGUF", file: "gemma-2-9b-it-Q4_K_M.gguf", size_mb: 5494, ctx_train: 8192,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Gemma 2", display_name: "Gemma 2 27B Instruct", params: "27B", params_b: 27.0, quant: "Q4_K_M",
-        repo: "bartowski/gemma-2-27b-it-GGUF", file: "gemma-2-27b-it-Q4_K_M.gguf", size_mb: 15875, ctx_train: 8192 },
+        repo: "bartowski/gemma-2-27b-it-GGUF", file: "gemma-2-27b-it-Q4_K_M.gguf", size_mb: 15875, ctx_train: 8192,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     // --- Gemma 3 (2025): newer generation, 1B → 27B ---
     CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 1B Instruct", params: "1B", params_b: 1.0, quant: "Q4_K_M",
-        repo: "bartowski/google_gemma-3-1b-it-GGUF", file: "google_gemma-3-1b-it-Q4_K_M.gguf", size_mb: 769, ctx_train: 32768 },
+        repo: "bartowski/google_gemma-3-1b-it-GGUF", file: "google_gemma-3-1b-it-Q4_K_M.gguf", size_mb: 769, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 4B Instruct", params: "4B", params_b: 4.0, quant: "Q4_K_M",
-        repo: "bartowski/google_gemma-3-4b-it-GGUF", file: "google_gemma-3-4b-it-Q4_K_M.gguf", size_mb: 2374, ctx_train: 131072 },
+        repo: "bartowski/google_gemma-3-4b-it-GGUF", file: "google_gemma-3-4b-it-Q4_K_M.gguf", size_mb: 2374, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 12B Instruct", params: "12B", params_b: 12.0, quant: "Q4_K_M",
-        repo: "bartowski/google_gemma-3-12b-it-GGUF", file: "google_gemma-3-12b-it-Q4_K_M.gguf", size_mb: 6962, ctx_train: 131072 },
+        repo: "bartowski/google_gemma-3-12b-it-GGUF", file: "google_gemma-3-12b-it-Q4_K_M.gguf", size_mb: 6962, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Gemma 3", display_name: "Gemma 3 27B Instruct", params: "27B", params_b: 27.0, quant: "Q4_K_M",
-        repo: "bartowski/google_gemma-3-27b-it-GGUF", file: "google_gemma-3-27b-it-Q4_K_M.gguf", size_mb: 15780, ctx_train: 131072 },
+        repo: "bartowski/google_gemma-3-27b-it-GGUF", file: "google_gemma-3-27b-it-Q4_K_M.gguf", size_mb: 15780, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     // --- Phi 3.5 ---
     CatalogEntry { family: "Phi 3.5", display_name: "Phi 3.5 Mini Instruct", params: "3.8B", params_b: 3.8, quant: "Q4_K_M",
-        repo: "bartowski/Phi-3.5-mini-instruct-GGUF", file: "Phi-3.5-mini-instruct-Q4_K_M.gguf", size_mb: 2400, ctx_train: 131072 },
+        repo: "bartowski/Phi-3.5-mini-instruct-GGUF", file: "Phi-3.5-mini-instruct-Q4_K_M.gguf", size_mb: 2400, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     // --- Phi-4 (Microsoft, 2025) ---
     CatalogEntry { family: "Phi-4", display_name: "Phi-4 Mini Instruct", params: "3.8B", params_b: 3.8, quant: "Q4_K_M",
-        repo: "bartowski/microsoft_Phi-4-mini-instruct-GGUF", file: "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf", size_mb: 2376, ctx_train: 131072 },
+        repo: "bartowski/microsoft_Phi-4-mini-instruct-GGUF", file: "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf", size_mb: 2376, ctx_train: 131072,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     CatalogEntry { family: "Phi-4", display_name: "Phi-4 (14B)", params: "14B", params_b: 14.0, quant: "Q4_K_M",
-        repo: "bartowski/phi-4-GGUF", file: "phi-4-Q4_K_M.gguf", size_mb: 8634, ctx_train: 16384 },
+        repo: "bartowski/phi-4-GGUF", file: "phi-4-Q4_K_M.gguf", size_mb: 8634, ctx_train: 16384,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
     // --- Mistral ---
     CatalogEntry { family: "Mistral", display_name: "Mistral 7B Instruct v0.3", params: "7B", params_b: 7.0, quant: "Q4_K_M",
-        repo: "bartowski/Mistral-7B-Instruct-v0.3-GGUF", file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf", size_mb: 4170, ctx_train: 32768 },
+        repo: "bartowski/Mistral-7B-Instruct-v0.3-GGUF", file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf", size_mb: 4170, ctx_train: 32768,
+        rec_kv: None, rec_gpu_layers: None, rec_history_turns: None },
 ];
 
 /// Parse a parameter size in billions from a model name: the first run of
@@ -164,6 +197,24 @@ pub fn active_params_b(repo: &str, file: &str) -> f32 {
     params_b_from_name(repo, file).unwrap_or(0.0)
 }
 
+/// Map a `KvType` to the fit-math `KvKind` and a lowercase tag.
+fn kv_to_kind(t: crate::config::KvType) -> (crate::fit::KvKind, &'static str) {
+    match t {
+        crate::config::KvType::Q8 => (crate::fit::KvKind::Q8, "q8"),
+        crate::config::KvType::Q4 => (crate::fit::KvKind::Q4, "q4"),
+        crate::config::KvType::F16 => (crate::fit::KvKind::F16, "f16"),
+    }
+}
+
+/// Lowercase tag for the global fallback `KvKind`.
+fn kv_kind_tag(k: crate::fit::KvKind) -> &'static str {
+    match k {
+        crate::fit::KvKind::Q8 => "q8",
+        crate::fit::KvKind::Q4 => "q4",
+        crate::fit::KvKind::F16 => "f16",
+    }
+}
+
 /// Annotate the catalog for this machine + the active model. Pure.
 pub fn catalog_view(
     entries: &[CatalogEntry],
@@ -173,6 +224,7 @@ pub fn catalog_view(
     active: Option<&ModelSpec>,
     is_downloaded: impl Fn(&str, &str) -> bool,
     ctx_override: impl Fn(&str, &str) -> Option<u32>,
+    profile_override: impl Fn(&str, &str) -> crate::settings::ExecProfile,
 ) -> Vec<FamilyView> {
     let budget = total_ram_mb * 65 / 100;
     let tight_ceiling = total_ram_mb * 85 / 100;
@@ -185,7 +237,16 @@ pub fn catalog_view(
     let mut smallest: Option<usize> = None; // fallback: smallest est_ram
 
     for (i, e) in entries.iter().enumerate() {
-        let kv_per_token = crate::fit::est_kv_bytes_per_token(e.params_b, kv);
+        let prof = profile_override(e.repo, e.file);
+        let (eff_kv_kind, kv_tag) = match prof.kv_type.or(e.rec_kv.clone()) {
+            Some(t) => kv_to_kind(t),
+            None => (kv, kv_kind_tag(kv)),
+        };
+        let kv_default_tag = match e.rec_kv.clone() {
+            Some(t) => kv_to_kind(t).1,
+            None => kv_kind_tag(kv),
+        };
+        let kv_per_token = crate::fit::est_kv_bytes_per_token(e.params_b, eff_kv_kind);
         let bounds = crate::fit::ctx_bounds(e.size_mb, kv_per_token, budget_mb, e.ctx_train);
         let ctx_current = if bounds.max == 0 {
             0
@@ -244,6 +305,11 @@ pub fn catalog_view(
             ctx_default: bounds.default,
             ctx_max: bounds.max,
             ctx_current,
+            kv_current: kv_tag.to_string(),
+            kv_default: kv_default_tag.to_string(),
+            gpu_layers_current: prof.gpu_layers.or(e.rec_gpu_layers),
+            history_turns_current: prof.history_turns.or(e.rec_history_turns),
+            history_turns_default: e.rec_history_turns,
         });
     }
 
@@ -268,7 +334,9 @@ mod tests {
     use crate::fit::KvKind;
 
     fn entry(family: &'static str, name: &'static str, pb: f32, repo: &'static str, file: &'static str, size_mb: u32) -> CatalogEntry {
-        CatalogEntry { family, display_name: name, params: "x", params_b: pb, quant: "Q4_K_M", repo, file, size_mb, ctx_train: 32768 }
+        CatalogEntry { family, display_name: name, params: "x", params_b: pb, quant: "Q4_K_M",
+            repo, file, size_mb, ctx_train: 32768,
+            rec_kv: None, rec_gpu_layers: None, rec_history_turns: None }
     }
 
     fn sample() -> Vec<CatalogEntry> {
@@ -289,7 +357,7 @@ mod tests {
         let cat = sample();
         let active = ModelSpec { repo: "q/7b".into(), file: "7b.gguf".into() };
         let downloaded = |r: &str, _f: &str| r == "q/3b"; // 3B cached
-        let view = catalog_view(&cat, 16384, 32768, KvKind::Q8, Some(&active), downloaded, |_, _| None);
+        let view = catalog_view(&cat, 16384, 32768, KvKind::Q8, Some(&active), downloaded, |_, _| None, |_, _| crate::settings::ExecProfile::default());
 
         // grouped by family in first-seen order
         assert_eq!(view[0].family, "Qwen2.5");
@@ -316,7 +384,7 @@ mod tests {
     fn tiny_ram_recommends_smallest() {
         let cat = sample();
         // 2 GB → budget 1331; nothing fits → smallest est (3B has lowest est).
-        let view = catalog_view(&cat, 2048, 32768, KvKind::Q8, None, |_, _| false, |_, _| None);
+        let view = catalog_view(&cat, 2048, 32768, KvKind::Q8, None, |_, _| false, |_, _| None, |_, _| crate::settings::ExecProfile::default());
         let recs: Vec<_> = view.iter().flat_map(|f| f.models.iter()).filter(|m| m.recommended).collect();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].display_name, "Qwen 3B");
@@ -330,7 +398,7 @@ mod tests {
         // 5B model, 6000 MB weights: KV at the computed ctx_current pushes est
         // above 6500 but below 8500 → Tight.
         let cat = vec![entry("F", "M", 5.0, "r", "f", 6000)];
-        let view = catalog_view(&cat, 10000, 32768, KvKind::Q8, None, |_, _| false, |_, _| None);
+        let view = catalog_view(&cat, 10000, 32768, KvKind::Q8, None, |_, _| false, |_, _| None, |_, _| crate::settings::ExecProfile::default());
         let m = &view[0].models[0];
         assert_eq!(m.fit, FitVerdict::Tight);
         // Pin the estimate to the Tight band so a shift in the fit constants
@@ -373,9 +441,10 @@ mod tests {
         let entries = [CatalogEntry {
             family: "T", display_name: "t3", params: "3B", params_b: 3.0, quant: "Q4_K_M",
             repo: "r", file: "f", size_mb: 2000, ctx_train: 32768,
+            rec_kv: None, rec_gpu_layers: None, rec_history_turns: None,
         }];
-        let big = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None);
-        let small = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| Some(4096));
+        let big = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None, |_, _| crate::settings::ExecProfile::default());
+        let small = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| Some(4096), |_, _| crate::settings::ExecProfile::default());
         let big_est = big[0].models[0].est_ram_mb;
         let small_est = small[0].models[0].est_ram_mb;
         // KV at 32768 costs more than at 4096 → bigger est. Both exceed size_mb.
@@ -390,8 +459,9 @@ mod tests {
         let entries = [CatalogEntry {
             family: "P", display_name: "phi4", params: "14B", params_b: 14.0, quant: "Q4_K_M",
             repo: "bartowski/phi-4-GGUF", file: "phi-4-Q4_K_M.gguf", size_mb: 8634, ctx_train: 16384,
+            rec_kv: None, rec_gpu_layers: None, rec_history_turns: None,
         }];
-        let v = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None);
+        let v = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None, |_, _| crate::settings::ExecProfile::default());
         let m = &v[0].models[0];
         assert_eq!(m.ctx_max, 16384);          // trained ctx binds
         assert_eq!(m.ctx_current, 16384);       // min(32768 ceiling, 16384 max)
@@ -409,11 +479,29 @@ mod tests {
         let entries = [CatalogEntry {
             family: "T", display_name: "t3", params: "3B", params_b: 3.0, quant: "Q4_K_M",
             repo: "r", file: "f", size_mb: 2000, ctx_train: 131072,
+            rec_kv: None, rec_gpu_layers: None, rec_history_turns: None,
         }];
         // Big trained ctx, small model → ctx_max is memory- or GLOBAL_MAX-bound.
-        let v = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None);
+        let v = catalog_view(&entries, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None, |_, _| crate::settings::ExecProfile::default());
         let m = &v[0].models[0];
         // ceiling 32768 <= max → ctx_current = 32768
         assert_eq!(m.ctx_current, 32768.min(m.ctx_max));
+    }
+
+    #[test]
+    fn catalog_view_uses_per_model_kv_from_profile() {
+        use crate::settings::ExecProfile;
+        let cat = vec![entry("Qwen2.5", "Qwen 7B", 7.0, "q/7b", "7b.gguf", 4700)];
+        // Global kv = Q8, but this model's saved profile forces F16 → larger KV est.
+        let f16_profile = |_r: &str, _f: &str| ExecProfile {
+            kv_type: Some(crate::config::KvType::F16), ..Default::default()
+        };
+        let none = |_r: &str, _f: &str| ExecProfile::default();
+        let with_f16 = catalog_view(&cat, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None, f16_profile);
+        let with_q8  = catalog_view(&cat, 16384, 32768, KvKind::Q8, None, |_, _| false, |_, _| None, none);
+        // F16 KV is heavier per token → smaller max ctx for the same budget.
+        assert!(with_f16[0].models[0].ctx_max <= with_q8[0].models[0].ctx_max);
+        assert_eq!(with_f16[0].models[0].kv_current, "f16");
+        assert_eq!(with_q8[0].models[0].kv_current, "q8");
     }
 }
