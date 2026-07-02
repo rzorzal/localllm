@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RouteEntry {
     /// Unix seconds.
     pub ts: i64,
@@ -21,6 +21,23 @@ pub struct RouteEntry {
     pub prompt_tok: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_tok: Option<u64>,
+    // --- score breakdown (optional; populated at the decision point) so the
+    // dashboard can explain WHY a request scored as it did. ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_tok: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_messages: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_window: Option<u64>,
+    /// Capability-adjusted escalation threshold the score was compared against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+    /// Active local model parameter size in billions (0 = unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_b: Option<f64>,
+    /// Truncated latest-turn prompt text (the ask only, not full history).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_snippet: Option<String>,
 }
 
 /// Resolve the log path. `LOCALLLM_ROUTE_LOG` (full file path) wins.
@@ -175,10 +192,10 @@ mod tests {
             ts,
             surface: "openai".into(),
             dest: dest.into(),
-            reason: None,
             score: 0.1,
             prompt_tok: 100,
             completion_tok: Some(20),
+            ..Default::default()
         }
     }
 
@@ -203,10 +220,10 @@ mod tests {
             ts,
             surface: "openai".into(),
             dest: dest.into(),
-            reason: None,
             score: 0.1,
             prompt_tok: p,
             completion_tok: Some(c),
+            ..Default::default()
         }
     }
 

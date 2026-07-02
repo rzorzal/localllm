@@ -199,6 +199,21 @@ fn route_decision(
         crate::route::Decision::Cloud(r) => ("cloud", Some(format!("{r:?}"))),
         _ => ("local", None),
     };
+    // Latest-turn prompt snippet (the ask only, not full history), truncated.
+    let prompt_snippet = internal
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::api::common::Role::User)
+        .and_then(|m| m.text.clone())
+        .map(|t| {
+            let t = t.trim();
+            if t.chars().count() > 600 {
+                format!("{}…", t.chars().take(600).collect::<String>())
+            } else {
+                t.to_string()
+            }
+        });
     crate::route_log::append(&crate::route_log::RouteEntry {
         ts: crate::route_log::now_secs(),
         surface: surface.to_string(),
@@ -207,6 +222,12 @@ fn route_decision(
         score,
         prompt_tok: prompt_tokens as u64,
         completion_tok: None,
+        last_turn_tok: Some(last_turn_tokens as u64),
+        n_messages: Some(signals.n_messages as u64),
+        ctx_window: Some(signals.local_ctx_window as u64),
+        threshold: Some(threshold),
+        capability_b: Some(local_capability_b as f64),
+        prompt_snippet,
     });
 
     (decision, prompt_tokens)
