@@ -18,6 +18,20 @@ pub struct IntegrationState {
     pub priors: BTreeMap<String, ClientPrior>,
 }
 
+/// Per-model execution profile. Every field optional: `None` means "fall back
+/// to the catalog recommendation, then the global CLI default".
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExecProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_type: Option<crate::config::KvType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_layers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_turns: Option<u32>,
+}
+
 /// On-disk settings shape. New fields must be `#[serde(default)]` so older
 /// files (which only had `profile`) still load.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -26,8 +40,12 @@ struct Settings {
     profile: Profile,
     #[serde(default)]
     integrations: IntegrationState,
-    #[serde(default)]
+    /// Legacy per-model ctx map. Read-only for migration; new writes go to
+    /// `model_profiles`. Kept so old files still load.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     model_ctx: std::collections::BTreeMap<String, u32>,
+    #[serde(default)]
+    model_profiles: std::collections::BTreeMap<String, ExecProfile>,
 }
 
 /// Resolve the settings file path. `LOCALLLM_SETTINGS` (full file path) wins;
@@ -43,13 +61,18 @@ pub fn settings_path() -> Option<PathBuf> {
 /// Load the full settings object, or defaults if the file is absent/unreadable/
 /// malformed. Never fails — a bad settings file must not stop startup.
 fn load_settings() -> Settings {
-    let Some(path) = settings_path() else {
-        return Settings::default();
+    let mut s = match settings_path()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+    {
+        Some(s) => s,
+        None => Settings::default(),
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Settings::default();
-    };
-    serde_json::from_str::<Settings>(&text).unwrap_or_default()
+    // Migrate any legacy model_ctx entries into model_profiles.ctx.
+    for (k, ctx) in std::mem::take(&mut s.model_ctx) {
+        s.model_profiles.entry(k).or_default().ctx.get_or_insert(ctx);
+    }
+    s
 }
 
 /// Persist the full settings object, creating the parent directory if needed.
@@ -99,23 +122,48 @@ pub fn model_ctx_key(repo: &str, file: &str) -> String {
     format!("{repo}/{file}")
 }
 
+/// Load a model's full execution profile, or defaults if unset.
+pub fn load_model_profile(key: &str) -> ExecProfile {
+    load_settings().model_profiles.get(key).cloned().unwrap_or_default()
+}
+
+/// Persist a model's execution profile, preserving the rest of settings.
+pub fn save_model_profile(key: &str, p: &ExecProfile) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    if *p == ExecProfile::default() {
+        s.model_profiles.remove(key);
+    } else {
+        s.model_profiles.insert(key.to_string(), p.clone());
+    }
+    save_settings(&s)
+}
+
+/// Remove a model's execution profile, preserving the rest of settings.
+pub fn clear_model_profile(key: &str) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.model_profiles.remove(key);
+    save_settings(&s)
+}
+
+// --- ctx back-compat wrappers, now backed by the profile's ctx field ---
+
 /// Load a model's persisted ctx override, or `None` if unset.
 pub fn load_model_ctx(key: &str) -> Option<u32> {
-    load_settings().model_ctx.get(key).copied()
+    load_model_profile(key).ctx
 }
 
 /// Persist a model's ctx override, preserving the rest of settings.
 pub fn save_model_ctx(key: &str, ctx: u32) -> anyhow::Result<()> {
-    let mut s = load_settings();
-    s.model_ctx.insert(key.to_string(), ctx);
-    save_settings(&s)
+    let mut p = load_model_profile(key);
+    p.ctx = Some(ctx);
+    save_model_profile(key, &p)
 }
 
 /// Remove a model's ctx override, preserving the rest of settings.
 pub fn clear_model_ctx(key: &str) -> anyhow::Result<()> {
-    let mut s = load_settings();
-    s.model_ctx.remove(key);
-    save_settings(&s)
+    let mut p = load_model_profile(key);
+    p.ctx = None;
+    save_model_profile(key, &p)
 }
 
 #[cfg(test)]
@@ -257,6 +305,46 @@ mod tests {
             clear_model_ctx("a/1").unwrap();
             assert_eq!(load_model_ctx("a/1"), None);
             assert_eq!(load_model_ctx("b/2"), Some(8192));
+        });
+    }
+
+    #[test]
+    fn model_profile_round_trips() {
+        with_temp_settings(|| {
+            let k = model_ctx_key("r", "f");
+            assert_eq!(load_model_profile(&k), ExecProfile::default());
+            let p = ExecProfile {
+                ctx: Some(8192),
+                kv_type: Some(crate::config::KvType::Q4),
+                gpu_layers: Some(20),
+                history_turns: Some(3),
+            };
+            save_model_profile(&k, &p).unwrap();
+            assert_eq!(load_model_profile(&k), p);
+        });
+    }
+
+    #[test]
+    fn legacy_model_ctx_migrates_into_profile() {
+        with_temp_settings(|| {
+            // Write an old-shape settings file that only has model_ctx.
+            let path = settings_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, r#"{"model_ctx":{"r/f":16384}}"#).unwrap();
+            // Reading the profile should surface the migrated ctx.
+            assert_eq!(load_model_profile("r/f").ctx, Some(16384));
+            // And the ctx back-compat wrapper still sees it.
+            assert_eq!(load_model_ctx("r/f"), Some(16384));
+        });
+    }
+
+    #[test]
+    fn ctx_wrapper_writes_through_to_profile() {
+        with_temp_settings(|| {
+            save_model_ctx("r/f", 4096).unwrap();
+            assert_eq!(load_model_profile("r/f").ctx, Some(4096));
+            clear_model_ctx("r/f").unwrap();
+            assert_eq!(load_model_profile("r/f").ctx, None);
         });
     }
 }

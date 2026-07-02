@@ -22,7 +22,8 @@ pub enum Backend {
 ///
 /// Q8 is the default: ~50% the RAM of F16 with negligible quality loss.
 /// Q4 saves ~75% RAM but may reduce output quality on some models.
-#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum KvType {
     /// 8-bit quantized KV cache. ~50% the size of F16. Default.
     #[default]
