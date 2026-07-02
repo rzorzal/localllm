@@ -10,6 +10,7 @@ pub mod fit;
 pub mod model_manager;
 pub mod profile;
 pub mod route;
+pub mod route_log;
 pub mod settings;
 pub mod usage;
 pub mod server;
