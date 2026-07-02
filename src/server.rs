@@ -1457,6 +1457,7 @@ fn make_seeded_test_router(
         requested_ctx_ceiling: 32768,
         kv_kind: crate::fit::KvKind::Q8,
         tool_registry,
+        port: 31415,
     }))
 }
 
