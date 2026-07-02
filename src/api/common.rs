@@ -78,6 +78,15 @@ pub struct StreamDelta {
     pub finish_reason: Option<FinishReason>,
 }
 
+/// Drop tools whose name is in `disabled` (case-sensitive exact match),
+/// preserving the order of the rest. `disabled` empty = passthrough.
+pub fn filter_tools(tools: Vec<ToolSpec>, disabled: &[String]) -> Vec<ToolSpec> {
+    if disabled.is_empty() {
+        return tools;
+    }
+    tools.into_iter().filter(|t| !disabled.iter().any(|d| d == &t.name)).collect()
+}
+
 /// Keep only the last `keep_turns` conversation turns, plus all leading system
 /// messages. A turn begins at a `Role::User` message and runs until the next
 /// `Role::User`, so cutting on a user boundary never splits a `tool_use` from
@@ -194,5 +203,29 @@ mod tests {
     fn truncate_zero_turns_no_system_is_empty() {
         let msgs = vec![m(Role::User, "u1"), m(Role::Assistant, "a1")];
         assert!(truncate_history(msgs, Some(0)).is_empty());
+    }
+
+    fn tool(name: &str) -> ToolSpec {
+        ToolSpec { name: name.into(), description: "d".into(), parameters: serde_json::json!({}) }
+    }
+
+    #[test]
+    fn filter_tools_drops_named_and_preserves_order() {
+        let tools = vec![tool("Bash"), tool("Read"), tool("Glob"), tool("Edit")];
+        let out = filter_tools(tools, &["Read".to_string(), "Glob".to_string()]);
+        let names: Vec<_> = out.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(names, vec!["Bash".to_string(), "Edit".to_string()]);
+    }
+
+    #[test]
+    fn filter_tools_empty_disabled_is_passthrough() {
+        let tools = vec![tool("Bash"), tool("Read")];
+        assert_eq!(filter_tools(tools.clone(), &[]), tools);
+    }
+
+    #[test]
+    fn filter_tools_unknown_name_is_noop() {
+        let tools = vec![tool("Bash")];
+        assert_eq!(filter_tools(tools.clone(), &["Nope".to_string()]), tools);
     }
 }
