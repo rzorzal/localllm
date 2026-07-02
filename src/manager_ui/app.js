@@ -565,7 +565,7 @@ async function doDelete(m) {
   } catch (e) { toast(e.message, true); }
 }
 
-// ---- Pane 4: tools filter ----
+// ---- Pane 4: tools filter (text + status filters, collapsible descriptions) ----
 async function renderTools() {
   currentView = renderTools;
   setCrumbs([
@@ -579,9 +579,36 @@ async function renderTools() {
     view.innerHTML = ""; view.append(el("div", "detail", `Falha ao carregar: ${e.message || e}`));
     return;
   }
-  const wrap = el("div", "detail");
+  const wrap = el("div", "detail tools-wrap");
   wrap.append(el("h2", null, "Filtro de tools por cliente"));
-  wrap.append(el("div", "ctxhint", "Desmarcar remove a tool do que o modelo recebe. Aplica no próximo request (sem rebuild). Cuidado: desabilitar uma tool que o cliente usa remove essa capacidade."));
+  wrap.append(el("div", "ctxhint", "Desmarcar remove a tool do que o modelo recebe. Aplica no próximo request."));
+
+  const rows = []; // { el, name, desc, blocked, setDesc }
+
+  // Controls: text search + status filter + expand-all.
+  const controls = el("div", "tools-controls");
+  const search = el("input", "tools-search");
+  search.type = "search";
+  search.placeholder = "filtrar por nome ou descrição…";
+  controls.append(search);
+  const statusSeg = el("div", "segmented");
+  let statusFilter = "all";
+  const statusBtns = {};
+  [["all", "Todas"], ["allowed", "Permitidas"], ["blocked", "Bloqueadas"]].forEach(([v, l]) => {
+    const b = el("button", "seg-btn" + (v === "all" ? " on" : ""), l);
+    b.onclick = () => { statusFilter = v; Object.entries(statusBtns).forEach(([k, btn]) => btn.classList.toggle("on", k === v)); repaint(); };
+    statusBtns[v] = b; statusSeg.append(b);
+  });
+  controls.append(statusSeg);
+  const expandBtn = el("button", "btn", "Expandir descrições");
+  let allExpanded = false;
+  expandBtn.onclick = () => {
+    allExpanded = !allExpanded;
+    expandBtn.textContent = allExpanded ? "Recolher descrições" : "Expandir descrições";
+    rows.forEach(r => r.setDesc(allExpanded));
+  };
+  controls.append(expandBtn);
+  wrap.append(controls);
 
   const surfaces = Object.keys(data);
   if (surfaces.length === 0) {
@@ -591,29 +618,43 @@ async function renderTools() {
     const { seen = [], disabled = [], descriptions = {} } = data[surface];
     const box = el("div", "ctxbox");
     box.append(el("div", "ctxtitle", surface));
-    if (seen.length === 0) {
+    if (seen.length === 0 && disabled.length === 0) {
       box.append(el("div", "ctxnote", "envie um request deste cliente para descobrir as tools"));
     }
     const boxes = [];
     const addRow = (name, blocked, notSeen) => {
-      const row = el("label", "toolrow" + (blocked ? " blocked" : ""));
+      const row = el("div", "toolrow" + (blocked ? " blocked" : ""));
       const head = el("div", "toolhead");
+      const lbl = el("label", "tool-lbl");
       const cb = el("input", "toolcb");
       cb.type = "checkbox";
       cb.checked = !blocked; // checked = enabled
       cb.dataset.name = name;
-      head.append(cb, el("span", "toolname", name));
+      lbl.append(cb, el("span", "toolname", name));
+      head.append(lbl);
       if (blocked) head.append(el("span", "toolflag", "bloqueada"));
       if (notSeen) head.append(el("span", "toolmuted", "não vista agora"));
+      const desc = descriptions[name] || "";
+      let descEl = null, toggle = null;
+      if (desc) {
+        toggle = el("button", "desc-toggle", "descrição ▾");
+        head.append(toggle);
+        descEl = el("div", "tooldesc hidden", desc);
+      }
       row.append(head);
-      const desc = descriptions[name];
-      if (desc) row.append(el("div", "tooldesc", desc));
+      if (descEl) row.append(descEl);
       box.append(row);
       boxes.push(cb);
+      const setDesc = (open) => {
+        if (!descEl) return;
+        descEl.classList.toggle("hidden", !open);
+        toggle.textContent = open ? "descrição ▴" : "descrição ▾";
+      };
+      if (toggle) toggle.onclick = (e) => { e.preventDefault(); setDesc(descEl.classList.contains("hidden")); };
+      rows.push({ el: row, name, desc, blocked, setDesc });
     };
     seen.forEach(name => addRow(name, disabled.includes(name), false));
-    // Blocked tools the agent isn't currently sending stay listed as blocked,
-    // so the persisted block is always visible (and can be lifted).
+    // Blocked tools the agent isn't currently sending stay listed as blocked.
     disabled.filter(n => !seen.includes(n)).forEach(name => addRow(name, true, true));
     if (boxes.length) {
       const actions = el("div", "actions");
@@ -624,6 +665,20 @@ async function renderTools() {
     }
     wrap.append(box);
   });
+
+  // Live filter across all surfaces (visual only — saving still reads every box).
+  const repaint = () => {
+    const q = search.value.trim().toLowerCase();
+    rows.forEach(r => {
+      const matchText = !q || r.name.toLowerCase().includes(q) || r.desc.toLowerCase().includes(q);
+      const matchStatus = statusFilter === "all"
+        || (statusFilter === "blocked" && r.blocked)
+        || (statusFilter === "allowed" && !r.blocked);
+      r.el.style.display = (matchText && matchStatus) ? "" : "none";
+    });
+  };
+  search.oninput = repaint;
+
   view.innerHTML = ""; view.append(wrap);
 }
 
@@ -749,44 +804,166 @@ async function renderDashboard() {
   });
   wrap.append(cards);
 
-  // Recent decisions table
+  // Recent decisions table (with filters, score popover, prompt row-expand)
   const panel = el("div", "dash-table-wrap");
   panel.append(el("div", "dash-table-title", "Decisões recentes"));
   const recent = d.recent || [];
   if (recent.length === 0) {
     panel.append(el("div", "colempty", "sem requisições ainda — envie um prompt por um cliente"));
   } else {
-    const table = el("table", "dash-table");
-    const thead = el("thead");
-    thead.innerHTML = "<tr><th>surface</th><th>destino</th><th>motivo</th><th>score</th><th>prompt tok</th></tr>";
-    table.append(thead);
-    const tbody = el("tbody");
-    recent.forEach((e) => {
-      const tr = el("tr");
-      tr.append(el("td", null, e.surface));
-      const dest = el("td");
-      dest.append(el("span", "destpill dest-" + e.dest, e.dest));
-      tr.append(dest);
-      tr.append(el("td", "muted", e.reason || "—"));
-      const sc = el("td");
-      const scWrap = el("div", "scorecell");
-      const scBar = el("div", "scorebar");
-      scBar.style.width = Math.round(Math.min(1, e.score) * 100) + "%";
-      scWrap.append(el("span", "scoretxt", e.score.toFixed(2)));
-      const scTrack = el("div", "scoretrack");
-      scTrack.append(scBar);
-      scWrap.append(scTrack);
-      sc.append(scWrap);
-      tr.append(sc);
-      tr.append(el("td", "muted", fmtNum(e.prompt_tok)));
-      tbody.append(tr);
-    });
-    table.append(tbody);
-    panel.append(table);
+    renderDecisionsTable(panel, recent);
   }
   wrap.append(panel);
 
   view.innerHTML = ""; view.append(wrap);
+}
+
+// Local date+time from unix seconds: "DD/MM HH:MM:SS".
+function fmtDateTime(ts) {
+  const dt = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(dt.getDate())}/${p(dt.getMonth() + 1)} ${p(dt.getHours())}:${p(dt.getMinutes())}:${p(dt.getSeconds())}`;
+}
+
+// datetime-local string (for filter inputs) at a given ts, or "".
+function toLocalInput(ts) {
+  const dt = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}T${p(dt.getHours())}:${p(dt.getMinutes())}`;
+}
+
+// Human explanation of a routing score from its logged breakdown.
+function scoreExplainNode(e) {
+  const box = el("div", "score-pop");
+  if (e.last_turn_tok == null || e.n_messages == null) {
+    box.append(el("div", "score-pop-line", "Detalhe indisponível (registro antigo)."));
+    box.append(el("div", "score-pop-line muted", `score = ${e.score.toFixed(3)}`));
+    return box;
+  }
+  const turn = Math.min(1, e.last_turn_tok / 2000);
+  const depth = Math.min(1, e.n_messages / 20);
+  const diff = 0.8 * turn + 0.2 * depth;
+  const line = (html) => box.append(el("div", "score-pop-line", html));
+  box.append(el("div", "score-pop-title", "Como o score foi calculado"));
+  line(`dificuldade = 0.8·turn + 0.2·depth`);
+  line(`turn = min(1, ${e.last_turn_tok}/2000) = <b>${turn.toFixed(2)}</b>`);
+  line(`depth = min(1, ${e.n_messages}/20) = <b>${depth.toFixed(2)}</b>`);
+  line(`= 0.8·${turn.toFixed(2)} + 0.2·${depth.toFixed(2)} = <b>${diff.toFixed(3)}</b>`);
+  if (e.threshold != null) {
+    line(`limite (ajustado ao modelo${e.capability_b ? ` ${e.capability_b}B` : ""}) = <b>${e.threshold.toFixed(2)}</b>`);
+  }
+  if (e.ctx_window) {
+    const fill = e.prompt_tok / e.ctx_window;
+    line(`preenchimento do contexto = ${fmtNum(e.prompt_tok)}/${fmtNum(e.ctx_window)} = ${(fill * 100).toFixed(0)}%`);
+  }
+  const why = el("div", "score-pop-why");
+  if (e.reason === "ContextOverflow") {
+    why.textContent = "→ prompt maior que o contexto local → cloud.";
+  } else if (e.dest === "cloud") {
+    why.textContent = `→ score ${diff.toFixed(2)} acima do limite ${e.threshold != null ? e.threshold.toFixed(2) : ""} → cloud.`;
+  } else {
+    why.textContent = `→ score ${diff.toFixed(2)} abaixo do limite → local.`;
+  }
+  box.append(why);
+  return box;
+}
+
+function renderDecisionsTable(panel, recent) {
+  // Filters
+  const controls = el("div", "dash-filters");
+  const search = el("input", "tools-search");
+  search.type = "search";
+  search.placeholder = "filtrar surface, motivo ou prompt…";
+  controls.append(search);
+  const destSeg = el("div", "segmented");
+  let destFilter = "all";
+  const destBtns = {};
+  [["all", "Todos"], ["local", "Local"], ["cloud", "Cloud"]].forEach(([v, l]) => {
+    const b = el("button", "seg-btn" + (v === "all" ? " on" : ""), l);
+    b.onclick = () => { destFilter = v; Object.entries(destBtns).forEach(([k, btn]) => btn.classList.toggle("on", k === v)); repaint(); };
+    destBtns[v] = b; destSeg.append(b);
+  });
+  controls.append(destSeg);
+  const fromIn = el("input", "dt-input"); fromIn.type = "datetime-local"; fromIn.title = "de";
+  const toIn = el("input", "dt-input"); toIn.type = "datetime-local"; toIn.title = "até";
+  controls.append(el("span", "dt-lbl", "de")); controls.append(fromIn);
+  controls.append(el("span", "dt-lbl", "até")); controls.append(toIn);
+  fromIn.oninput = repaint; toIn.oninput = repaint;
+  panel.append(controls);
+
+  const table = el("table", "dash-table");
+  const thead = el("thead");
+  thead.innerHTML = "<tr><th>quando</th><th>surface</th><th>destino</th><th>motivo</th><th>score</th><th>prompt tok</th></tr>";
+  table.append(thead);
+  const tbody = el("tbody");
+
+  // one shared popover
+  let pop = null;
+  const closePop = () => { if (pop) { pop.remove(); pop = null; } };
+  document.addEventListener("click", closePop);
+
+  const rows = [];
+  recent.forEach((e) => {
+    const tr = el("tr", "drow");
+    tr.append(el("td", "muted nowrap", fmtDateTime(e.ts)));
+    tr.append(el("td", null, e.surface));
+    const dest = el("td");
+    dest.append(el("span", "destpill dest-" + e.dest, e.dest));
+    tr.append(dest);
+    tr.append(el("td", "muted", e.reason || "—"));
+    const sc = el("td");
+    const scWrap = el("div", "scorecell scoreclick");
+    const scBar = el("div", "scorebar");
+    scBar.style.width = Math.round(Math.min(1, e.score) * 100) + "%";
+    scWrap.append(el("span", "scoretxt", e.score.toFixed(2)));
+    const scTrack = el("div", "scoretrack"); scTrack.append(scBar); scWrap.append(scTrack);
+    scWrap.onclick = (ev) => {
+      ev.stopPropagation();
+      closePop();
+      pop = scoreExplainNode(e);
+      document.body.append(pop);
+      const r = scWrap.getBoundingClientRect();
+      pop.style.left = Math.min(r.left, window.innerWidth - 320) + "px";
+      pop.style.top = (r.bottom + 6) + "px";
+    };
+    sc.append(scWrap);
+    tr.append(sc);
+    tr.append(el("td", "muted", fmtNum(e.prompt_tok)));
+
+    // Expandable prompt row.
+    const detail = el("tr", "drow-detail hidden");
+    const dcell = el("td"); dcell.colSpan = 6;
+    if (e.prompt_snippet) {
+      dcell.append(el("div", "prompt-label", "Prompt (último turno)"));
+      dcell.append(el("div", "prompt-box", e.prompt_snippet));
+    } else {
+      dcell.append(el("div", "muted", "sem prompt registrado para esta linha"));
+    }
+    detail.append(dcell);
+    tr.onclick = () => detail.classList.toggle("hidden");
+
+    tbody.append(tr); tbody.append(detail);
+    rows.push({ tr, detail, e });
+  });
+  table.append(tbody);
+  panel.append(table);
+
+  function repaint() {
+    const q = search.value.trim().toLowerCase();
+    const fromTs = fromIn.value ? new Date(fromIn.value).getTime() / 1000 : null;
+    const toTs = toIn.value ? new Date(toIn.value).getTime() / 1000 : null;
+    rows.forEach(({ tr, detail, e }) => {
+      const hay = `${e.surface} ${e.reason || ""} ${e.prompt_snippet || ""}`.toLowerCase();
+      const matchText = !q || hay.includes(q);
+      const matchDest = destFilter === "all" || e.dest === destFilter;
+      const matchFrom = fromTs == null || e.ts >= fromTs;
+      const matchTo = toTs == null || e.ts <= toTs;
+      const show = matchText && matchDest && matchFrom && matchTo;
+      tr.style.display = show ? "" : "none";
+      if (!show) detail.classList.add("hidden");
+      if (!show) detail.style.display = "none"; else detail.style.display = "";
+    });
+  }
 }
 
 // ---- hash router ----

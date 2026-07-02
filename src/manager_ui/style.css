@@ -373,3 +373,42 @@ body {
 .btn.danger.armed { background: var(--red); color: #fff; border-color: var(--red); }
 
 .dash-bar-actions { display: flex; gap: 10px; align-items: center; }
+
+/* Tools view — controls + collapsible descriptions */
+.tools-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 14px 0 6px; }
+.tools-search {
+  flex: 1; min-width: 200px; padding: 8px 12px; font: inherit; font-size: 13px;
+  background: var(--panel-2); color: var(--txt); border: 1px solid var(--line); border-radius: 10px;
+}
+.tools-search:focus { outline: none; border-color: var(--teal); }
+.tool-lbl { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.desc-toggle {
+  appearance: none; background: none; border: none; cursor: pointer;
+  color: var(--teal); font: inherit; font-size: 11.5px; padding: 2px 4px;
+}
+.desc-toggle:hover { text-decoration: underline; }
+.tooldesc.hidden { display: none; }
+.tooldesc { white-space: pre-wrap; }
+
+/* Dashboard table — filters, score popover, prompt expand */
+.dash-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.dt-input { padding: 6px 8px; font: inherit; font-size: 12.5px; background: var(--panel-2); color: var(--txt); border: 1px solid var(--line); border-radius: 8px; }
+.dt-lbl { color: var(--muted); font-size: 12px; }
+.nowrap { white-space: nowrap; }
+.drow { cursor: pointer; }
+.drow:hover td { background: rgba(255,255,255,.02); }
+.scoreclick { cursor: pointer; }
+.scoreclick:hover .scoretxt { color: var(--teal); }
+.drow-detail.hidden { display: none; }
+.drow-detail td { background: rgba(13,17,23,.5); }
+.prompt-label { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.prompt-box { white-space: pre-wrap; font-size: 12.5px; line-height: 1.5; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; max-height: 260px; overflow: auto; }
+.score-pop {
+  position: fixed; z-index: 50; width: 300px; max-width: 92vw;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 14px; font-size: 12.5px;
+}
+.score-pop-title { font-weight: 600; margin-bottom: 8px; }
+.score-pop-line { color: var(--muted); line-height: 1.7; }
+.score-pop-line b { color: var(--txt); }
+.score-pop-why { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--teal); }
