@@ -21,6 +21,8 @@ use crate::server::Generator;
 pub struct ModelSpec {
     pub repo: String,
     pub file: String,
+    #[serde(default)]
+    pub quant: Option<String>,
 }
 
 /// Phase within a switch, for status reporting.
@@ -315,7 +317,7 @@ mod tests {
     }
 
     fn spec(repo: &str, file: &str) -> ModelSpec {
-        ModelSpec { repo: repo.into(), file: file.into() }
+        ModelSpec { repo: repo.into(), file: file.into(), quant: None }
     }
 
     fn noop_builder() -> EngineBuilder {
@@ -500,5 +502,16 @@ mod tests {
         assert_eq!(s.current, spec("r", "f"));
         assert_eq!(s.target, None);
         assert_eq!(s.progress, 100);
+    }
+
+    #[test]
+    fn model_spec_quant_defaults_and_round_trips() {
+        // old JSON without "quant" → None
+        let old: ModelSpec = serde_json::from_str(r#"{"repo":"r","file":"f"}"#).unwrap();
+        assert_eq!(old.quant, None);
+        // round-trip with quant
+        let s = ModelSpec { repo: "r".into(), file: "f".into(), quant: Some("Q6_K".into()) };
+        let j = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<ModelSpec>(&j).unwrap(), s);
     }
 }

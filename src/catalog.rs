@@ -404,7 +404,7 @@ mod tests {
         // (weights alone saturate the 78% device budget → max=0).
         // Largest-that-fits = 8B (params_b 8 > 7).
         let cat = sample();
-        let active = ModelSpec { repo: "q/7b".into(), file: "7b.gguf".into() };
+        let active = ModelSpec { repo: "q/7b".into(), file: "7b.gguf".into(), quant: None };
         let downloaded = |r: &str, _f: &str| r == "q/3b"; // 3B cached
         let view = catalog_view(&cat, 16384, 32768, KvKind::Q8, Some(&active), downloaded, |_, _| None, |_, _| crate::settings::ExecProfile::default());
 

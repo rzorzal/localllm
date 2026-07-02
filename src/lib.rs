@@ -163,6 +163,7 @@ pub async fn run_server_with_ready_policy_token(
     let initial_spec = ModelSpec {
         repo: cfg.model_id.clone(),
         file: cfg.gguf_files[0].clone(),
+        quant: None,
     };
     let b_ctx_len = cfg.ctx_len as u32;
     let b_kv_type = cfg.kv_type.clone(); // crate::config::KvType
@@ -392,7 +393,7 @@ pub fn router_for_test_with(
     });
     let manager = ModelManager::new(
         gen,
-        ModelSpec { repo: "test".into(), file: "test".into() },
+        ModelSpec { repo: "test".into(), file: "test".into(), quant: None },
         builder,
     );
     crate::server::router(

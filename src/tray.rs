@@ -237,6 +237,7 @@ mod tests {
         let spec = ModelSpec {
             repo: "Qwen/Qwen2.5-7B-Instruct-GGUF".into(),
             file: "qwen2.5-7b-instruct-q4_k_m.gguf".into(),
+            quant: None,
         };
         assert_eq!(
             model_menu_label(&spec),
@@ -246,7 +247,7 @@ mod tests {
 
     #[test]
     fn label_handles_repo_without_owner() {
-        let spec = ModelSpec { repo: "local".into(), file: "m.gguf".into() };
+        let spec = ModelSpec { repo: "local".into(), file: "m.gguf".into(), quant: None };
         assert_eq!(model_menu_label(&spec), "Model:  local / m.gguf");
     }
 
@@ -256,7 +257,7 @@ mod tests {
     fn status(state: &str, phase: SwitchPhase, progress: u8) -> SwitchStatus {
         SwitchStatus {
             state: state.into(),
-            current: ModelSpec { repo: "r".into(), file: "f".into() },
+            current: ModelSpec { repo: "r".into(), file: "f".into(), quant: None },
             target: None,
             phase,
             progress,

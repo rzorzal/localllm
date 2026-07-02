@@ -514,7 +514,7 @@ async fn handle_admin_switch(
         )
             .into_response();
     }
-    let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file };
+    let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: None };
     match state.manager.start_switch(spec) {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state": "switching"}))).into_response(),
         Err(crate::model_manager::SwitchError::AlreadySwitching) => (
@@ -646,7 +646,7 @@ async fn handle_model_set_ctx(
     // Reload if this is the active model so the new ctx takes effect now.
     let active = state.manager.status().current;
     if active.repo == body.repo && active.file == body.file {
-        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file };
+        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: None };
         match state.manager.start_switch(spec) {
             Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
             Err(crate::model_manager::SwitchError::AlreadySwitching) => {
@@ -721,7 +721,7 @@ async fn handle_model_set_profile(
     // Reload if this is the active model so the new profile takes effect now.
     let active = state.manager.status().current;
     if active.repo == body.repo && active.file == body.file {
-        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file };
+        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: None };
         match state.manager.start_switch(spec) {
             Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
             Err(crate::model_manager::SwitchError::AlreadySwitching) => {
