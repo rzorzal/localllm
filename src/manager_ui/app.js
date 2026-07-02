@@ -540,7 +540,7 @@ async function renderTools() {
     wrap.append(el("div", "ctxnote", "Nenhuma tool descoberta ainda. Envie um request de um cliente (Claude Code / Codex) e recarregue."));
   }
   surfaces.forEach(surface => {
-    const { seen = [], disabled = [] } = data[surface];
+    const { seen = [], disabled = [], descriptions = {} } = data[surface];
     const box = el("div", "ctxbox");
     box.append(el("div", "ctxtitle", surface));
     if (seen.length === 0) {
@@ -549,13 +549,17 @@ async function renderTools() {
     const boxes = [];
     const addRow = (name, blocked, notSeen) => {
       const row = el("label", "toolrow" + (blocked ? " blocked" : ""));
+      const head = el("div", "toolhead");
       const cb = el("input", "toolcb");
       cb.type = "checkbox";
       cb.checked = !blocked; // checked = enabled
       cb.dataset.name = name;
-      row.append(cb, el("span", "toolname", name));
-      if (blocked) row.append(el("span", "toolflag", "bloqueada"));
-      if (notSeen) row.append(el("span", "toolmuted", "não vista agora"));
+      head.append(cb, el("span", "toolname", name));
+      if (blocked) head.append(el("span", "toolflag", "bloqueada"));
+      if (notSeen) head.append(el("span", "toolmuted", "não vista agora"));
+      row.append(head);
+      const desc = descriptions[name];
+      if (desc) row.append(el("div", "tooldesc", desc));
       box.append(row);
       boxes.push(cb);
     };

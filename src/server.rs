@@ -264,22 +264,39 @@ fn resolve_history_turns(active: &crate::model_manager::ModelSpec) -> Option<u32
 /// inference. Local-only; the cloud path forwards raw bytes untouched.
 fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
     // 1) record seen (pre-filter) — reflects what the client actually sent.
-    // The latest request's set replaces the previous one (new tools appear, gone
-    // tools drop). Persist on change so the Tools view survives a restart.
+    // Cumulative: tools are only ever ADDED to the seen set, never removed — a
+    // tool that stops being sent stays listed so it (and its block) persist if
+    // it ever returns. Persist on growth so the Tools view survives a restart.
     {
-        let mut names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
-        names.sort();
-        names.dedup();
-        let changed = {
-            let mut reg = state.tool_registry.lock().unwrap_or_else(|e| e.into_inner());
-            let differs = reg.get(surface) != Some(&names);
-            if differs {
-                reg.insert(surface.to_string(), names.clone());
+        // Capture descriptions for this session (rendered in the Tools view).
+        {
+            let mut descs = state.tool_descs.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = descs.entry(surface.to_string()).or_default();
+            for t in &req.tools {
+                if !t.description.is_empty() {
+                    entry.insert(t.name.clone(), t.description.clone());
+                }
             }
-            differs
+        }
+        // Union the request's tool names into the seen set (seeded from the
+        // persisted set the first time this surface is touched this session).
+        let grown: Option<Vec<String>> = {
+            let mut reg = state.tool_registry.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = reg
+                .entry(surface.to_string())
+                .or_insert_with(|| crate::settings::load_tool_seen(surface));
+            let before = entry.len();
+            for t in &req.tools {
+                if !entry.contains(&t.name) {
+                    entry.push(t.name.clone());
+                }
+            }
+            entry.sort();
+            entry.dedup();
+            if entry.len() != before { Some(entry.clone()) } else { None }
         };
-        if changed {
-            if let Err(e) = crate::settings::save_tool_seen(surface, &names) {
+        if let Some(seen) = grown {
+            if let Err(e) = crate::settings::save_tool_seen(surface, &seen) {
                 tracing::warn!("failed to persist seen tools for {surface}: {e}");
             }
         }
@@ -420,6 +437,10 @@ pub struct AppState {
     /// Per-surface discovery of the tool names seen on recent requests
     /// (surface -> latest sorted-unique names). In-memory; re-discovered on restart.
     pub tool_registry: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
+    /// Per-surface tool descriptions seen this session (surface -> name -> desc).
+    /// In-memory only; re-captured as requests carry them. Rendered in the Tools
+    /// view when available.
+    pub tool_descs: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>>,
     /// TCP port this server listens on — needed to (re)wire agent client configs
     /// via `POST /admin/integrations`.
     pub port: u16,
@@ -501,6 +522,9 @@ pub fn router(
         requested_ctx_ceiling,
         kv_kind,
         tool_registry: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        )),
+        tool_descs: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::new(),
         )),
         port,
@@ -978,6 +1002,11 @@ async fn handle_tools_get(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let descs = state
+        .tool_descs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let mut out = serde_json::Map::new();
     for surface in KNOWN_SURFACES {
         // In-memory registry is the live source once a request has arrived this
@@ -990,9 +1019,10 @@ async fn handle_tools_get(
         if seen.is_empty() && disabled.is_empty() {
             continue;
         }
+        let descriptions = descs.get(surface).cloned().unwrap_or_default();
         out.insert(
             surface.to_string(),
-            json!({ "seen": seen, "disabled": disabled }),
+            json!({ "seen": seen, "disabled": disabled, "descriptions": descriptions }),
         );
     }
     Json(serde_json::Value::Object(out)).into_response()
@@ -1568,6 +1598,9 @@ fn make_seeded_test_router(
         requested_ctx_ceiling: 32768,
         kv_kind: crate::fit::KvKind::Q8,
         tool_registry,
+        tool_descs: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        )),
         port: 31415,
     }))
 }
