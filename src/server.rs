@@ -559,8 +559,14 @@ async fn handle_admin_switch(
             .into_response();
     }
     let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: body.quant };
+    let (save_repo, save_file, save_quant) = (spec.repo.clone(), spec.file.clone(), spec.quant.clone());
     match state.manager.start_switch(spec) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state": "switching"}))).into_response(),
+        Ok(()) => {
+            if let Err(e) = crate::settings::save_active_model(&save_repo, &save_file, save_quant.as_deref()) {
+                tracing::warn!("failed to persist active model: {e}");
+            }
+            (StatusCode::ACCEPTED, Json(json!({"state": "switching"}))).into_response()
+        }
         Err(crate::model_manager::SwitchError::AlreadySwitching) => (
             StatusCode::CONFLICT,
             Json(json!({"error": "switch already in progress"})),

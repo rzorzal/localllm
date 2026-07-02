@@ -112,6 +112,24 @@ fn main() -> anyhow::Result<()> {
             .block_on(localllm::engine_llama::run_smoke_test());
     }
 
+    // Restore the last activated model unless --model-id was explicitly passed.
+    // DEFAULT_MODEL/DEFAULT_FILE MUST match the #[arg(default_value …)] in
+    // src/config.rs — if they drift, explicit-CLI detection breaks.
+    let mut cfg = args.config;
+    {
+        const DEFAULT_MODEL: &str = "Qwen/Qwen2.5-3B-Instruct-GGUF";
+        const DEFAULT_FILE: &str = "qwen2.5-3b-instruct-q4_k_m.gguf";
+        let (model, files) = localllm::settings::resolve_active_model(
+            &cfg.model_id,
+            &cfg.gguf_files,
+            DEFAULT_MODEL,
+            DEFAULT_FILE,
+            localllm::settings::load_active_model(),
+        );
+        cfg.model_id = model;
+        cfg.gguf_files = files;
+    }
+
     // --- Tray mode: server on background thread, event loop on main thread. ---
     // Enable tray mode if --tray is passed OR we were launched from a macOS
     // .app bundle (launchd sets __CFBundleIdentifier). Launching as the
@@ -124,9 +142,9 @@ fn main() -> anyhow::Result<()> {
         { false }
     };
     if want_tray {
-        let token = std::sync::Arc::from(localllm::server::resolve_admin_token(args.config.admin_token.clone()));
+        let token = std::sync::Arc::from(localllm::server::resolve_admin_token(cfg.admin_token.clone()));
         // run_tray() is `-> !` (exits via process::exit on Quit).
-        localllm::tray::run_tray(args.config, token);
+        localllm::tray::run_tray(cfg, token);
     }
 
     // --- Headless mode ---
@@ -135,5 +153,5 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(localllm::run_server(args.config))
+        .block_on(localllm::run_server(cfg))
 }
