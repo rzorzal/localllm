@@ -156,6 +156,7 @@ fn route_decision(
     internal: &ChatRequest,
     headers: &axum::http::HeaderMap,
     rid: &str,
+    surface: &str,
 ) -> (crate::route::Decision, usize) {
     let has_cloud_creds =
         headers.contains_key("x-api-key") || headers.contains_key("authorization");
@@ -189,6 +190,24 @@ fn route_decision(
         if signals.local_ctx_window == 0 { 1.0 } else { (prompt_tokens as f64 / signals.local_ctx_window as f64).min(1.0) },
         signals.n_tools,
     );
+
+    // Persist the routing decision (where + why + score + prompt size) for the
+    // dashboard. Completion tokens are unknown at decision time → None. Records
+    // the DECISION, not the eventual outcome (a cloud decision that degrades to
+    // local still reads "cloud"). Best-effort — never fails the request.
+    let (dest, reason) = match decision {
+        crate::route::Decision::Cloud(r) => ("cloud", Some(format!("{r:?}"))),
+        _ => ("local", None),
+    };
+    crate::route_log::append(&crate::route_log::RouteEntry {
+        ts: crate::route_log::now_secs(),
+        surface: surface.to_string(),
+        dest: dest.to_string(),
+        reason,
+        score,
+        prompt_tok: prompt_tokens as u64,
+        completion_tok: None,
+    });
 
     (decision, prompt_tokens)
 }
@@ -976,7 +995,7 @@ async fn handle_oai_chat(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "openai");
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
@@ -1155,7 +1174,7 @@ async fn handle_oai_responses(
             Json(json!({"error": "model switching, retry shortly"}))).into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "openai-responses");
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [responses] route=cloud reason={reason:?}");
@@ -1263,7 +1282,7 @@ async fn handle_anth_messages(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid);
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "anthropic");
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
