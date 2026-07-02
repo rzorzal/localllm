@@ -104,51 +104,66 @@ function el(tag, cls, html) {
 }
 
 // ---- Pane 0: Config landing ----
+const NAV_CARDS = [
+  { route: "/models", icon: "◈", title: "Models", desc: "Escolher, baixar e configurar modelos locais" },
+  { route: "/tools", icon: "⛭", title: "Tools", desc: "Filtrar tools por cliente" },
+  { route: "/dashboard", icon: "▤", title: "Dashboard", desc: "Roteamento local↔cloud e tokens economizados" },
+];
+
 function renderConfig() {
   currentView = renderConfig;
   setCrumbs([{ label: "Config" }]);
-  const grid = el("div", "grid");
+  const shell = el("div", "config-home");
+  shell.append(el("div", "config-lead", "Configuração"));
 
-  const modelsCard = el("div", "card");
-  modelsCard.append(el("h3", null, "Models"));
-  modelsCard.append(el("div", "meta", "Escolher, baixar e configurar modelos locais"));
-  modelsCard.onclick = () => navigate("/models");
-  grid.append(modelsCard);
-
-  const toolsCard = el("div", "card");
-  toolsCard.append(el("h3", null, "Tools"));
-  toolsCard.append(el("div", "meta", "Filtrar tools por cliente"));
-  toolsCard.onclick = () => navigate("/tools");
-  grid.append(toolsCard);
-
-  const dashCard = el("div", "card");
-  dashCard.append(el("h3", null, "Dashboard"));
-  dashCard.append(el("div", "meta", "Roteamento local↔cloud e tokens economizados"));
-  dashCard.onclick = () => navigate("/dashboard");
-  grid.append(dashCard);
+  const grid = el("div", "navgrid");
+  NAV_CARDS.forEach((c, i) => {
+    const card = el("div", "navcard");
+    card.style.setProperty("--i", i);
+    card.append(el("div", "navicon", c.icon));
+    const body = el("div", "navbody");
+    body.append(el("h3", null, c.title));
+    body.append(el("div", "navdesc", c.desc));
+    card.append(body);
+    card.append(el("div", "navgo", "→"));
+    card.onclick = () => navigate(c.route);
+    grid.append(card);
+  });
+  shell.append(grid);
 
   view.innerHTML = "";
-  view.append(grid);
-  renderIntegrationToggle(view);
+  view.append(shell);
+  renderIntegrationToggle(shell);
 }
 
 // Route-apps integration toggle (moved from the tray). Reads GET /admin/integrations,
 // flips via POST. The tray shows the same state read-only.
 async function renderIntegrationToggle(container) {
-  const box = el("div", "ctxbox");
-  box.append(el("div", "ctxtitle", "Rotear apps pelo localllm"));
-  box.append(el("div", "ctxhint",
-    "Liga/desliga o roteamento dos clientes (Claude Code, Codex) por este servidor. Ao sair do localllm, o roteamento é removido automaticamente."));
-  const status = el("div", "ctxhint", "carregando…");
-  const btn = el("button", "btn primary", "…");
-  btn.disabled = true;
-  let enabled = false;
+  const panel = el("div", "intpanel");
+  const head = el("div", "intpanel-head");
+  const txt = el("div", "intpanel-txt");
+  txt.append(el("div", "intpanel-title", "Rotear apps pelo localllm"));
+  txt.append(el("div", "intpanel-sub",
+    "Clientes (Claude Code, Codex) passam por este servidor. Ao sair do localllm, o roteamento é removido automaticamente."));
+  head.append(txt);
 
+  const sw = el("button", "switch");
+  sw.setAttribute("role", "switch");
+  sw.append(el("span", "switch-knob"));
+  head.append(sw);
+  panel.append(head);
+
+  const status = el("div", "intpanel-status", "carregando…");
+  panel.append(status);
+
+  let enabled = false;
+  let busy = false;
   const paint = (st) => {
     enabled = !!st.enabled;
-    btn.textContent = enabled ? "Desligar" : "Ligar";
-    btn.disabled = false;
+    sw.classList.toggle("on", enabled);
+    sw.setAttribute("aria-checked", enabled ? "true" : "false");
     const wired = (st.wired || []).join(", ");
+    status.className = "intpanel-status" + (enabled ? " on" : "");
     status.textContent = enabled
       ? `Ligado — wired: ${wired || "nenhum cliente encontrado"}`
       : "Desligado — apps vão direto ao provider";
@@ -157,77 +172,92 @@ async function renderIntegrationToggle(container) {
   try { paint(await api("GET", "/admin/integrations")); }
   catch (e) { status.textContent = e.message; }
 
-  btn.onclick = async () => {
-    btn.disabled = true;
+  sw.onclick = async () => {
+    if (busy) return;
+    busy = true; sw.classList.add("busy");
     try { paint(await api("POST", "/admin/integrations", { enabled: !enabled })); toast("Integração atualizada"); }
-    catch (e) { toast(e.message, true); btn.disabled = false; }
+    catch (e) { toast(e.message, true); }
+    finally { busy = false; sw.classList.remove("busy"); }
   };
 
-  const actions = el("div", "actions");
-  actions.append(btn);
-  box.append(status, actions);
-  container.append(box);
+  container.append(panel);
 }
 
-// ---- Pane 1: families ----
+// Firestore-style drilldown selection, preserved across background refreshes.
+let selFamilyName = null;
+let selModelFile = null;
+
+// ---- Models: three-column drilldown (Família → Modelo → Detalhe) ----
 function renderFamilies() {
   currentView = renderFamilies;
-  setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Models" }, { label: "Tools", onClick: renderTools }]);
-  const grid = el("div", "grid");
-  families.forEach((fam) => {
-    const recommended = fam.models.some((m) => m.recommended);
-    const inUse = fam.models.some((m) => m.status === "in_use");
-    const card = el("div", "card");
-    card.append(el("h3", null, fam.family));
-    card.append(el("div", "meta", `${fam.models.length} model${fam.models.length === 1 ? "" : "s"}`));
-    const row = el("div", "row");
-    if (inUse) row.append(el("span", "badge in_use", "In use"));
-    if (recommended) row.append(el("span", "badge fits", "★ Recommended"));
-    card.append(row);
-    card.onclick = () => renderModels(fam);
-    grid.append(card);
+  setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Models" }]);
+
+  const fam = families.find((f) => f.family === selFamilyName) || null;
+  const model = fam ? fam.models.find((m) => m.file === selModelFile) || null : null;
+
+  const cols = el("div", "columns");
+
+  // Column 1 — families
+  const c1 = el("div", "col");
+  c1.append(el("div", "colhead", "Família"));
+  const c1b = el("div", "colbody");
+  families.forEach((f) => {
+    const inUse = f.models.some((m) => m.status === "in_use");
+    const rec = f.models.some((m) => m.recommended);
+    const it = el("div", "colitem" + (f.family === selFamilyName ? " sel" : ""));
+    const left = el("div", "colitem-main");
+    left.append(el("span", "colitem-name", f.family));
+    left.append(el("span", "colitem-sub", `${f.models.length} variante${f.models.length === 1 ? "" : "s"}`));
+    it.append(left);
+    const tags = el("div", "colitem-tags");
+    if (inUse) tags.append(el("span", "pip pip-use", ""));
+    if (rec) tags.append(el("span", "pip pip-rec", ""));
+    tags.append(el("span", "chev", "›"));
+    it.append(tags);
+    it.onclick = () => { selFamilyName = f.family; selModelFile = null; renderFamilies(); };
+    c1b.append(it);
   });
-  view.innerHTML = ""; view.append(grid);
+  c1.append(c1b);
+  cols.append(c1);
+
+  // Column 2 — models in the selected family
+  const c2 = el("div", "col");
+  c2.append(el("div", "colhead", "Modelo"));
+  const c2b = el("div", "colbody");
+  if (!fam) c2b.append(el("div", "colempty", "escolha uma família"));
+  else fam.models.forEach((m) => {
+    const it = el("div", "colitem" + (m.file === selModelFile ? " sel" : ""));
+    if (m.recommended) it.classList.add("rec");
+    const left = el("div", "colitem-main");
+    left.append(el("span", "colitem-name", m.display_name));
+    left.append(el("span", "colitem-sub", `${m.params} · ${m.quant} · ${gb(m.size_mb)}`));
+    it.append(left);
+    const tags = el("div", "colitem-tags");
+    tags.append(el("span", "badge " + m.status, STATUS_LABEL[m.status] || m.status));
+    tags.append(el("span", "chev", "›"));
+    it.append(tags);
+    it.onclick = () => { selModelFile = m.file; renderFamilies(); };
+    c2b.append(it);
+  });
+  c2.append(c2b);
+  cols.append(c2);
+
+  // Column 3 — detail of the selected model
+  const c3 = el("div", "col col-detail");
+  c3.append(el("div", "colhead", "Detalhe"));
+  const c3b = el("div", "colbody");
+  if (!model) c3b.append(el("div", "colempty", fam ? "escolha um modelo" : "← comece pela família"));
+  else c3b.append(buildDetail(fam, model));
+  c3.append(c3b);
+  cols.append(c3);
+
+  view.innerHTML = ""; view.append(cols);
 }
 
-// ---- Pane 2: models in a family ----
-function renderModels(fam) {
-  const famName = fam.family;
-  currentView = () => {
-    const f = families.find((x) => x.family === famName);
-    f ? renderModels(f) : renderFamilies();
-  };
-  setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Models", onClick: renderFamilies }, { label: fam.family }]);
-  const grid = el("div", "grid");
-  fam.models.forEach((m) => {
-    const card = el("div", "card");
-    if (m.recommended) card.append(el("div", "ribbon", "RECOMMENDED"));
-    card.append(el("h3", null, m.display_name));
-    card.append(el("div", "meta", `${m.params} · ${m.quant} · ${gb(m.size_mb)}`));
-    const row = el("div", "row");
-    row.append(el("span", "badge " + m.status, STATUS_LABEL[m.status] || m.status));
-    row.append(el("span", "badge " + m.fit, `${FIT_LABEL[m.fit] || m.fit} · ~${gb(m.est_ram_mb)} RAM`));
-    card.append(row);
-    card.onclick = () => renderDetail(fam, m);
-    grid.append(card);
-  });
-  view.innerHTML = ""; view.append(grid);
-}
-
-// ---- Pane 3: detail + actions ----
-function renderDetail(fam, m) {
-  const famName = fam.family, file = m.file;
-  currentView = () => {
-    const f = families.find((x) => x.family === famName);
-    const mm = f && f.models.find((x) => x.file === file);
-    mm ? renderDetail(f, mm) : (f ? renderModels(f) : renderFamilies());
-  };
-  setCrumbs([
-    { label: "Config", onClick: renderConfig },
-    { label: "Models", onClick: renderFamilies },
-    { label: fam.family, onClick: () => renderModels(fam) },
-    { label: m.display_name },
-  ]);
+// Build the detail/actions element for a model (rendered into column 3).
+// Internal saves call currentView() (= renderFamilies) to refresh in place,
+// preserving the current family/model selection.
+function buildDetail(fam, m) {
   const wrap = el("div", "detail");
   wrap.append(el("h2", null, m.display_name + (m.recommended ? " ★" : "")));
   const specs = el("div", "specs");
@@ -357,7 +387,7 @@ function renderDetail(fam, m) {
   actions.append(delBtn);
   wrap.append(actions);
 
-  view.innerHTML = ""; view.append(wrap);
+  return wrap;
 }
 
 async function doSwitch(m, wrap) {
@@ -525,31 +555,113 @@ async function saveToolFilter(surface, boxes) {
 }
 
 // ---- Pane: Dashboard (routing + tokens saved) ----
-// NOTE: functional layout — the polished visual is co-designed with the user
-// (frontend-design) before finalizing. Data contract fixed by GET /admin/dashboard.
+const PERIOD_LABEL = { hour: "Última hora", day: "Hoje", month: "Este mês" };
+
+// Compact number formatting: 1240000 → "1.24M", 12000 → "12.0k".
+function fmtNum(n) {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+}
+function pctSaved(b) {
+  const all = b.tokens_if_all_cloud || 0;
+  return all === 0 ? 0 : Math.round((b.tokens_saved / all) * 100);
+}
+function pctLocal(b) {
+  const total = (b.local_count || 0) + (b.cloud_count || 0);
+  return total === 0 ? 0 : Math.round((b.local_count / total) * 100);
+}
+
 async function renderDashboard() {
   currentView = renderDashboard;
   setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Dashboard" }]);
   let d;
   try { d = await api("GET", "/admin/dashboard"); }
   catch (e) { view.innerHTML = ""; view.append(el("div", "detail", e.message)); return; }
-  const wrap = el("div", "detail");
-  wrap.append(el("h2", null, "Dashboard"));
+
+  const wrap = el("div", "dash");
+  const m = d.month || { tokens_saved: 0, tokens_if_all_cloud: 0, local_count: 0, cloud_count: 0 };
+
+  // Hero — monthly savings
+  const hero = el("div", "dash-hero");
+  const heroL = el("div", "dash-hero-main");
+  heroL.append(el("div", "dash-kicker", "Tokens economizados este mês"));
+  heroL.append(el("div", "dash-big", fmtNum(m.tokens_saved)));
+  heroL.append(el("div", "dash-sub",
+    `de ${fmtNum(m.tokens_if_all_cloud)} se tudo fosse para a cloud`));
+  hero.append(heroL);
+  const heroR = el("div", "dash-hero-side");
+  const savedPct = pctSaved(m);
+  heroR.append(el("div", "dash-ring-num", savedPct + "%"));
+  heroR.append(el("div", "dash-ring-cap", "economia"));
+  const ring = el("div", "dash-ring");
+  ring.style.setProperty("--pct", savedPct);
+  ring.append(heroR);
+  hero.append(ring);
+  wrap.append(hero);
+
+  // Period cards
+  const cards = el("div", "dash-cards");
   ["hour", "day", "month"].forEach((k) => {
-    const b = d[k];
-    const box = el("div", "ctxbox");
-    box.append(el("div", "ctxtitle", { hour: "Última hora", day: "Hoje", month: "Este mês" }[k]));
-    box.append(el("div", "ctxhint",
-      `local ${b.local_count} · cloud ${b.cloud_count} · tokens salvos ${b.tokens_saved} · se tudo cloud ${b.tokens_if_all_cloud}`));
-    wrap.append(box);
+    const b = d[k] || { local_count: 0, cloud_count: 0, tokens_saved: 0, tokens_if_all_cloud: 0 };
+    const card = el("div", "dash-card");
+    card.append(el("div", "dash-card-head", PERIOD_LABEL[k]));
+    const saved = el("div", "dash-card-num");
+    saved.append(document.createTextNode(fmtNum(b.tokens_saved)));
+    saved.append(el("span", "dash-card-unit", " salvos"));
+    card.append(saved);
+    card.append(el("div", "dash-card-alt", `${fmtNum(b.tokens_if_all_cloud)} se tudo cloud`));
+    // local vs cloud ratio bar
+    const bar = el("div", "ratio");
+    const loc = el("div", "ratio-local");
+    loc.style.width = pctLocal(b) + "%";
+    bar.append(loc);
+    card.append(bar);
+    card.append(el("div", "dash-card-split",
+      `${b.local_count} local · ${b.cloud_count} cloud`));
+    cards.append(card);
   });
-  const rec = el("div", "ctxbox");
-  rec.append(el("div", "ctxtitle", "Recentes"));
-  (d.recent || []).forEach((e) => {
-    rec.append(el("div", "toolrow",
-      `${e.surface} → ${e.dest}${e.reason ? " (" + e.reason + ")" : ""} · score ${e.score.toFixed(2)} · ${e.prompt_tok} tok`));
-  });
-  wrap.append(rec);
+  wrap.append(cards);
+
+  // Recent decisions table
+  const panel = el("div", "dash-table-wrap");
+  panel.append(el("div", "dash-table-title", "Decisões recentes"));
+  const recent = d.recent || [];
+  if (recent.length === 0) {
+    panel.append(el("div", "colempty", "sem requisições ainda — envie um prompt por um cliente"));
+  } else {
+    const table = el("table", "dash-table");
+    const thead = el("thead");
+    thead.innerHTML = "<tr><th>surface</th><th>destino</th><th>motivo</th><th>score</th><th>prompt tok</th></tr>";
+    table.append(thead);
+    const tbody = el("tbody");
+    recent.forEach((e) => {
+      const tr = el("tr");
+      tr.append(el("td", null, e.surface));
+      const dest = el("td");
+      dest.append(el("span", "destpill dest-" + e.dest, e.dest));
+      tr.append(dest);
+      tr.append(el("td", "muted", e.reason || "—"));
+      const sc = el("td");
+      const scWrap = el("div", "scorecell");
+      const scBar = el("div", "scorebar");
+      scBar.style.width = Math.round(Math.min(1, e.score) * 100) + "%";
+      scWrap.append(el("span", "scoretxt", e.score.toFixed(2)));
+      const scTrack = el("div", "scoretrack");
+      scTrack.append(scBar);
+      scWrap.append(scTrack);
+      sc.append(scWrap);
+      tr.append(sc);
+      tr.append(el("td", "muted", fmtNum(e.prompt_tok)));
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    panel.append(table);
+  }
+  wrap.append(panel);
+
   view.innerHTML = ""; view.append(wrap);
 }
 
