@@ -150,3 +150,7 @@ body {
 }
 .advbox { margin-top: 10px; }
 .advsummary { cursor: pointer; opacity: 0.8; }
+
+.toolrow { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; }
+.toolcb { width: 16px; height: 16px; }
+.toolname { font-size: 13px; }

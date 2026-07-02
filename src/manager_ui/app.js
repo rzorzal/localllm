@@ -106,7 +106,7 @@ function el(tag, cls, html) {
 // ---- Pane 1: families ----
 function renderFamilies() {
   currentView = renderFamilies;
-  setCrumbs([{ label: "Models" }]);
+  setCrumbs([{ label: "Models", onClick: renderFamilies }, { label: "Tools", onClick: renderTools }]);
   const grid = el("div", "grid");
   families.forEach((fam) => {
     const recommended = fam.models.some((m) => m.recommended);
@@ -384,6 +384,77 @@ async function doDelete(m) {
     toast(r && r.deleted ? "Deleted" : "Nothing to delete");
     await refresh(); renderFamilies();
   } catch (e) { toast(e.message, true); }
+}
+
+// ---- Pane 4: tools filter ----
+async function renderTools() {
+  currentView = renderTools;
+  setCrumbs([
+    { label: "Models", onClick: renderFamilies },
+    { label: "Tools" },
+  ]);
+  let data;
+  try {
+    data = await api("GET", "/admin/tools");
+  } catch (e) {
+    view.innerHTML = ""; view.append(el("div", "detail", `Falha ao carregar: ${e.message || e}`));
+    return;
+  }
+  const wrap = el("div", "detail");
+  wrap.append(el("h2", null, "Filtro de tools por cliente"));
+  wrap.append(el("div", "ctxhint", "Desmarcar remove a tool do que o modelo recebe. Aplica no próximo request (sem rebuild). Cuidado: desabilitar uma tool que o cliente usa remove essa capacidade."));
+
+  const surfaces = Object.keys(data);
+  if (surfaces.length === 0) {
+    wrap.append(el("div", "ctxnote", "Nenhuma tool descoberta ainda. Envie um request de um cliente (Claude Code / Codex) e recarregue."));
+  }
+  surfaces.forEach(surface => {
+    const { seen = [], disabled = [] } = data[surface];
+    const box = el("div", "ctxbox");
+    box.append(el("div", "ctxtitle", surface));
+    if (seen.length === 0) {
+      box.append(el("div", "ctxnote", "envie um request deste cliente para descobrir as tools"));
+    }
+    const boxes = [];
+    seen.forEach(name => {
+      const row = el("label", "toolrow");
+      const cb = el("input", "toolcb");
+      cb.type = "checkbox";
+      cb.checked = !disabled.includes(name); // checked = enabled
+      cb.dataset.name = name;
+      row.append(cb, el("span", "toolname", name));
+      box.append(row);
+      boxes.push(cb);
+    });
+    // include any disabled-but-not-currently-seen tools so they can be re-enabled
+    disabled.filter(n => !seen.includes(n)).forEach(name => {
+      const row = el("label", "toolrow");
+      const cb = el("input", "toolcb");
+      cb.type = "checkbox"; cb.checked = false; cb.dataset.name = name;
+      row.append(cb, el("span", "toolname", `${name} (não visto agora)`));
+      box.append(row); boxes.push(cb);
+    });
+    if (boxes.length) {
+      const actions = el("div", "actions");
+      const saveBtn = el("button", "btn primary", "Salvar");
+      saveBtn.onclick = () => saveToolFilter(surface, boxes);
+      actions.append(saveBtn);
+      box.append(actions);
+    }
+    wrap.append(box);
+  });
+  view.innerHTML = ""; view.append(wrap);
+}
+
+async function saveToolFilter(surface, boxes) {
+  const disabled = boxes.filter(cb => !cb.checked).map(cb => cb.dataset.name);
+  try {
+    await api("POST", "/admin/tools", { surface, disabled });
+  } catch (e) {
+    return toast(`Falha ao salvar: ${e.message || e}`, true);
+  }
+  toast("Filtro salvo");
+  renderTools();
 }
 
 // ---- boot ----
