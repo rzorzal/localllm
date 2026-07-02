@@ -768,3 +768,23 @@ async fn admin_integrations_get_reports_state_shape() {
     assert!(body.get("enabled").and_then(|v| v.as_bool()).is_some());
     assert!(body.get("wired").map(|v| v.is_array()).unwrap_or(false));
 }
+
+// --- Dashboard API (config-nav-dashboard, Task 7) ---
+
+#[tokio::test]
+async fn admin_dashboard_requires_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_get_status(app, "/admin/dashboard").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_dashboard_returns_shape() {
+    let app = localllm::router_for_test();
+    let body = localllm::axum_test_get_with_header(
+        app, "/admin/dashboard", "x-admin-token", "test-token").await;
+    for k in ["hour", "day", "month", "recent"] {
+        assert!(body.get(k).is_some(), "missing {k}");
+    }
+    assert!(body["hour"].get("tokens_saved").is_some());
+}

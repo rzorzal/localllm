@@ -450,6 +450,7 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
         .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
         .route("/admin/integrations", get(handle_integrations_get).post(handle_integrations_set))
+        .route("/admin/dashboard", get(handle_dashboard))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
         .route("/manager/style.css", get(handle_manager_css))
@@ -547,6 +548,20 @@ async fn handle_integrations_set(
     let _ = crate::settings::save_integrations(&new_state);
     let wired: Vec<String> = new_state.priors.keys().cloned().collect();
     Json(json!({ "enabled": new_state.enabled, "wired": wired })).into_response()
+}
+
+/// GET /admin/dashboard — routing rollups + recent decisions (token-guarded).
+async fn handle_dashboard(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let entries = crate::route_log::read_all();
+    let dash = crate::route_log::build_dashboard(&entries, crate::route_log::now_secs(), 50);
+    Json(dash).into_response()
 }
 
 /// Verify the `X-Admin-Token` header against the configured token (constant-time).
