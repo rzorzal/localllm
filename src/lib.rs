@@ -35,6 +35,17 @@ fn resolve_load_params(
     crate::profile::resolve(&saved, catalog, global_ctx, global_kv)
 }
 
+/// Resolve the GGUF file list for a model + quant: the variant's files if the
+/// quant is available, else the model's default `file`.
+fn resolve_variant_files(repo: &str, file: &str, quant: &str) -> Vec<String> {
+    if let Some(entry) = crate::catalog::CATALOG.iter().find(|e| e.repo == repo && e.file == file) {
+        if let Some(files) = crate::catalog::files_for_quant(entry, quant) {
+            return files;
+        }
+    }
+    vec![file.to_string()]
+}
+
 /// Map `KvType` to the llama-cpp-2 KV cache type.
 fn kv_type_to_llama(t: crate::config::KvType) -> llama_cpp_2::context::params::KvCacheType {
     use llama_cpp_2::context::params::KvCacheType;
@@ -133,6 +144,7 @@ pub async fn run_server_with_ready_policy_token(
                 "resolved load params: ctx={} kv={:?} gpu_layers={:?}",
                 r.ctx, r.kv_type, r.gpu_layers
             );
+            // Startup: use CLI --gguf-file directly; saved-quant variant resolution applies on switch, not here.
             let llama = LlamaEngine::load(
                 &cfg.model_id,
                 &cfg.gguf_files,
@@ -193,10 +205,13 @@ pub async fn run_server_with_ready_policy_token(
             )
             .await?;
             let r = resolve_load_params(&spec.repo, &spec.file, b_ctx_len, kv_type);
+            // On switch, load the resolved quant variant's file list.
+            // The startup path keeps &cfg.gguf_files unchanged (CLI is authoritative).
+            let files = resolve_variant_files(&spec.repo, &spec.file, &r.quant);
             let engine =
                 LlamaEngine::load(
                     &spec.repo,
-                    &[spec.file.clone()],
+                    &files,
                     r.ctx as usize,
                     kv_type_to_llama(r.kv_type),
                     kv_dir,
@@ -585,6 +600,18 @@ pub async fn axum_test_request_with_header(
     let response = app.oneshot(request).await.unwrap();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn resolve_variant_files_prefers_quant_then_falls_back() {
+        // Absent repo → no catalog entry → falls back to [file] for any quant.
+        let files = crate::resolve_variant_files("q/absent", "model-q4_k_m.gguf", "Q4_K_M");
+        assert_eq!(files, vec!["model-q4_k_m.gguf".to_string()]);
+        let fb = crate::resolve_variant_files("q/absent", "model-q4_k_m.gguf", "Q9_NOPE");
+        assert_eq!(fb, vec!["model-q4_k_m.gguf".to_string()]); // fallback to spec.file
+    }
 }
 
 /// Send a POST with a JSON body to `path` on `app` and return the raw
