@@ -250,6 +250,21 @@ function renderDetail(fam, m) {
   adv.append(el("div", "ctxhint", "vazio = todas na GPU. Menos = tira pressão da Metal, porém mais lento."));
   wrap.append(adv);
 
+  // --- Quant variant ---
+  const qBox = el("div", "ctxbox");
+  qBox.append(el("div", "ctxtitle", "Quantização"));
+  const qSel = el("select", "kvselect");
+  (m.variants || []).forEach(v => {
+    const status = v.status === "downloaded" ? "✓ baixado" : `⇩ ${gb(v.size_mb)}`;
+    const opt = el("option", "", `${v.quant} · ~${gb(v.est_ram_mb)} · ${FIT_LABEL[v.fit] || v.fit} · ${status}`);
+    opt.value = v.quant;
+    if (v.selected) opt.selected = true;
+    qSel.append(opt);
+  });
+  qBox.append(qSel);
+  qBox.append(el("div", "ctxhint", `atual: ${m.quant_selected}`));
+  wrap.append(qBox);
+
   // --- Save profile button ---
   const profActions = el("div", "actions");
   const saveProfBtn = el("button", "btn primary", "Salvar perfil");
@@ -257,6 +272,7 @@ function renderDetail(fam, m) {
     kv_type: kvSel.value,
     history_turns: histInput.value === "" ? 0 : Number(histInput.value),
     gpu_layers: gpuInput.value === "" ? 4294967295 : Number(gpuInput.value), // u32::MAX = clear
+    quant: qSel.value,
   }, wrap);
   profActions.append(saveProfBtn);
   wrap.append(profActions);
