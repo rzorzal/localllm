@@ -134,7 +134,41 @@ function renderConfig() {
   view.innerHTML = "";
   view.append(shell);
   renderRoutingSelector(shell);
+  renderSmartHistoryToggle(shell);
   renderIntegrationToggle(shell);
+}
+
+// Global smart-history filter toggle. GET/POST /admin/history-filter.
+async function renderSmartHistoryToggle(container) {
+  const panel = el("div", "intpanel");
+  const head = el("div", "intpanel-head");
+  const txt = el("div", "intpanel-txt");
+  txt.append(el("div", "intpanel-title", "Filtro inteligente de histórico"));
+  txt.append(el("div", "intpanel-sub",
+    "Ao cortar o histórico, seleciona os turnos mais relevantes ao pedido atual (BM25 + MMR) em vez de só os mais recentes. Desligado = recência."));
+  head.append(txt);
+  const sw = el("button", "switch");
+  sw.setAttribute("role", "switch");
+  sw.append(el("span", "switch-knob"));
+  head.append(sw);
+  panel.append(head);
+  container.append(panel);
+
+  let enabled = false, busy = false;
+  const paint = (on) => {
+    enabled = !!on;
+    sw.classList.toggle("on", enabled);
+    sw.setAttribute("aria-checked", enabled ? "true" : "false");
+  };
+  try { const r = await api("GET", "/admin/history-filter"); paint(r.enabled); }
+  catch (_) {}
+  sw.onclick = async () => {
+    if (busy) return;
+    busy = true; sw.classList.add("busy");
+    try { const r = await api("POST", "/admin/history-filter", { enabled: !enabled }); paint(r.enabled); toast("Filtro atualizado"); }
+    catch (e) { toast(e.message, true); }
+    finally { busy = false; sw.classList.remove("busy"); }
+  };
 }
 
 // Routing profile selector (moved from the tray). GET current + options,
@@ -619,14 +653,36 @@ async function renderDashboard() {
 
   const wrap = el("div", "dash");
 
-  // Toolbar: clear-data action.
+  // Toolbar: clear-data action. Inline two-click confirm — window.confirm() is
+  // unreliable inside the wry webview (no JS dialog), so the first click arms
+  // the button and the second click actually clears + reloads.
   const bar = el("div", "dash-bar");
   bar.append(el("div", "dash-bar-title", "Dashboard"));
   const clearBtn = el("button", "btn danger", "Limpar dados");
+  let armed = false, armTimer = null;
   clearBtn.onclick = async () => {
-    if (!confirm("Limpar todo o histórico de roteamento? Não dá para desfazer.")) return;
-    try { await api("DELETE", "/admin/dashboard"); toast("Dados limpos"); renderDashboard(); }
-    catch (e) { toast(e.message, true); }
+    if (!armed) {
+      armed = true;
+      clearBtn.textContent = "Confirmar limpeza?";
+      clearBtn.classList.add("armed");
+      armTimer = setTimeout(() => {
+        armed = false; clearBtn.textContent = "Limpar dados"; clearBtn.classList.remove("armed");
+      }, 4000);
+      return;
+    }
+    clearTimeout(armTimer);
+    armed = false;
+    clearBtn.disabled = true;
+    try {
+      await api("DELETE", "/admin/dashboard");
+      toast("Dados limpos");
+      renderDashboard();
+    } catch (e) {
+      toast(e.message, true);
+      clearBtn.disabled = false;
+      clearBtn.textContent = "Limpar dados";
+      clearBtn.classList.remove("armed");
+    }
   };
   bar.append(clearBtn);
   wrap.append(bar);

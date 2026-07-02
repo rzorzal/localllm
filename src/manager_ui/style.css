@@ -369,3 +369,5 @@ body {
 .toolhead { display: flex; align-items: center; gap: 8px; }
 .tooldesc { margin-left: 24px; font-size: 12px; color: var(--muted); line-height: 1.4; }
 .toolrow.blocked .tooldesc { opacity: .7; }
+
+.btn.danger.armed { background: var(--red); color: #fff; border-color: var(--red); }
