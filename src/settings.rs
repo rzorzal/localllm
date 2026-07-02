@@ -30,6 +30,8 @@ pub struct ExecProfile {
     pub gpu_layers: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quant: Option<String>,
 }
 
 /// On-disk settings shape. New fields must be `#[serde(default)]` so older
@@ -318,6 +320,7 @@ mod tests {
                 kv_type: Some(crate::config::KvType::Q4),
                 gpu_layers: Some(20),
                 history_turns: Some(3),
+                quant: None,
             };
             save_model_profile(&k, &p).unwrap();
             assert_eq!(load_model_profile(&k), p);
@@ -345,6 +348,16 @@ mod tests {
             assert_eq!(load_model_profile("r/f").ctx, Some(4096));
             clear_model_ctx("r/f").unwrap();
             assert_eq!(load_model_profile("r/f").ctx, None);
+        });
+    }
+
+    #[test]
+    fn exec_profile_quant_round_trips() {
+        with_temp_settings(|| {
+            let k = model_ctx_key("r", "f");
+            let p = ExecProfile { quant: Some("Q5_K_M".into()), ..Default::default() };
+            save_model_profile(&k, &p).unwrap();
+            assert_eq!(load_model_profile(&k).quant, Some("Q5_K_M".to_string()));
         });
     }
 }
