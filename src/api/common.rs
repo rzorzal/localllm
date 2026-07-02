@@ -89,6 +89,11 @@ pub fn truncate_history(messages: Vec<ChatMessage>, keep_turns: Option<u32>) -> 
     // Leading system messages are always kept.
     let lead_sys = messages.iter().take_while(|m| m.role == Role::System).count();
 
+    if n == 0 {
+        // Keep only leading system messages.
+        return messages.into_iter().take(lead_sys).collect();
+    }
+
     // Indices (in the full vec) where a turn starts.
     let user_starts: Vec<usize> = messages
         .iter()
@@ -171,5 +176,23 @@ mod tests {
     fn truncate_none_is_passthrough() {
         let msgs = vec![m(Role::System, "sys"), m(Role::User, "u1")];
         assert_eq!(truncate_history(msgs.clone(), None), msgs);
+    }
+
+    #[test]
+    fn truncate_zero_turns_keeps_only_leading_system() {
+        let msgs = vec![
+            m(Role::System, "sys"),
+            m(Role::User, "u1"), m(Role::Assistant, "a1"),
+            m(Role::User, "u2"), m(Role::Assistant, "a2"),
+        ];
+        let out = truncate_history(msgs, Some(0));
+        let texts: Vec<_> = out.iter().map(|x| x.text.clone().unwrap()).collect();
+        assert_eq!(texts, vec!["sys"]);
+    }
+
+    #[test]
+    fn truncate_zero_turns_no_system_is_empty() {
+        let msgs = vec![m(Role::User, "u1"), m(Role::Assistant, "a1")];
+        assert!(truncate_history(msgs, Some(0)).is_empty());
     }
 }

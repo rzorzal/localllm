@@ -341,7 +341,7 @@ async function saveProfile(m, fields, wrap) {
   try {
     res = await api("POST", "/admin/model/profile", { repo: m.repo, file: m.file, ...fields });
   } catch (e) {
-    return toast(e.message, true);
+    return toast(`Falha ao salvar perfil: ${e.message || e}`, true);
   }
   if (res && res.reloading) {
     // Active model is reloading at the new profile — show the same progress UI as a ctx reload.
