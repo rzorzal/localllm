@@ -138,3 +138,15 @@ body {
   opacity: 0.7;
   font-style: italic;
 }
+
+.kvselect {
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  background: var(--panel-2);
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.advbox { margin-top: 10px; }
+.advsummary { cursor: pointer; opacity: 0.8; }

@@ -210,6 +210,57 @@ function renderDetail(fam, m) {
   }
   wrap.append(ctxBox);
 
+  // --- KV cache quantization ---
+  const kvBox = el("div", "ctxbox");
+  kvBox.append(el("div", "ctxtitle", "KV cache"));
+  const kvSel = el("select", "kvselect");
+  [["q8", "Q8 · metade da RAM (padrão)"], ["f16", "F16 · máxima qualidade"], ["q4", "Q4 · menor RAM"]]
+    .forEach(([val, label]) => {
+      const opt = el("option", "", label);
+      opt.value = val;
+      if (val === m.kv_current) opt.selected = true;
+      kvSel.append(opt);
+    });
+  kvBox.append(kvSel);
+  kvBox.append(el("div", "ctxhint", `recomendado: ${m.kv_default}`));
+  wrap.append(kvBox);
+
+  // --- History window (turns) ---
+  const histBox = el("div", "ctxbox");
+  histBox.append(el("div", "ctxtitle", "Histórico (turnos)"));
+  const histInput = el("input", "ctxinput");
+  histInput.type = "number";
+  histInput.min = 0;
+  histInput.placeholder = "todos";
+  if (m.history_turns_current != null) histInput.value = m.history_turns_current;
+  histBox.append(histInput);
+  histBox.append(el("div", "ctxhint", "0 ou vazio = manter tudo"));
+  wrap.append(histBox);
+
+  // --- Advanced: GPU layers (offload) ---
+  const adv = el("details", "advbox");
+  adv.append(el("summary", "advsummary", "Avançado"));
+  const gpuInput = el("input", "ctxinput");
+  gpuInput.type = "number";
+  gpuInput.min = 0;
+  gpuInput.placeholder = "todas";
+  if (m.gpu_layers_current != null) gpuInput.value = m.gpu_layers_current;
+  adv.append(el("div", "ctxtitle", "Camadas na GPU"));
+  adv.append(gpuInput);
+  adv.append(el("div", "ctxhint", "vazio = todas na GPU. Menos = tira pressão da Metal, porém mais lento."));
+  wrap.append(adv);
+
+  // --- Save profile button ---
+  const profActions = el("div", "actions");
+  const saveProfBtn = el("button", "btn primary", "Salvar perfil");
+  saveProfBtn.onclick = () => saveProfile(m, {
+    kv_type: kvSel.value,
+    history_turns: histInput.value === "" ? 0 : Number(histInput.value),
+    gpu_layers: gpuInput.value === "" ? 4294967295 : Number(gpuInput.value), // u32::MAX = clear
+  }, wrap);
+  profActions.append(saveProfBtn);
+  wrap.append(profActions);
+
   const actions = el("div", "actions");
   const switchBtn = el("button", "btn primary", m.status === "in_use" ? "Active" : "Switch to this model");
   switchBtn.disabled = m.status === "in_use";
@@ -280,6 +331,31 @@ async function saveCtx(m, ctx, wrap) {
     });
   } else {
     toast(res && res.cleared ? "Voltou ao padrão" : "Contexto salvo");
+    await refresh().catch(() => {});
+    currentView();
+  }
+}
+
+async function saveProfile(m, fields, wrap) {
+  let res;
+  try {
+    res = await api("POST", "/admin/model/profile", { repo: m.repo, file: m.file, ...fields });
+  } catch (e) {
+    return toast(e.message, true);
+  }
+  if (res && res.reloading) {
+    // Active model is reloading at the new profile — show the same progress UI as a ctx reload.
+    toast("recarregando…");
+    const prog = el("div", "progress");
+    const bar = el("div", "bar"); const fill = el("div", "fill"); bar.append(fill);
+    const phase = el("div", "phase", "reloading…");
+    prog.append(bar, phase); wrap.append(prog);
+    startPolling(fill, phase, (s) => {
+      toast(s.state === "error" ? (s.error || "reload failed") : "Perfil aplicado", s.state === "error");
+      currentView();
+    });
+  } else {
+    toast("Perfil salvo");
     await refresh().catch(() => {});
     currentView();
   }
