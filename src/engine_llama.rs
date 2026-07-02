@@ -152,6 +152,7 @@ impl LlamaEngine {
         ctx_len: usize,
         kv_cache_type: KvCacheType,
         kv_cache_dir: Option<PathBuf>,
+        gpu_layers: Option<u32>,
         total_ram_mb: u64,
     ) -> Result<Self> {
         // Download (or skip if cached) and get local paths.
@@ -198,7 +199,7 @@ impl LlamaEngine {
 
         // Spawn the persistent worker thread. It owns backend + model + context.
         std::thread::spawn(move || {
-            worker_thread(path, ctx_len_u32, kv_cache_type, provenance_base, kv_cache_dir, total_ram_mb, rx, load_tx);
+            worker_thread(path, ctx_len_u32, kv_cache_type, gpu_layers, provenance_base, kv_cache_dir, total_ram_mb, rx, load_tx);
         });
 
         // Wait for the worker to signal successful model load (or an error).
@@ -248,6 +249,11 @@ fn shared_backend() -> &'static LlamaBackend {
     BACKEND.get_or_init(|| {
         LlamaBackend::init().expect("llama backend init (once, process-global)")
     })
+}
+
+/// GPU-layer count for `with_n_gpu_layers`: `None` means "all layers on GPU".
+fn resolve_n_gpu_layers(opt: Option<u32>) -> u32 {
+    opt.unwrap_or(u32::MAX)
 }
 
 /// Build the context params for a given context length + KV type. Extracted so
@@ -314,6 +320,7 @@ fn worker_thread(
     model_path: PathBuf,
     ctx_len: u32,
     kv_cache_type: KvCacheType,
+    gpu_layers: Option<u32>,
     provenance_base: String,
     kv_cache_dir: Option<PathBuf>,
     total_ram_mb: u64,
@@ -328,7 +335,7 @@ fn worker_thread(
     let backend = shared_backend();
 
     // --- Load model ---
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(resolve_n_gpu_layers(gpu_layers));
     let model = match LlamaModel::load_from_file(backend, &model_path, &model_params)
         .context("LlamaModel::load_from_file failed")
     {
@@ -1268,6 +1275,7 @@ pub async fn run_smoke_test() -> Result<()> {
         4096,
         KvCacheType::Q8_0,
         None, // no disk persistence for smoke test
+        None, // gpu_layers: all on GPU
         total_ram_mb,
     )
     .await?;
@@ -1329,4 +1337,14 @@ pub async fn run_smoke_test() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn resolve_n_gpu_layers_maps_none_to_all() {
+        assert_eq!(super::resolve_n_gpu_layers(None), u32::MAX);
+        assert_eq!(super::resolve_n_gpu_layers(Some(0)), 0);
+        assert_eq!(super::resolve_n_gpu_layers(Some(24)), 24);
+    }
 }
