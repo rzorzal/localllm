@@ -588,9 +588,11 @@ async fn responses_overflow_routes_to_cloud() {
 
 // --- Tool filtering (Task 3, sub-project 3) ---
 
-/// Verify that `shape_tools` drops blocklisted tools before local inference:
+/// Verify that `shape_tools` drops blocklisted tools before local inference
+/// AND records the pre-filter seen set in the tool registry:
 /// posting Bash+Read to /v1/messages with "Read" in the anthropic blocklist
-/// should deliver only ["Bash"] to the generator.
+/// should deliver only ["Bash"] to the generator, while /admin/tools must
+/// report seen=["Bash","Read"] (pre-filter) and disabled=["Read"].
 #[tokio::test]
 async fn anthropic_request_drops_blocklisted_tool() {
     let _guard = ENV_LOCK.lock().await;
@@ -618,6 +620,8 @@ async fn anthropic_request_drops_blocklisted_tool() {
     );
 
     // POST /v1/messages with tools Bash + Read.
+    // Clone the router so we can reuse `app` for the GET below (Router::clone
+    // shares the same Arc<AppState> / tool_registry).
     let body = r#"{
         "model": "m",
         "max_tokens": 256,
@@ -627,9 +631,18 @@ async fn anthropic_request_drops_blocklisted_tool() {
             {"name": "Read",   "description": "read file",  "input_schema": {"type": "object"}}
         ]
     }"#;
-    localllm::axum_test_request(app, "/v1/messages", body).await;
+    localllm::axum_test_request(app.clone(), "/v1/messages", body).await;
 
     let tool_names = recorded.lock().unwrap().clone();
+
+    // GET /admin/tools on the same app instance to verify the pre-filter recording.
+    let tools_resp = localllm::axum_test_get_with_header(
+        app,
+        "/admin/tools",
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
 
     std::env::remove_var("LOCALLLM_SETTINGS");
     let _ = std::fs::remove_dir_all(&dir);
@@ -640,6 +653,24 @@ async fn anthropic_request_drops_blocklisted_tool() {
         vec!["Bash".to_string()],
         "expected only [Bash] after filtering, got: {:?}",
         tool_names
+    );
+
+    // shape_tools must record the pre-filter seen set (both Bash and Read).
+    let anthropic = tools_resp
+        .get("anthropic")
+        .expect("anthropic key missing in /admin/tools response");
+    assert_eq!(
+        anthropic["seen"],
+        serde_json::json!(["Bash", "Read"]),
+        "shape_tools must record pre-filter seen tools; got: {anthropic}"
+    );
+    assert!(
+        anthropic["disabled"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .contains(&serde_json::json!("Read")),
+        "Read must appear in disabled list; got: {}",
+        anthropic["disabled"]
     );
 }
 

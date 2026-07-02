@@ -240,7 +240,6 @@ fn resolve_history_turns(active: &crate::model_manager::ModelSpec) -> Option<u32
     saved.or(rec)
 }
 
-/// Trim a request's history to the active model's window, in place.
 /// Record the request's tool names into the discovery registry for `surface`
 /// (latest sorted-unique set), then drop any blocklisted tools before local
 /// inference. Local-only; the cloud path forwards raw bytes untouched.
@@ -261,6 +260,7 @@ fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
     }
 }
 
+/// Trim a request's history to the active model's window, in place.
 fn apply_history_window(state: &AppState, req: &mut ChatRequest) {
     let active = state.manager.status().current;
     let keep = resolve_history_turns(&active);
