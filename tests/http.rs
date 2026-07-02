@@ -788,3 +788,31 @@ async fn admin_dashboard_returns_shape() {
     }
     assert!(body["hour"].get("tokens_saved").is_some());
 }
+
+// --- Dashboard clear + routing API (config-nav-dashboard, follow-ups) ---
+
+#[tokio::test]
+async fn admin_dashboard_clear_requires_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_delete_status_with_header(
+        app, "/admin/dashboard", "", "x-admin-token", "wrong").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_routing_get_requires_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_get_status(app, "/admin/routing").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_routing_get_returns_current_and_options() {
+    let app = localllm::router_for_test();
+    let body = localllm::axum_test_get_with_header(
+        app, "/admin/routing", "x-admin-token", "test-token").await;
+    assert!(body.get("current").is_some());
+    let opts = body["options"].as_array().expect("options array");
+    assert_eq!(opts.len(), 4);
+    assert!(opts[0].get("value").is_some() && opts[0].get("label").is_some());
+}

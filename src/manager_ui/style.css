@@ -336,3 +336,22 @@ body {
 
 .dash-hero-main { flex: 1; min-width: 0; }
 .colitem.rec .colitem-name::after { content: " ★"; color: var(--amber); font-size: 11px; }
+
+/* Segmented routing selector (Config page) */
+.segmented { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.seg-btn {
+  appearance: none; cursor: pointer; font: inherit; font-size: 13px; font-weight: 550;
+  padding: 8px 14px; border-radius: 10px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--line);
+  transition: color .12s ease, border-color .12s ease, background .12s ease;
+}
+.seg-btn:hover:not(:disabled) { color: var(--txt); border-color: #3a4458; }
+.seg-btn:disabled { opacity: .5; cursor: progress; }
+.seg-btn.on {
+  color: #08121a; border-color: transparent;
+  background: linear-gradient(135deg, var(--teal), var(--indigo));
+}
+
+/* Dashboard toolbar */
+.dash-bar { display: flex; align-items: center; justify-content: space-between; }
+.dash-bar-title { font-size: 20px; font-weight: 700; }

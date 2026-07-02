@@ -133,7 +133,41 @@ function renderConfig() {
 
   view.innerHTML = "";
   view.append(shell);
+  renderRoutingSelector(shell);
   renderIntegrationToggle(shell);
+}
+
+// Routing profile selector (moved from the tray). GET current + options,
+// POST on click to apply + persist live.
+async function renderRoutingSelector(container) {
+  const panel = el("div", "intpanel");
+  panel.append(el("div", "intpanel-title", "Roteamento"));
+  panel.append(el("div", "intpanel-sub",
+    "Como o localllm decide entre modelo local e cloud. Aplica na hora e persiste."));
+  const seg = el("div", "segmented");
+  panel.append(seg);
+  container.append(panel);
+
+  let data;
+  try { data = await api("GET", "/admin/routing"); }
+  catch (e) { seg.append(el("div", "intpanel-status", e.message)); return; }
+
+  const paint = (current) => {
+    seg.innerHTML = "";
+    (data.options || []).forEach((o) => {
+      const b = el("button", "seg-btn" + (o.value === current ? " on" : ""), o.label);
+      b.onclick = async () => {
+        if (o.value === current) return;
+        seg.querySelectorAll("button").forEach((x) => x.disabled = true);
+        try {
+          const r = await api("POST", "/admin/routing", { profile: o.value });
+          paint(r.current); toast("Roteamento atualizado");
+        } catch (e) { toast(e.message, true); paint(current); }
+      };
+      seg.append(b);
+    });
+  };
+  paint(data.current);
 }
 
 // Route-apps integration toggle (moved from the tray). Reads GET /admin/integrations,
@@ -582,6 +616,19 @@ async function renderDashboard() {
   catch (e) { view.innerHTML = ""; view.append(el("div", "detail", e.message)); return; }
 
   const wrap = el("div", "dash");
+
+  // Toolbar: clear-data action.
+  const bar = el("div", "dash-bar");
+  bar.append(el("div", "dash-bar-title", "Dashboard"));
+  const clearBtn = el("button", "btn danger", "Limpar dados");
+  clearBtn.onclick = async () => {
+    if (!confirm("Limpar todo o histórico de roteamento? Não dá para desfazer.")) return;
+    try { await api("DELETE", "/admin/dashboard"); toast("Dados limpos"); renderDashboard(); }
+    catch (e) { toast(e.message, true); }
+  };
+  bar.append(clearBtn);
+  wrap.append(bar);
+
   const m = d.month || { tokens_saved: 0, tokens_if_all_cloud: 0, local_count: 0, cloud_count: 0 };
 
   // Hero — monthly savings

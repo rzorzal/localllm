@@ -463,7 +463,8 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
         .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
         .route("/admin/integrations", get(handle_integrations_get).post(handle_integrations_set))
-        .route("/admin/dashboard", get(handle_dashboard))
+        .route("/admin/routing", get(handle_routing_get).post(handle_routing_set))
+        .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
         .route("/manager/style.css", get(handle_manager_css))
@@ -505,6 +506,51 @@ pub fn router(
         port,
     });
     build_router_inner(state)
+}
+
+/// GET /admin/routing — current routing profile + selectable options (token-guarded).
+async fn handle_routing_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let current = crate::settings::load_profile();
+    let options: Vec<_> = crate::route::Profile::ALL
+        .iter()
+        .map(|p| json!({ "value": p, "label": p.label() }))
+        .collect();
+    Json(json!({ "current": current, "options": options })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct RoutingSetBody {
+    profile: crate::route::Profile,
+}
+
+/// POST /admin/routing {profile} — apply + persist the routing profile (token-guarded).
+async fn handle_routing_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: RoutingSetBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    crate::route::policy::apply_profile(&state.policy, body.profile);
+    if let Err(e) = crate::settings::save_profile(body.profile) {
+        tracing::warn!("failed to persist routing profile: {e}");
+    }
+    Json(json!({ "current": body.profile })).into_response()
 }
 
 /// GET /admin/integrations — current wiring state (token-guarded).
@@ -575,6 +621,19 @@ async fn handle_dashboard(
     let entries = crate::route_log::read_all();
     let dash = crate::route_log::build_dashboard(&entries, crate::route_log::now_secs(), 50);
     Json(dash).into_response()
+}
+
+/// DELETE /admin/dashboard — clear all routing history (token-guarded).
+async fn handle_dashboard_clear(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let cleared = crate::route_log::clear();
+    Json(json!({ "cleared": cleared })).into_response()
 }
 
 /// Verify the `X-Admin-Token` header against the configured token (constant-time).

@@ -25,7 +25,7 @@
 //!
 //! ## Status text strategy
 //!
-//! The status MenuItem is set to "localllm — running on http://127.0.0.1:PORT"
+//! The status MenuItem is set to "localllm â running on http://127.0.0.1:PORT"
 //! immediately (static). Port is known from `Config::port` at launch time, so
 //! no cross-thread update is needed. If the server fails to bind, it logs the
 //! error; the tray still shows the expected URL (acceptable for a local tool).
@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use tray_icon::{
     TrayIconBuilder,
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon,
 };
 use std::sync::{Arc, RwLock};
@@ -104,15 +104,15 @@ mod platform {
 // Icon generation
 // ---------------------------------------------------------------------------
 
-/// Render the app icon as `size`×`size` RGBA: a rounded square with a
-/// teal→indigo diagonal gradient and a white minimalist chat-bubble glyph
+/// Render the app icon as `size`Ã`size` RGBA: a rounded square with a
+/// tealâindigo diagonal gradient and a white minimalist chat-bubble glyph
 /// with a spark. Shared by the tray (32px) and the .app icon export.
 pub fn render_icon_rgba(size: u32) -> Vec<u8> {
     let s = size as f32;
     let r = s * 0.22; // corner radius
     let mut rgba = vec![0u8; (size * size * 4) as usize];
 
-    // gradient endpoints: teal #2DD4BF → indigo #6366F1
+    // gradient endpoints: teal #2DD4BF â indigo #6366F1
     let (r0, g0, b0) = (45.0f32, 212.0, 191.0);
     let (r1, g1, b1) = (99.0f32, 102.0, 241.0);
 
@@ -273,20 +273,20 @@ mod tests {
 
     #[test]
     fn status_ready_is_running() {
-        assert_eq!(status_menu_label(&status("ready", SwitchPhase::Idle, 0)), "🟢 Running");
+        assert_eq!(status_menu_label(&status("ready", SwitchPhase::Idle, 0)), "ð¢ Running");
     }
 
     #[test]
     fn status_switching_shows_phase_and_percent() {
         assert_eq!(
             status_menu_label(&status("switching", SwitchPhase::Downloading, 42)),
-            "🟡 Switching… downloading 42%"
+            "ð¡ Switchingâ¦ downloading 42%"
         );
     }
 
     #[test]
     fn status_error_is_failed() {
-        assert_eq!(status_menu_label(&status("error", SwitchPhase::Idle, 0)), "🔴 Switch failed");
+        assert_eq!(status_menu_label(&status("error", SwitchPhase::Idle, 0)), "ð´ Switch failed");
     }
 }
 
@@ -309,10 +309,10 @@ fn status_menu_label(s: &crate::model_manager::SwitchStatus) -> String {
                 SwitchPhase::Loading => "loading",
                 SwitchPhase::Idle => "switching",
             };
-            format!("🟡 Switching… {phase} {}%", s.progress)
+            format!("ð¡ Switchingâ¦ {phase} {}%", s.progress)
         }
-        "error" => "🔴 Switch failed".to_string(),
-        _ => "🟢 Running".to_string(),
+        "error" => "ð´ Switch failed".to_string(),
+        _ => "ð¢ Running".to_string(),
     }
 }
 
@@ -344,7 +344,7 @@ fn wired_label(state: &crate::settings::IntegrationState) -> String {
 /// Run the server in a background thread and drive the event loop +
 /// tray icon on the main thread.
 ///
-/// This function is `-> !` — it blocks forever (exits via
+/// This function is `-> !` â it blocks forever (exits via
 /// `std::process::exit(0)` on Quit, or the OS kills the process).
 pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let port = cfg.port;
@@ -426,16 +426,17 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // avoids redundant set_text on every poll tick.
     let mut model_handle: Option<MenuItem> = None;
     let mut last_model: Option<crate::model_manager::ModelSpec> = None;
-    // Routing submenu state: (menu id, profile, check item) for each profile,
-    // populated in Init and used to dispatch clicks + re-check on change.
-    let mut routing_items: Vec<(tray_icon::menu::MenuId, Profile, CheckMenuItem)> = Vec::new();
+    // Read-only routing sub-line: reflects the profile now chosen from the
+    // Config page. last_routing avoids redundant set_text on every poll tick.
     let mut routing_status: Option<MenuItem> = None;
+    let mut last_routing: Option<Profile> = None;
     let log_path = std::env::var("LOCALLLM_LOG")
         .unwrap_or_else(|_| "/tmp/localllm.log".to_string());
 
     // Config window state: None until first open, then single-instance. The
     // Config submenu items each open/show it and navigate to their SPA route.
     // admin_token (function param) is captured by the closure for window injection.
+    let mut config_home_id: Option<tray_icon::menu::MenuId> = None;
     let mut config_models_id: Option<tray_icon::menu::MenuId> = None;
     let mut config_tools_id: Option<tray_icon::menu::MenuId> = None;
     let mut config_dash_id: Option<tray_icon::menu::MenuId> = None;
@@ -461,12 +462,12 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let menu = Menu::new();
                 // Title + status, then info lines (all disabled/informational),
                 // a separator, and the clickable Quit item.
-                let title = MenuItem::new("localllm — local LLM server", false, None);
+                let title = MenuItem::new("localllm â local LLM server", false, None);
                 // Starts as loading (yellow); flips to green "Running" once
                 // the server thread signals it is actually serving.
-                let status = MenuItem::new("🟡 Loading model…", false, None);
+                let status = MenuItem::new("ð¡ Loading modelâ¦", false, None);
                 status_handle = Some(status.clone());
-                // URL is clickable → copies to clipboard.
+                // URL is clickable â copies to clipboard.
                 let url_line = MenuItem::new(format!("URL:    {url_for_tray}  (click to copy)"), true, None);
                 url_id = Some(url_line.id().clone());
                 let model_line = MenuItem::new(format!("Model:  {model_short}"), false, None);
@@ -474,33 +475,27 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let ctx_line = MenuItem::new(format!("Context: {info_ctx} tokens"), false, None);
                 let kv_line = MenuItem::new(format!("KV cache: {info_kv}"), false, None);
                 let backend_line = MenuItem::new(format!("Backend: {info_backend}"), false, None);
-                let logs_item = MenuItem::new("Open Logs", true, None);
+                let logs_item = MenuItem::new("🗎  Open Logs", true, None);
                 logs_id = Some(logs_item.id().clone());
                 let config_submenu = Submenu::new("Config", true);
-                let cfg_models = MenuItem::new("Models", true, None);
-                let cfg_tools = MenuItem::new("Tools", true, None);
-                let cfg_dash = MenuItem::new("Dashboard", true, None);
+                let cfg_home = MenuItem::new("⚙  Abrir Config", true, None);
+                let cfg_models = MenuItem::new("◈  Models", true, None);
+                let cfg_tools = MenuItem::new("⛭  Tools", true, None);
+                let cfg_dash = MenuItem::new("▤  Dashboard", true, None);
+                config_home_id = Some(cfg_home.id().clone());
                 config_models_id = Some(cfg_models.id().clone());
                 config_tools_id = Some(cfg_tools.id().clone());
                 config_dash_id = Some(cfg_dash.id().clone());
+                config_submenu.append(&cfg_home).expect("append config home");
+                config_submenu.append(&PredefinedMenuItem::separator()).expect("config sep");
                 config_submenu.append(&cfg_models).expect("append config models");
                 config_submenu.append(&cfg_tools).expect("append config tools");
                 config_submenu.append(&cfg_dash).expect("append config dashboard");
-                let quit_item = MenuItem::new("Quit localllm", true, None);
+                let quit_item = MenuItem::new("⏻  Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
-                // Routing profile selector (live; persists on click).
-                let routing_submenu = Submenu::new("Routing", true);
-                for p in Profile::ALL {
-                    let item = CheckMenuItem::new(
-                        p.label(),
-                        true,
-                        p == initial_profile,
-                        None,
-                    );
-                    routing_items.push((item.id().clone(), p, item.clone()));
-                    routing_submenu.append(&item).expect("append routing item");
-                }
+                // Routing is now chosen from the Config page; the tray shows the
+                // current profile as a read-only line, refreshed each poll tick.
                 let routing_line = MenuItem::new(
                     format!("Routing: {}", initial_profile.label()),
                     false,
@@ -526,7 +521,6 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&backend_line).expect("append backend");
                 menu.append(&PredefinedMenuItem::separator()).expect("sep2");
                 menu.append(&routing_line).expect("append routing line");
-                menu.append(&routing_submenu).expect("append routing submenu");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator");
                 menu.append(&wired_line).expect("append wired line");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator2");
@@ -537,13 +531,13 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 _tray_keeper.push(
                     TrayIconBuilder::new()
                         .with_menu(Box::new(menu))
-                        .with_tooltip(format!("localllm — {url_for_tray}"))
+                        .with_tooltip(format!("localllm â {url_for_tray}"))
                         .with_icon(icon)
                         .build()
                         .expect("failed to create tray icon"),
                 );
 
-                tracing::info!("tray icon created; server loading in background…");
+                tracing::info!("tray icon created; server loading in backgroundâ¦");
             }
 
             // Poll the tray-icon menu-event channel on every wake-up.
@@ -552,7 +546,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
             Event::MainEventsCleared
             | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 // Flip status to green once the server is actually serving.
-                // Until the server is bound, keep the launch-time "Loading model…"
+                // Until the server is bound, keep the launch-time "Loading modelâ¦"
                 // line. Once ready, drive both the status and the model line from
                 // the live manager so startup, hot-swaps, and switch failures all
                 // show in the tray.
@@ -587,9 +581,20 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     }
                 }
 
+                // Keep the read-only routing line in sync with the Config-page selector.
+                {
+                    let p = crate::settings::load_profile();
+                    if last_routing != Some(p) {
+                        if let Some(line) = &routing_status {
+                            line.set_text(format!("Routing: {}", p.label()));
+                        }
+                        last_routing = Some(p);
+                    }
+                }
+
                 while let Ok(menu_event) = MenuEvent::receiver().try_recv() {
                     if quit_id.as_ref() == Some(&menu_event.id) {
-                        tracing::info!("quit requested via tray menu — unwiring integrations");
+                        tracing::info!("quit requested via tray menu â unwiring integrations");
                         let st = crate::settings::load_integrations();
                         if st.enabled {
                             let injectors = crate::integrations::injectors_default();
@@ -608,23 +613,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     } else if url_id.as_ref() == Some(&menu_event.id) {
                         platform::copy_to_clipboard(&url_for_tray);
                         tracing::info!("copied to clipboard: {url_for_tray}");
-                    } else if let Some((_, profile, _)) =
-                        routing_items.iter().find(|(id, _, _)| id == &menu_event.id)
-                    {
-                        let chosen = *profile;
-                        crate::route::policy::apply_profile(&policy, chosen);
-                        if let Err(e) = crate::settings::save_profile(chosen) {
-                            tracing::warn!("failed to persist routing profile: {e}");
-                        }
-                        // Re-check exactly the chosen item; update the status line.
-                        for (_, p, item) in &routing_items {
-                            item.set_checked(*p == chosen);
-                        }
-                        if let Some(s) = &routing_status {
-                            s.set_text(format!("Routing: {}", chosen.label()));
-                        }
-                        tracing::info!("routing profile set via tray: {chosen:?}");
-                    } else if config_models_id.as_ref() == Some(&menu_event.id)
+                    } else if config_home_id.as_ref() == Some(&menu_event.id)
+                        || config_models_id.as_ref() == Some(&menu_event.id)
                         || config_tools_id.as_ref() == Some(&menu_event.id)
                         || config_dash_id.as_ref() == Some(&menu_event.id)
                     {
@@ -632,8 +622,10 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                             "#/models"
                         } else if config_tools_id.as_ref() == Some(&menu_event.id) {
                             "#/tools"
-                        } else {
+                        } else if config_dash_id.as_ref() == Some(&menu_event.id) {
                             "#/dashboard"
+                        } else {
+                            "#/config"
                         };
                         match &manager_window {
                             Some(w) => {

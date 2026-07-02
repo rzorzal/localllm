@@ -93,6 +93,15 @@ pub fn rotate_app_log(_now: i64, _max_age_secs: i64) {
     );
 }
 
+/// Delete all routing history (the "clear dashboard data" action). Best-effort:
+/// truncates the file to empty. Returns true if the file existed.
+pub fn clear() -> bool {
+    let Some(path) = log_path() else { return false };
+    let existed = path.exists();
+    let _ = crate::integrations::atomic_write(&path, b"");
+    existed
+}
+
 /// Current unix seconds.
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -234,5 +243,19 @@ mod tests {
         let entries: Vec<RouteEntry> = (0..20).map(|i| e(now - i, "local", 1, 1)).collect();
         let d = build_dashboard(&entries, now, 5);
         assert_eq!(d.recent.len(), 5);
+    }
+
+    #[test]
+    fn clear_empties_the_log() {
+        let dir = std::env::temp_dir().join(format!("localllm-rl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+        append(&entry(now_secs(), "local"));
+        assert!(!read_all().is_empty());
+        assert!(clear());
+        assert!(read_all().is_empty());
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
