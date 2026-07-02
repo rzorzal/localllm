@@ -103,10 +103,76 @@ function el(tag, cls, html) {
   return e;
 }
 
+// ---- Pane 0: Config landing ----
+function renderConfig() {
+  currentView = renderConfig;
+  setCrumbs([{ label: "Config" }]);
+  const grid = el("div", "grid");
+
+  const modelsCard = el("div", "card");
+  modelsCard.append(el("h3", null, "Models"));
+  modelsCard.append(el("div", "meta", "Escolher, baixar e configurar modelos locais"));
+  modelsCard.onclick = () => navigate("/models");
+  grid.append(modelsCard);
+
+  const toolsCard = el("div", "card");
+  toolsCard.append(el("h3", null, "Tools"));
+  toolsCard.append(el("div", "meta", "Filtrar tools por cliente"));
+  toolsCard.onclick = () => navigate("/tools");
+  grid.append(toolsCard);
+
+  const dashCard = el("div", "card");
+  dashCard.append(el("h3", null, "Dashboard"));
+  dashCard.append(el("div", "meta", "Roteamento local↔cloud e tokens economizados"));
+  dashCard.onclick = () => navigate("/dashboard");
+  grid.append(dashCard);
+
+  view.innerHTML = "";
+  view.append(grid);
+  renderIntegrationToggle(view);
+}
+
+// Route-apps integration toggle (moved from the tray). Reads GET /admin/integrations,
+// flips via POST. The tray shows the same state read-only.
+async function renderIntegrationToggle(container) {
+  const box = el("div", "ctxbox");
+  box.append(el("div", "ctxtitle", "Rotear apps pelo localllm"));
+  box.append(el("div", "ctxhint",
+    "Liga/desliga o roteamento dos clientes (Claude Code, Codex) por este servidor. Ao sair do localllm, o roteamento é removido automaticamente."));
+  const status = el("div", "ctxhint", "carregando…");
+  const btn = el("button", "btn primary", "…");
+  btn.disabled = true;
+  let enabled = false;
+
+  const paint = (st) => {
+    enabled = !!st.enabled;
+    btn.textContent = enabled ? "Desligar" : "Ligar";
+    btn.disabled = false;
+    const wired = (st.wired || []).join(", ");
+    status.textContent = enabled
+      ? `Ligado — wired: ${wired || "nenhum cliente encontrado"}`
+      : "Desligado — apps vão direto ao provider";
+  };
+
+  try { paint(await api("GET", "/admin/integrations")); }
+  catch (e) { status.textContent = e.message; }
+
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try { paint(await api("POST", "/admin/integrations", { enabled: !enabled })); toast("Integração atualizada"); }
+    catch (e) { toast(e.message, true); btn.disabled = false; }
+  };
+
+  const actions = el("div", "actions");
+  actions.append(btn);
+  box.append(status, actions);
+  container.append(box);
+}
+
 // ---- Pane 1: families ----
 function renderFamilies() {
   currentView = renderFamilies;
-  setCrumbs([{ label: "Models", onClick: renderFamilies }, { label: "Tools", onClick: renderTools }]);
+  setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Models" }, { label: "Tools", onClick: renderTools }]);
   const grid = el("div", "grid");
   families.forEach((fam) => {
     const recommended = fam.models.some((m) => m.recommended);
@@ -131,7 +197,7 @@ function renderModels(fam) {
     const f = families.find((x) => x.family === famName);
     f ? renderModels(f) : renderFamilies();
   };
-  setCrumbs([{ label: "Models", onClick: renderFamilies }, { label: fam.family }]);
+  setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Models", onClick: renderFamilies }, { label: fam.family }]);
   const grid = el("div", "grid");
   fam.models.forEach((m) => {
     const card = el("div", "card");
@@ -157,6 +223,7 @@ function renderDetail(fam, m) {
     mm ? renderDetail(f, mm) : (f ? renderModels(f) : renderFamilies());
   };
   setCrumbs([
+    { label: "Config", onClick: renderConfig },
     { label: "Models", onClick: renderFamilies },
     { label: fam.family, onClick: () => renderModels(fam) },
     { label: m.display_name },
@@ -390,7 +457,7 @@ async function doDelete(m) {
 async function renderTools() {
   currentView = renderTools;
   setCrumbs([
-    { label: "Models", onClick: renderFamilies },
+    { label: "Config", onClick: renderConfig },
     { label: "Tools" },
   ]);
   let data;
@@ -457,9 +524,52 @@ async function saveToolFilter(surface, boxes) {
   renderTools();
 }
 
+// ---- Pane: Dashboard (routing + tokens saved) ----
+// NOTE: functional layout — the polished visual is co-designed with the user
+// (frontend-design) before finalizing. Data contract fixed by GET /admin/dashboard.
+async function renderDashboard() {
+  currentView = renderDashboard;
+  setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Dashboard" }]);
+  let d;
+  try { d = await api("GET", "/admin/dashboard"); }
+  catch (e) { view.innerHTML = ""; view.append(el("div", "detail", e.message)); return; }
+  const wrap = el("div", "detail");
+  wrap.append(el("h2", null, "Dashboard"));
+  ["hour", "day", "month"].forEach((k) => {
+    const b = d[k];
+    const box = el("div", "ctxbox");
+    box.append(el("div", "ctxtitle", { hour: "Última hora", day: "Hoje", month: "Este mês" }[k]));
+    box.append(el("div", "ctxhint",
+      `local ${b.local_count} · cloud ${b.cloud_count} · tokens salvos ${b.tokens_saved} · se tudo cloud ${b.tokens_if_all_cloud}`));
+    wrap.append(box);
+  });
+  const rec = el("div", "ctxbox");
+  rec.append(el("div", "ctxtitle", "Recentes"));
+  (d.recent || []).forEach((e) => {
+    rec.append(el("div", "toolrow",
+      `${e.surface} → ${e.dest}${e.reason ? " (" + e.reason + ")" : ""} · score ${e.score.toFixed(2)} · ${e.prompt_tok} tok`));
+  });
+  wrap.append(rec);
+  view.innerHTML = ""; view.append(wrap);
+}
+
+// ---- hash router ----
+function routeFromHash() {
+  const h = (location.hash || "#/config").replace(/^#/, "");
+  if (h.startsWith("/models")) return renderFamilies();
+  if (h.startsWith("/tools")) return renderTools();
+  if (h.startsWith("/dashboard")) return renderDashboard();
+  return renderConfig();
+}
+function navigate(route) {
+  if (location.hash === "#" + route) routeFromHash();
+  else location.hash = route; // triggers hashchange → routeFromHash
+}
+window.addEventListener("hashchange", () => routeFromHash());
+
 // ---- boot ----
 (async function boot() {
-  try { await refresh(); renderFamilies(); }
+  try { await refresh(); routeFromHash(); }
   catch (e) { view.innerHTML = `<div class="loading">${e.message}</div>`; }
   // Keep header + grid live: catches switches started elsewhere and stale
   // badges after the window was hidden then reopened from the tray.
