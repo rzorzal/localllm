@@ -9,16 +9,19 @@ use std::collections::BTreeMap;
 /// Target quant tags, longest-first so `Q4_K_M` matches before a hypothetical `Q4`.
 const TARGET_QUANTS: &[&str] = &["Q4_K_M", "Q5_K_M", "Q3_K_M", "Q6_K", "Q8_0", "Q2_K"];
 
-/// The canonical target tag contained in a filename (case-insensitive), or None.
+/// The canonical target tag for a filename (case-insensitive), or None.
+///
+/// Matches only when the variant key (filename minus `.gguf` and any shard suffix)
+/// ends with `-{tag}` (case-insensitive), so `Q6_K_L` does NOT match `Q6_K`.
 fn quant_tag_of(filename: &str) -> Option<&'static str> {
-    let lower = filename.to_ascii_lowercase();
-    if !lower.ends_with(".gguf") {
+    if !filename.to_ascii_lowercase().ends_with(".gguf") {
         return None;
     }
+    let key = variant_key(filename).to_ascii_lowercase();
     TARGET_QUANTS
         .iter()
         .copied()
-        .find(|tag| lower.contains(&tag.to_ascii_lowercase()))
+        .find(|tag| key.ends_with(&format!("-{}", tag.to_ascii_lowercase())))
 }
 
 /// Strip a `-NNNNN-of-NNNNN` shard suffix and the `.gguf` extension so shards of
@@ -165,6 +168,17 @@ mod tests {
         assert_eq!(variant_key("gemma-2-27b-it-Q6_K-00001-of-00002.gguf"),
                    "gemma-2-27b-it-Q6_K");
         assert_eq!(variant_key("model-q4_k_m.gguf"), "model-q4_k_m");
+    }
+
+    #[test]
+    fn quant_tag_rejects_suffixed_variants() {
+        assert_eq!(quant_tag_of("gemma-2-27b-it-Q6_K.gguf"), Some("Q6_K"));
+        assert_eq!(quant_tag_of("gemma-2-27b-it-Q6_K_L.gguf"), None);   // _L is not Q6_K
+        assert_eq!(quant_tag_of("model-Q4_K_M.gguf"), Some("Q4_K_M"));
+        assert_eq!(quant_tag_of("model-Q4_K_S.gguf"), None);            // _S not a target
+        assert_eq!(quant_tag_of("model-iq4_xs.gguf"), None);
+        // shard suffix stripped before matching:
+        assert_eq!(quant_tag_of("gemma-2-27b-it-Q6_K-00001-of-00002.gguf"), Some("Q6_K"));
     }
 
     #[test]
