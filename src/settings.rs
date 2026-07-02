@@ -60,6 +60,10 @@ struct Settings {
     model_profiles: std::collections::BTreeMap<String, ExecProfile>,
     #[serde(default)]
     tool_filters: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-surface last-seen discovered tool names, persisted so the Tools view
+    /// shows them immediately after a restart (before any new request refreshes).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    tool_seen: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_model: Option<ActiveModel>,
 }
@@ -234,12 +238,43 @@ pub fn save_tool_filter(surface: &str, disabled: &[String]) -> anyhow::Result<()
     save_settings(&s)
 }
 
+/// Load a surface's persisted last-seen discovered tool names.
+pub fn load_tool_seen(surface: &str) -> Vec<String> {
+    load_settings().tool_seen.get(surface).cloned().unwrap_or_default()
+}
+
+/// Persist a surface's last-seen tool names (empty clears it), preserving the rest.
+pub fn save_tool_seen(surface: &str, seen: &[String]) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    if seen.is_empty() {
+        s.tool_seen.remove(surface);
+    } else {
+        s.tool_seen.insert(surface.to_string(), seen.to_vec());
+    }
+    save_settings(&s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // Mutex to serialise tests that mutate the LOCALLLM_SETTINGS env var.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn tool_seen_round_trips_and_clears_and_preserves_filter() {
+        with_temp_settings(|| {
+            save_tool_filter("claude-code", &["Bash".to_string()]).unwrap();
+            save_tool_seen("claude-code", &["Bash".to_string(), "Read".to_string()]).unwrap();
+            assert_eq!(load_tool_seen("claude-code"), vec!["Bash".to_string(), "Read".to_string()]);
+            // seen persistence must not disturb the disabled filter
+            assert_eq!(load_tool_filter("claude-code"), vec!["Bash".to_string()]);
+            // empty clears
+            save_tool_seen("claude-code", &[]).unwrap();
+            assert!(load_tool_seen("claude-code").is_empty());
+            assert_eq!(load_tool_filter("claude-code"), vec!["Bash".to_string()]);
+        });
+    }
 
     fn with_temp_settings<F: FnOnce()>(f: F) {
         let _guard = ENV_LOCK.lock().unwrap();

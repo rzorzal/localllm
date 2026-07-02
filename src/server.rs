@@ -263,13 +263,26 @@ fn resolve_history_turns(active: &crate::model_manager::ModelSpec) -> Option<u32
 /// (latest sorted-unique set), then drop any blocklisted tools before local
 /// inference. Local-only; the cloud path forwards raw bytes untouched.
 fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
-    // 1) record seen (pre-filter) — reflects what the client actually sent
+    // 1) record seen (pre-filter) — reflects what the client actually sent.
+    // The latest request's set replaces the previous one (new tools appear, gone
+    // tools drop). Persist on change so the Tools view survives a restart.
     {
         let mut names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
         names.sort();
         names.dedup();
-        let mut reg = state.tool_registry.lock().unwrap_or_else(|e| e.into_inner());
-        reg.insert(surface.to_string(), names);
+        let changed = {
+            let mut reg = state.tool_registry.lock().unwrap_or_else(|e| e.into_inner());
+            let differs = reg.get(surface) != Some(&names);
+            if differs {
+                reg.insert(surface.to_string(), names.clone());
+            }
+            differs
+        };
+        if changed {
+            if let Err(e) = crate::settings::save_tool_seen(surface, &names) {
+                tracing::warn!("failed to persist seen tools for {surface}: {e}");
+            }
+        }
     }
     // 2) filter disabled
     let disabled = crate::settings::load_tool_filter(surface);
@@ -908,7 +921,12 @@ async fn handle_tools_get(
         .clone();
     let mut out = serde_json::Map::new();
     for surface in KNOWN_SURFACES {
-        let seen = reg.get(surface).cloned().unwrap_or_default();
+        // In-memory registry is the live source once a request has arrived this
+        // session; fall back to the persisted set so tools show right after boot.
+        let seen = match reg.get(surface) {
+            Some(s) => s.clone(),
+            None => crate::settings::load_tool_seen(surface),
+        };
         let disabled = crate::settings::load_tool_filter(surface);
         if seen.is_empty() && disabled.is_empty() {
             continue;
