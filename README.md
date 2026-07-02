@@ -36,6 +36,26 @@ local and free, difficult turns still get a frontier model.
 
 ---
 
+## Screenshots
+
+**Config** — the hub: model picker, tools, dashboard, routing profile, smart-history toggle, and app wiring.
+
+![Config](docs/images/config.png)
+
+**Dashboard** — tokens saved (hour/day/month), local↔cloud split, and a filterable decisions table. Click a score for the calc breakdown; click a row for the prompt.
+
+![Dashboard](docs/images/dashboard.png)
+
+**Models** — Firestore-style drilldown (Family → Model → Detail) with per-model context, KV-cache, GPU layers, history, and quant.
+
+![Models](docs/images/models.png)
+
+**Tools** — per-client allow/block list with text + status filters and collapsible descriptions.
+
+![Tools](docs/images/tools.png)
+
+---
+
 ## How routing works
 
 For every request localllm computes cheap signals (no generation) and decides:
