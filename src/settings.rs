@@ -34,6 +34,16 @@ pub struct ExecProfile {
     pub quant: Option<String>,
 }
 
+/// The last successfully-activated model, restored at boot unless the CLI
+/// explicitly overrides `--model-id`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ActiveModel {
+    pub repo: String,
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quant: Option<String>,
+}
+
 /// On-disk settings shape. New fields must be `#[serde(default)]` so older
 /// files (which only had `profile`) still load.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -50,6 +60,8 @@ struct Settings {
     model_profiles: std::collections::BTreeMap<String, ExecProfile>,
     #[serde(default)]
     tool_filters: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_model: Option<ActiveModel>,
 }
 
 /// Resolve the settings file path. `LOCALLLM_SETTINGS` (full file path) wins;
@@ -107,6 +119,42 @@ pub fn save_profile(p: Profile) -> anyhow::Result<()> {
     let mut s = load_settings();
     s.profile = p;
     save_settings(&s)
+}
+
+/// Load the last-activated model, if any was saved.
+pub fn load_active_model() -> Option<ActiveModel> {
+    load_settings().active_model
+}
+
+/// Persist the last-activated model (called on a successful switch).
+pub fn save_active_model(repo: &str, file: &str, quant: Option<&str>) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.active_model = Some(ActiveModel {
+        repo: repo.to_string(),
+        file: file.to_string(),
+        quant: quant.map(|q| q.to_string()),
+    });
+    save_settings(&s)
+}
+
+/// Resolve the boot model: an explicit CLI `--model-id` (i.e. one that differs
+/// from the compiled default) wins; otherwise the saved model; otherwise the
+/// default. Split-model file lists from the saved entry are not restored
+/// (single-file only) — a saved model always resolves to `[file]`.
+pub fn resolve_active_model(
+    cli_model: &str,
+    cli_files: &[String],
+    default_model: &str,
+    default_file: &str,
+    saved: Option<ActiveModel>,
+) -> (String, Vec<String>) {
+    if cli_model != default_model {
+        return (cli_model.to_string(), cli_files.to_vec());
+    }
+    match saved {
+        Some(a) => (a.repo, vec![a.file]),
+        None => (default_model.to_string(), vec![default_file.to_string()]),
+    }
 }
 
 /// Load the persisted client-integration toggle state.
@@ -401,5 +449,44 @@ mod tests {
             assert_eq!(load_profile(), Profile::MaxQuality);
             assert_eq!(load_tool_filter("openai"), vec!["Foo".to_string()]);
         });
+    }
+
+    #[test]
+    fn active_model_round_trips() {
+        with_temp_settings(|| {
+            assert!(load_active_model().is_none());
+            save_active_model("Qwen/Qwen2.5-7B-Instruct-GGUF", "q7.gguf", Some("Q4_K_M")).unwrap();
+            let a = load_active_model().unwrap();
+            assert_eq!(a.repo, "Qwen/Qwen2.5-7B-Instruct-GGUF");
+            assert_eq!(a.file, "q7.gguf");
+            assert_eq!(a.quant.as_deref(), Some("Q4_K_M"));
+        });
+    }
+
+    #[test]
+    fn resolve_active_model_prefers_explicit_cli() {
+        // CLI differs from default → CLI wins even if a model is saved.
+        let saved = Some(ActiveModel { repo: "saved/repo".into(), file: "s.gguf".into(), quant: None });
+        let (m, f) = resolve_active_model(
+            "cli/repo", &["c.gguf".to_string()], "default/repo", "d.gguf", saved);
+        assert_eq!(m, "cli/repo");
+        assert_eq!(f, vec!["c.gguf".to_string()]);
+    }
+
+    #[test]
+    fn resolve_active_model_uses_saved_when_cli_is_default() {
+        let saved = Some(ActiveModel { repo: "saved/repo".into(), file: "s.gguf".into(), quant: None });
+        let (m, f) = resolve_active_model(
+            "default/repo", &["d.gguf".to_string()], "default/repo", "d.gguf", saved);
+        assert_eq!(m, "saved/repo");
+        assert_eq!(f, vec!["s.gguf".to_string()]);
+    }
+
+    #[test]
+    fn resolve_active_model_falls_back_to_default_when_nothing_saved() {
+        let (m, f) = resolve_active_model(
+            "default/repo", &["d.gguf".to_string()], "default/repo", "d.gguf", None);
+        assert_eq!(m, "default/repo");
+        assert_eq!(f, vec!["d.gguf".to_string()]);
     }
 }
