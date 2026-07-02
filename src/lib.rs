@@ -17,6 +17,34 @@ pub mod tray;
 pub mod integrations;
 
 // ---------------------------------------------------------------------------
+// Per-model profile resolution helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve a model's effective load parameters (ctx, kv_type, gpu_layers) from
+/// its saved profile, the catalog recommendation, and the global CLI defaults.
+fn resolve_load_params(
+    repo: &str,
+    file: &str,
+    global_ctx: u32,
+    global_kv: crate::config::KvType,
+) -> crate::profile::Resolved {
+    let key = crate::settings::model_ctx_key(repo, file);
+    let saved = crate::settings::load_model_profile(&key);
+    let catalog = crate::catalog::CATALOG.iter().find(|e| e.repo == repo && e.file == file);
+    crate::profile::resolve(&saved, catalog, global_ctx, global_kv)
+}
+
+/// Map `KvType` to the llama-cpp-2 KV cache type.
+fn kv_type_to_llama(t: crate::config::KvType) -> llama_cpp_2::context::params::KvCacheType {
+    use llama_cpp_2::context::params::KvCacheType;
+    match t {
+        crate::config::KvType::Q8 => KvCacheType::Q8_0,
+        crate::config::KvType::Q4 => KvCacheType::Q4_0,
+        crate::config::KvType::F16 => KvCacheType::F16,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared server startup logic
 // ---------------------------------------------------------------------------
 
@@ -87,7 +115,6 @@ pub async fn run_server_with_ready_policy_token(
 
     let (engine, effective_ctx): (Arc<dyn Generator>, usize) = match cfg.backend {
         Backend::Llama => {
-            let kv_cache_type = cfg.llama_kv_cache_type();
             let kv_cache_dir = cfg.resolved_kv_cache_dir();
             tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
             tracing::info!(
@@ -95,15 +122,23 @@ pub async fn run_server_with_ready_policy_token(
                 kv_cache_dir,
                 cfg.no_kv_persist
             );
-            let requested_ctx = crate::settings::load_model_ctx(
-                &crate::settings::model_ctx_key(&cfg.model_id, &cfg.gguf_files[0]),
-            ).unwrap_or(cfg.ctx_len as u32) as usize;
+            let r = resolve_load_params(
+                &cfg.model_id,
+                &cfg.gguf_files[0],
+                cfg.ctx_len as u32,
+                cfg.kv_type.clone(),
+            );
+            tracing::info!(
+                "resolved load params: ctx={} kv={:?} gpu_layers={:?}",
+                r.ctx, r.kv_type, r.gpu_layers
+            );
             let llama = LlamaEngine::load(
                 &cfg.model_id,
                 &cfg.gguf_files,
-                requested_ctx,
-                kv_cache_type,
+                r.ctx as usize,
+                kv_type_to_llama(r.kv_type),
                 kv_cache_dir,
+                r.gpu_layers,
                 total_ram_mb,
             )
             .await?;
@@ -128,8 +163,8 @@ pub async fn run_server_with_ready_policy_token(
         repo: cfg.model_id.clone(),
         file: cfg.gguf_files[0].clone(),
     };
-    let b_ctx_len = cfg.ctx_len;
-    let b_kv_type = cfg.llama_kv_cache_type();
+    let b_ctx_len = cfg.ctx_len as u32;
+    let b_kv_type = cfg.kv_type.clone(); // crate::config::KvType
     let b_kv_dir = cfg.resolved_kv_cache_dir();
     let b_total_ram_mb = total_ram_mb;
     let manager_slot: Arc<std::sync::OnceLock<std::sync::Weak<ModelManager>>> =
@@ -137,6 +172,7 @@ pub async fn run_server_with_ready_policy_token(
     let slot_for_builder = manager_slot.clone();
     let builder: EngineBuilder = Box::new(move |spec: ModelSpec| {
         let kv_dir = b_kv_dir.clone();
+        let kv_type = b_kv_type.clone(); // clone per-invocation before moving into async block
         let slot = slot_for_builder.clone();
         Box::pin(async move {
             let progress_target = slot.get().and_then(|w| w.upgrade());
@@ -154,11 +190,17 @@ pub async fn run_server_with_ready_policy_token(
                 },
             )
             .await?;
-            let requested_ctx = crate::settings::load_model_ctx(
-                &crate::settings::model_ctx_key(&spec.repo, &spec.file),
-            ).unwrap_or(b_ctx_len as u32) as usize;
+            let r = resolve_load_params(&spec.repo, &spec.file, b_ctx_len, kv_type);
             let engine =
-                LlamaEngine::load(&spec.repo, &[spec.file], requested_ctx, b_kv_type, kv_dir, b_total_ram_mb).await?;
+                LlamaEngine::load(
+                    &spec.repo,
+                    &[spec.file.clone()],
+                    r.ctx as usize,
+                    kv_type_to_llama(r.kv_type),
+                    kv_dir,
+                    r.gpu_layers,
+                    b_total_ram_mb,
+                ).await?;
             Ok(Arc::new(engine) as Arc<dyn Generator>)
         })
     });
