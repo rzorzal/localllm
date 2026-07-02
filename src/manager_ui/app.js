@@ -451,7 +451,22 @@ function buildDetail(fam, m) {
   const delBtn = el("button", "btn danger", "Delete");
   delBtn.disabled = m.status !== "downloaded"; // can't delete in-use or not-downloaded
   delBtn.title = m.status === "in_use" ? "Switch away first" : m.status === "needs_download" ? "Not downloaded" : "";
-  delBtn.onclick = () => doDelete(m);
+  // Inline two-click confirm — window.confirm() is a no-op in the wry webview.
+  let delArmed = false, delTimer = null;
+  delBtn.onclick = () => {
+    if (!delArmed) {
+      delArmed = true;
+      delBtn.textContent = "Confirmar delete?";
+      delBtn.classList.add("armed");
+      delTimer = setTimeout(() => {
+        delArmed = false; delBtn.textContent = "Delete"; delBtn.classList.remove("armed");
+      }, 4000);
+      return;
+    }
+    clearTimeout(delTimer);
+    delArmed = false;
+    doDelete(m);
+  };
   actions.append(delBtn);
   wrap.append(actions);
 
@@ -543,7 +558,6 @@ async function saveProfile(m, fields, wrap) {
 }
 
 async function doDelete(m) {
-  if (!confirm(`Delete ${m.display_name} from disk?`)) return;
   try {
     const r = await api("DELETE", "/admin/models", { repo: m.repo, file: m.file });
     toast(r && r.deleted ? "Deleted" : "Nothing to delete");
