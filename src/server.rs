@@ -426,6 +426,7 @@ pub fn router(
         .route("/admin/model", post(handle_admin_switch))
         .route("/admin/model/status", get(handle_admin_status))
         .route("/admin/model/ctx", post(handle_model_set_ctx))
+        .route("/admin/model/profile", post(handle_model_set_profile))
         .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
@@ -466,6 +467,20 @@ struct AdminCtxBody {
     repo: String,
     file: String,
     ctx: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct SetProfileBody {
+    repo: String,
+    file: String,
+    #[serde(default)]
+    ctx: Option<u32>,
+    #[serde(default)]
+    kv_type: Option<crate::config::KvType>,
+    #[serde(default)]
+    gpu_layers: Option<u32>,
+    #[serde(default)]
+    history_turns: Option<u32>,
 }
 
 /// A model `file` must be a bare filename (no path components), so it can never
@@ -640,6 +655,79 @@ async fn handle_model_set_ctx(
         }
     } else if cleared {
         (StatusCode::OK, Json(json!({"cleared": true}))).into_response()
+    } else {
+        (StatusCode::OK, Json(json!({"saved": true}))).into_response()
+    }
+}
+
+/// POST /admin/model/profile — set a subset of a model's execution profile.
+/// Each field is optional; `ctx == 0` clears, `gpu_layers == u32::MAX` clears,
+/// `history_turns == 0` clears. Reloads the model if it is the active one.
+async fn handle_model_set_profile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: SetProfileBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    if body.repo.is_empty() || !is_safe_model_file(&body.file) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and a valid (non-path) file are required"}))).into_response();
+    }
+    let Some(entry) = crate::catalog::CATALOG.iter().find(|e| e.repo == body.repo && e.file == body.file) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown model"}))).into_response();
+    };
+
+    let key = crate::settings::model_ctx_key(&body.repo, &body.file);
+    let mut prof = crate::settings::load_model_profile(&key);
+
+    if let Some(ctx) = body.ctx {
+        if ctx == 0 {
+            prof.ctx = None;
+        } else {
+            // Effective KV kind: incoming body > existing profile > entry rec > global default.
+            let eff_kv_kind = match body.kv_type.as_ref().or(prof.kv_type.as_ref()).or(entry.rec_kv.as_ref()) {
+                Some(crate::config::KvType::Q4) => crate::fit::KvKind::Q4,
+                Some(crate::config::KvType::F16) => crate::fit::KvKind::F16,
+                Some(crate::config::KvType::Q8) | None => state.kv_kind,
+            };
+            let budget_mb = crate::fit::device_budget_mb(state.total_ram_mb, true);
+            let kv_per_token = crate::fit::est_kv_bytes_per_token(entry.params_b, eff_kv_kind);
+            let bounds = crate::fit::ctx_bounds(entry.size_mb, kv_per_token, budget_mb, entry.ctx_train);
+            if bounds.max == 0 || ctx < bounds.min || ctx > bounds.max {
+                return (StatusCode::BAD_REQUEST, Json(json!({
+                    "error": format!("ctx must be in the range {}..{}", bounds.min, bounds.max)
+                }))).into_response();
+            }
+            prof.ctx = Some(ctx);
+        }
+    }
+
+    if let Some(k) = body.kv_type { prof.kv_type = Some(k); }
+    if let Some(g) = body.gpu_layers { prof.gpu_layers = if g == u32::MAX { None } else { Some(g) }; }
+    if let Some(h) = body.history_turns { prof.history_turns = if h == 0 { None } else { Some(h) }; }
+
+    if let Err(e) = crate::settings::save_model_profile(&key, &prof) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+    }
+
+    // Reload if this is the active model so the new profile takes effect now.
+    let active = state.manager.status().current;
+    if active.repo == body.repo && active.file == body.file {
+        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file };
+        match state.manager.start_switch(spec) {
+            Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
+            Err(crate::model_manager::SwitchError::AlreadySwitching) => {
+                (StatusCode::CONFLICT, Json(json!({"error": "a switch is already in progress"}))).into_response()
+            }
+        }
     } else {
         (StatusCode::OK, Json(json!({"saved": true}))).into_response()
     }
@@ -1181,5 +1269,66 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sekret");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serialise tests that set LOCALLLM_SETTINGS so they don't race each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// POST /admin/model/profile — happy path: kv_type and history_turns persist.
+    #[tokio::test]
+    async fn set_model_profile_persists_kv_and_history() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        use crate::config::KvType;
+
+        // Isolate settings storage so this test never touches the real file.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let settings_file = std::env::temp_dir()
+            .join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
+        std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
+
+        // Use the first CATALOG entry — guaranteed to exist.
+        let entry = &crate::catalog::CATALOG[0];
+        let body = serde_json::json!({
+            "repo": entry.repo,
+            "file": entry.file,
+            "kv_type": "q4",
+            "history_turns": 3
+        });
+
+        // Build the test router. admin_token is hardcoded as "test-token".
+        let app = crate::router_for_test_with(
+            std::sync::Arc::new(crate::test_support::TaggedGen("test")),
+            crate::route::Profile::default().policy(),
+            1000,
+        );
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/model/profile")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let resp_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Expect 200 {"saved": true} (current model is "test"/"test", not this entry).
+        assert_eq!(status, 200, "expected 200, got {status}: {resp_body}");
+        assert_eq!(resp_body.get("saved"), Some(&serde_json::Value::Bool(true)));
+
+        // Assert the profile was actually persisted.
+        let key = crate::settings::model_ctx_key(entry.repo, entry.file);
+        let prof = crate::settings::load_model_profile(&key);
+        assert_eq!(prof.kv_type, Some(KvType::Q4), "kv_type should be Q4");
+        assert_eq!(prof.history_turns, Some(3), "history_turns should be 3");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&settings_file);
+        std::env::remove_var("LOCALLLM_SETTINGS");
     }
 }
