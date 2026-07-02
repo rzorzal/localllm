@@ -25,7 +25,7 @@
 //!
 //! ## Status text strategy
 //!
-//! The status MenuItem is set to "localllm â running on http://127.0.0.1:PORT"
+//! The status MenuItem is set to "localllm — running on http://127.0.0.1:PORT"
 //! immediately (static). Port is known from `Config::port` at launch time, so
 //! no cross-thread update is needed. If the server fails to bind, it logs the
 //! error; the tray still shows the expected URL (acceptable for a local tool).
@@ -104,15 +104,15 @@ mod platform {
 // Icon generation
 // ---------------------------------------------------------------------------
 
-/// Render the app icon as `size`Ã`size` RGBA: a rounded square with a
-/// tealâindigo diagonal gradient and a white minimalist chat-bubble glyph
+/// Render the app icon as `size`×`size` RGBA: a rounded square with a
+/// teal→indigo diagonal gradient and a white minimalist chat-bubble glyph
 /// with a spark. Shared by the tray (32px) and the .app icon export.
 pub fn render_icon_rgba(size: u32) -> Vec<u8> {
     let s = size as f32;
     let r = s * 0.22; // corner radius
     let mut rgba = vec![0u8; (size * size * 4) as usize];
 
-    // gradient endpoints: teal #2DD4BF â indigo #6366F1
+    // gradient endpoints: teal #2DD4BF → indigo #6366F1
     let (r0, g0, b0) = (45.0f32, 212.0, 191.0);
     let (r1, g1, b1) = (99.0f32, 102.0, 241.0);
 
@@ -273,20 +273,20 @@ mod tests {
 
     #[test]
     fn status_ready_is_running() {
-        assert_eq!(status_menu_label(&status("ready", SwitchPhase::Idle, 0)), "ð¢ Running");
+        assert_eq!(status_menu_label(&status("ready", SwitchPhase::Idle, 0)), "🟢 Running");
     }
 
     #[test]
     fn status_switching_shows_phase_and_percent() {
         assert_eq!(
             status_menu_label(&status("switching", SwitchPhase::Downloading, 42)),
-            "ð¡ Switchingâ¦ downloading 42%"
+            "🟡 Switching… downloading 42%"
         );
     }
 
     #[test]
     fn status_error_is_failed() {
-        assert_eq!(status_menu_label(&status("error", SwitchPhase::Idle, 0)), "ð´ Switch failed");
+        assert_eq!(status_menu_label(&status("error", SwitchPhase::Idle, 0)), "🔴 Switch failed");
     }
 }
 
@@ -309,10 +309,10 @@ fn status_menu_label(s: &crate::model_manager::SwitchStatus) -> String {
                 SwitchPhase::Loading => "loading",
                 SwitchPhase::Idle => "switching",
             };
-            format!("ð¡ Switchingâ¦ {phase} {}%", s.progress)
+            format!("🟡 Switching… {phase} {}%", s.progress)
         }
-        "error" => "ð´ Switch failed".to_string(),
-        _ => "ð¢ Running".to_string(),
+        "error" => "🔴 Switch failed".to_string(),
+        _ => "🟢 Running".to_string(),
     }
 }
 
@@ -344,7 +344,7 @@ fn wired_label(state: &crate::settings::IntegrationState) -> String {
 /// Run the server in a background thread and drive the event loop +
 /// tray icon on the main thread.
 ///
-/// This function is `-> !` â it blocks forever (exits via
+/// This function is `-> !` — it blocks forever (exits via
 /// `std::process::exit(0)` on Quit, or the OS kills the process).
 pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let port = cfg.port;
@@ -462,12 +462,12 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let menu = Menu::new();
                 // Title + status, then info lines (all disabled/informational),
                 // a separator, and the clickable Quit item.
-                let title = MenuItem::new("localllm â local LLM server", false, None);
+                let title = MenuItem::new("localllm — local LLM server", false, None);
                 // Starts as loading (yellow); flips to green "Running" once
                 // the server thread signals it is actually serving.
-                let status = MenuItem::new("ð¡ Loading modelâ¦", false, None);
+                let status = MenuItem::new("🟡 Loading model…", false, None);
                 status_handle = Some(status.clone());
-                // URL is clickable â copies to clipboard.
+                // URL is clickable → copies to clipboard.
                 let url_line = MenuItem::new(format!("URL:    {url_for_tray}  (click to copy)"), true, None);
                 url_id = Some(url_line.id().clone());
                 let model_line = MenuItem::new(format!("Model:  {model_short}"), false, None);
@@ -531,13 +531,13 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 _tray_keeper.push(
                     TrayIconBuilder::new()
                         .with_menu(Box::new(menu))
-                        .with_tooltip(format!("localllm â {url_for_tray}"))
+                        .with_tooltip(format!("localllm — {url_for_tray}"))
                         .with_icon(icon)
                         .build()
                         .expect("failed to create tray icon"),
                 );
 
-                tracing::info!("tray icon created; server loading in backgroundâ¦");
+                tracing::info!("tray icon created; server loading in background…");
             }
 
             // Poll the tray-icon menu-event channel on every wake-up.
@@ -546,7 +546,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
             Event::MainEventsCleared
             | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 // Flip status to green once the server is actually serving.
-                // Until the server is bound, keep the launch-time "Loading modelâ¦"
+                // Until the server is bound, keep the launch-time "Loading model…"
                 // line. Once ready, drive both the status and the model line from
                 // the live manager so startup, hot-swaps, and switch failures all
                 // show in the tray.
@@ -594,7 +594,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
 
                 while let Ok(menu_event) = MenuEvent::receiver().try_recv() {
                     if quit_id.as_ref() == Some(&menu_event.id) {
-                        tracing::info!("quit requested via tray menu â unwiring integrations");
+                        tracing::info!("quit requested via tray menu — unwiring integrations");
                         let st = crate::settings::load_integrations();
                         if st.enabled {
                             let injectors = crate::integrations::injectors_default();
