@@ -46,6 +46,12 @@ fn resolve_variant_files(repo: &str, file: &str, quant: &str) -> Vec<String> {
     vec![file.to_string()]
 }
 
+/// The effective quant for a switch: an explicit spec quant wins over the
+/// profile-resolved quant.
+fn effective_quant(spec_quant: Option<String>, resolved_quant: String) -> String {
+    spec_quant.unwrap_or(resolved_quant)
+}
+
 /// Map `KvType` to the llama-cpp-2 KV cache type.
 fn kv_type_to_llama(t: crate::config::KvType) -> llama_cpp_2::context::params::KvCacheType {
     use llama_cpp_2::context::params::KvCacheType;
@@ -189,10 +195,16 @@ pub async fn run_server_with_ready_policy_token(
         let kv_type = b_kv_type.clone(); // clone per-invocation before moving into async block
         let slot = slot_for_builder.clone();
         Box::pin(async move {
+            let r = resolve_load_params(&spec.repo, &spec.file, b_ctx_len, kv_type);
+            // Prefer an explicit quant on the switch spec; else the saved-profile-resolved quant.
+            let quant = effective_quant(spec.quant.clone(), r.quant.clone());
+            // On switch, load the resolved quant variant's file list.
+            // The startup path keeps &cfg.gguf_files unchanged (CLI is authoritative).
+            let files = resolve_variant_files(&spec.repo, &spec.file, &quant);
             let progress_target = slot.get().and_then(|w| w.upgrade());
             crate::download::ensure_model_with_progress(
                 &spec.repo,
-                std::slice::from_ref(&spec.file),
+                &files,
                 |done, total| {
                     if let Some(m) = &progress_target {
                         let pct = match total {
@@ -204,10 +216,6 @@ pub async fn run_server_with_ready_policy_token(
                 },
             )
             .await?;
-            let r = resolve_load_params(&spec.repo, &spec.file, b_ctx_len, kv_type);
-            // On switch, load the resolved quant variant's file list.
-            // The startup path keeps &cfg.gguf_files unchanged (CLI is authoritative).
-            let files = resolve_variant_files(&spec.repo, &spec.file, &r.quant);
             let engine =
                 LlamaEngine::load(
                     &spec.repo,
@@ -604,6 +612,12 @@ pub async fn axum_test_request_with_header(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effective_quant_prefers_spec_over_resolved() {
+        assert_eq!(crate::effective_quant(Some("Q8_0".into()), "Q4_K_M".into()), "Q8_0");
+        assert_eq!(crate::effective_quant(None, "Q4_K_M".into()), "Q4_K_M");
+    }
+
     #[test]
     fn resolve_variant_files_prefers_quant_then_falls_back() {
         // Absent repo → no catalog entry → falls back to [file] for any quant.

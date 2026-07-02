@@ -13,6 +13,12 @@ const TARGET_QUANTS: &[&str] = &["Q4_K_M", "Q5_K_M", "Q3_K_M", "Q6_K", "Q8_0", "
 ///
 /// Matches only when the variant key (filename minus `.gguf` and any shard suffix)
 /// ends with `-{tag}` (case-insensitive), so `Q6_K_L` does NOT match `Q6_K`.
+///
+/// NOTE: matching uses `-` as the quant delimiter. Repos that use `.`-separated
+/// quant names (e.g. `model.Q4_K_M.gguf`) will NOT be detected here.
+///
+/// NOTE: the tree fetch URL (see `main`) does not paginate; this is fine for the
+/// current catalog where all target repos have small file listings.
 fn quant_tag_of(filename: &str) -> Option<&'static str> {
     if !filename.to_ascii_lowercase().ends_with(".gguf") {
         return None;
