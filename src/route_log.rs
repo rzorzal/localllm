@@ -81,6 +81,62 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Bucket {
+    pub local_count: u64,
+    pub cloud_count: u64,
+    /// Σ(prompt+completion) of local requests — tokens NOT sent to the provider.
+    pub tokens_saved: u64,
+    /// Σ(prompt+completion) of ALL requests — the hypothetical all-cloud cost.
+    pub tokens_if_all_cloud: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Dashboard {
+    pub hour: Bucket,
+    pub day: Bucket,
+    pub month: Bucket,
+    /// Newest-first, capped at `recent_n`.
+    pub recent: Vec<RouteEntry>,
+}
+
+const HOUR: i64 = 3600;
+const DAY: i64 = 86_400;
+const MONTH: i64 = 2_592_000; // 30 days
+
+fn accumulate(bucket: &mut Bucket, e: &RouteEntry) {
+    let toks = e.prompt_tok + e.completion_tok.unwrap_or(0);
+    bucket.tokens_if_all_cloud += toks;
+    if e.dest == "local" {
+        bucket.local_count += 1;
+        bucket.tokens_saved += toks;
+    } else {
+        bucket.cloud_count += 1;
+    }
+}
+
+/// Build the dashboard rollups: rolling hour/day/month buckets plus the newest
+/// `recent_n` entries (newest first).
+pub fn build_dashboard(entries: &[RouteEntry], now: i64, recent_n: usize) -> Dashboard {
+    let (mut hour, mut day, mut month) = (Bucket::default(), Bucket::default(), Bucket::default());
+    for e in entries {
+        let age = now - e.ts;
+        if age <= MONTH {
+            accumulate(&mut month, e);
+        }
+        if age <= DAY {
+            accumulate(&mut day, e);
+        }
+        if age <= HOUR {
+            accumulate(&mut hour, e);
+        }
+    }
+    let mut recent: Vec<RouteEntry> = entries.to_vec();
+    recent.sort_by(|a, b| b.ts.cmp(&a.ts));
+    recent.truncate(recent_n);
+    Dashboard { hour, day, month, recent }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +167,52 @@ mod tests {
         let now = 1_000_000i64;
         let kept = prune(&[entry(now - 5, "local"), entry(now - 6, "cloud")], now, 100);
         assert_eq!(kept.len(), 2);
+    }
+
+    fn e(ts: i64, dest: &str, p: u64, c: u64) -> RouteEntry {
+        RouteEntry {
+            ts,
+            surface: "openai".into(),
+            dest: dest.into(),
+            reason: None,
+            score: 0.1,
+            prompt_tok: p,
+            completion_tok: Some(c),
+        }
+    }
+
+    #[test]
+    fn dashboard_buckets_and_token_math() {
+        let now = 10_000_000i64;
+        let entries = vec![
+            e(now - 10, "local", 100, 20),      // in hour/day/month
+            e(now - 7200, "cloud", 200, 50),    // in day/month, not hour
+            e(now - 200_000, "local", 300, 30), // in month only
+        ];
+        let d = build_dashboard(&entries, now, 10);
+        // hour: only the first local entry
+        assert_eq!(d.hour.local_count, 1);
+        assert_eq!(d.hour.cloud_count, 0);
+        assert_eq!(d.hour.tokens_saved, 120);
+        assert_eq!(d.hour.tokens_if_all_cloud, 120);
+        // day: local(120) + cloud(250)
+        assert_eq!(d.day.local_count, 1);
+        assert_eq!(d.day.cloud_count, 1);
+        assert_eq!(d.day.tokens_saved, 120); // only local counts as saved
+        assert_eq!(d.day.tokens_if_all_cloud, 370); // all requests
+        // month: all three
+        assert_eq!(d.month.tokens_saved, 120 + 330); // two local
+        assert_eq!(d.month.tokens_if_all_cloud, 120 + 250 + 330);
+        // recent newest-first
+        assert_eq!(d.recent.len(), 3);
+        assert_eq!(d.recent[0].ts, now - 10);
+    }
+
+    #[test]
+    fn dashboard_recent_is_capped() {
+        let now = 100i64;
+        let entries: Vec<RouteEntry> = (0..20).map(|i| e(now - i, "local", 1, 1)).collect();
+        let d = build_dashboard(&entries, now, 5);
+        assert_eq!(d.recent.len(), 5);
     }
 }
