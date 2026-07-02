@@ -586,6 +586,63 @@ async fn responses_overflow_routes_to_cloud() {
     std::env::remove_var("LOCALLLM_OPENAI_BASE");
 }
 
+// --- Tool filtering (Task 3, sub-project 3) ---
+
+/// Verify that `shape_tools` drops blocklisted tools before local inference:
+/// posting Bash+Read to /v1/messages with "Read" in the anthropic blocklist
+/// should deliver only ["Bash"] to the generator.
+#[tokio::test]
+async fn anthropic_request_drops_blocklisted_tool() {
+    let _guard = ENV_LOCK.lock().await;
+
+    // Point LOCALLLM_SETTINGS at a temp file; save "Read" as blocked for anthropic.
+    let dir = std::env::temp_dir().join(format!(
+        "localllm-toolfilter-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    std::env::set_var("LOCALLLM_SETTINGS", &path);
+    localllm::settings::save_tool_filter("anthropic", &["Read".to_string()]).unwrap();
+
+    // Build router wired to a ToolRecordingGen so we can inspect what reaches generate().
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let gen = std::sync::Arc::new(localllm::ToolRecordingGen(recorded.clone()));
+    let app = localllm::router_for_test_with(
+        gen,
+        localllm::route::Profile::SaveTokens.policy(),
+        128_000,
+    );
+
+    // POST /v1/messages with tools Bash + Read.
+    let body = r#"{
+        "model": "m",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [
+            {"name": "Bash",   "description": "run shell",  "input_schema": {"type": "object"}},
+            {"name": "Read",   "description": "read file",  "input_schema": {"type": "object"}}
+        ]
+    }"#;
+    localllm::axum_test_request(app, "/v1/messages", body).await;
+
+    let tool_names = recorded.lock().unwrap().clone();
+
+    std::env::remove_var("LOCALLLM_SETTINGS");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Read is blocklisted → generator must see only ["Bash"].
+    assert_eq!(
+        tool_names,
+        vec!["Bash".to_string()],
+        "expected only [Bash] after filtering, got: {:?}",
+        tool_names
+    );
+}
+
 // --- History truncation (Task 7) ---
 
 /// Verify that `apply_history_window` trims the conversation before local

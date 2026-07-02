@@ -398,6 +398,34 @@ impl Generator for RecordingGen {
     }
 }
 
+/// A generator that records the tool names it receives (for assertion in tests).
+pub struct ToolRecordingGen(pub Arc<std::sync::Mutex<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl Generator for ToolRecordingGen {
+    async fn generate(&self, req: crate::api::common::ChatRequest) -> anyhow::Result<ChatResult> {
+        *self.0.lock().unwrap() = req.tools.iter().map(|t| t.name.clone()).collect();
+        Ok(ChatResult {
+            content: vec![ContentPart::Text("ok".into())],
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        req: crate::api::common::ChatRequest,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
+        *self.0.lock().unwrap() = req.tools.iter().map(|t| t.name.clone()).collect();
+        let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
+            Ok(StreamDelta { text: Some("ok".into()), done: false, finish_reason: None }),
+            Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) }),
+        ];
+        Ok(Box::pin(futures::stream::iter(deltas)))
+    }
+}
+
 /// Build a test router with a custom generator, routing policy, and local
 /// context window. Lets tests drive specific routing/cascade decisions.
 pub fn router_for_test_with(

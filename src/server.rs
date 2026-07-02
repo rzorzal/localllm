@@ -241,6 +241,26 @@ fn resolve_history_turns(active: &crate::model_manager::ModelSpec) -> Option<u32
 }
 
 /// Trim a request's history to the active model's window, in place.
+/// Record the request's tool names into the discovery registry for `surface`
+/// (latest sorted-unique set), then drop any blocklisted tools before local
+/// inference. Local-only; the cloud path forwards raw bytes untouched.
+fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
+    // 1) record seen (pre-filter) — reflects what the client actually sent
+    {
+        let mut names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        let mut reg = state.tool_registry.lock().unwrap_or_else(|e| e.into_inner());
+        reg.insert(surface.to_string(), names);
+    }
+    // 2) filter disabled
+    let disabled = crate::settings::load_tool_filter(surface);
+    if !disabled.is_empty() {
+        let tools = std::mem::take(&mut req.tools);
+        req.tools = crate::api::common::filter_tools(tools, &disabled);
+    }
+}
+
 fn apply_history_window(state: &AppState, req: &mut ChatRequest) {
     let active = state.manager.status().current;
     let keep = resolve_history_turns(&active);
@@ -365,6 +385,9 @@ pub struct AppState {
     pub requested_ctx_ceiling: u32,
     /// KV cache kind used for catalog RAM estimates.
     pub kv_kind: crate::fit::KvKind,
+    /// Per-surface discovery of the tool names seen on recent requests
+    /// (surface -> latest sorted-unique names). In-memory; re-discovered on restart.
+    pub tool_registry: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -413,6 +436,7 @@ pub fn router(
         total_ram_mb,
         requested_ctx_ceiling,
         kv_kind,
+        tool_registry: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
     });
     // Large prompts must reach the routing layer to be forwarded to cloud;
     // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
@@ -782,6 +806,7 @@ async fn handle_oai_chat(
     };
     let mut internal = internal;
     apply_history_window(&state, &mut internal);
+    shape_tools(&state, "openai", &mut internal);
 
     // --- Routing decision ---
     if state.manager.is_errored() {
@@ -969,6 +994,7 @@ async fn handle_oai_responses(
     };
     let mut internal = internal;
     apply_history_window(&state, &mut internal);
+    shape_tools(&state, "openai-responses", &mut internal);
 
     if state.manager.is_errored() {
         return (StatusCode::SERVICE_UNAVAILABLE,
@@ -1067,6 +1093,7 @@ async fn handle_anth_messages(
     };
     let mut internal = internal;
     apply_history_window(&state, &mut internal);
+    shape_tools(&state, "anthropic", &mut internal);
 
     // --- Routing decision ---
     if state.manager.is_errored() {
