@@ -78,9 +78,45 @@ pub struct StreamDelta {
     pub finish_reason: Option<FinishReason>,
 }
 
+/// Keep only the last `keep_turns` conversation turns, plus all leading system
+/// messages. A turn begins at a `Role::User` message and runs until the next
+/// `Role::User`, so cutting on a user boundary never splits a `tool_use` from
+/// its `tool_result` (both live inside the same turn). `None` = passthrough.
+pub fn truncate_history(messages: Vec<ChatMessage>, keep_turns: Option<u32>) -> Vec<ChatMessage> {
+    let Some(n) = keep_turns else { return messages };
+    let n = n as usize;
+
+    // Leading system messages are always kept.
+    let lead_sys = messages.iter().take_while(|m| m.role == Role::System).count();
+
+    // Indices (in the full vec) where a turn starts.
+    let user_starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i)
+        .collect();
+
+    if user_starts.len() <= n {
+        return messages; // nothing to drop
+    }
+
+    // Start of the first turn we keep.
+    let cut = user_starts[user_starts.len() - n];
+
+    let mut out = Vec::with_capacity(lead_sys + (messages.len() - cut));
+    out.extend(messages.iter().take(lead_sys).cloned());
+    out.extend(messages.iter().skip(cut).cloned());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn m(role: Role, text: &str) -> ChatMessage {
+        ChatMessage { role, text: Some(text.into()), tool_calls: vec![], tool_result: None }
+    }
 
     #[test]
     fn tool_call_holds_json_arguments() {
@@ -96,5 +132,44 @@ mod tests {
     #[test]
     fn finish_reason_tool_calls_is_distinct() {
         assert_ne!(FinishReason::ToolCalls, FinishReason::Stop);
+    }
+
+    #[test]
+    fn truncate_keeps_system_and_last_n_turns() {
+        let msgs = vec![
+            m(Role::System, "sys"),
+            m(Role::User, "u1"), m(Role::Assistant, "a1"),
+            m(Role::User, "u2"), m(Role::Assistant, "a2"),
+        ];
+        let out = truncate_history(msgs, Some(1));
+        let texts: Vec<_> = out.iter().map(|x| x.text.clone().unwrap()).collect();
+        assert_eq!(texts, vec!["sys", "u2", "a2"]);
+    }
+
+    #[test]
+    fn truncate_never_splits_a_tool_turn() {
+        // Turn 1 has a tool call + result; keeping 1 turn must keep turn 2 whole.
+        let msgs = vec![
+            m(Role::System, "sys"),
+            m(Role::User, "u1"),
+            ChatMessage { role: Role::Assistant, text: None,
+                tool_calls: vec![ToolCall { id: "c1".into(), name: "t".into(), arguments: "{}".into() }],
+                tool_result: None },
+            ChatMessage { role: Role::Tool, text: None, tool_calls: vec![],
+                tool_result: Some(ToolResult { tool_call_id: "c1".into(), content: "ok".into() }) },
+            m(Role::Assistant, "a1"),
+            m(Role::User, "u2"), m(Role::Assistant, "a2"),
+        ];
+        let out = truncate_history(msgs.clone(), Some(1));
+        let roles: Vec<_> = out.iter().map(|x| x.role.clone()).collect();
+        assert_eq!(roles, vec![Role::System, Role::User, Role::Assistant]);
+        // Keeping 2 turns returns everything.
+        assert_eq!(truncate_history(msgs.clone(), Some(2)).len(), msgs.len());
+    }
+
+    #[test]
+    fn truncate_none_is_passthrough() {
+        let msgs = vec![m(Role::System, "sys"), m(Role::User, "u1")];
+        assert_eq!(truncate_history(msgs.clone(), None), msgs);
     }
 }
