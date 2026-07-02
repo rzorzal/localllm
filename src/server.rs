@@ -409,6 +409,31 @@ impl Generator for crate::engine::Engine {
 // Router
 // ---------------------------------------------------------------------------
 
+/// Wire all routes onto a pre-built `Arc<AppState>`. Extracted from `router()`
+/// so tests can inject a custom state (e.g. with a seeded tool registry).
+fn build_router_inner(state: Arc<AppState>) -> Router {
+    // Large prompts must reach the routing layer to be forwarded to cloud;
+    // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
+    // axum's default is 2 MB, which would reject them with 413 before routing.
+    Router::new()
+        .route("/v1/chat/completions", post(handle_oai_chat))
+        .route("/v1/messages", post(handle_anth_messages))
+        .route("/v1/responses", post(handle_oai_responses))
+        .route("/v1/models", get(handle_models))
+        .route("/health", get(handle_health))
+        .route("/admin/model", post(handle_admin_switch))
+        .route("/admin/model/status", get(handle_admin_status))
+        .route("/admin/model/ctx", post(handle_model_set_ctx))
+        .route("/admin/model/profile", post(handle_model_set_profile))
+        .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
+        .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
+        .route("/manager", get(handle_manager_page))
+        .route("/manager/app.js", get(handle_manager_js))
+        .route("/manager/style.css", get(handle_manager_css))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .with_state(state)
+}
+
 /// Build the axum Router with all four endpoints wired to the given generator,
 /// the configured model id, the shared routing policy, the local context
 /// window used by the context gate, and the session usage tracker.
@@ -436,27 +461,11 @@ pub fn router(
         total_ram_mb,
         requested_ctx_ceiling,
         kv_kind,
-        tool_registry: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        tool_registry: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        )),
     });
-    // Large prompts must reach the routing layer to be forwarded to cloud;
-    // 64 MB ≈ ~16 M chars, giving ample headroom for over-window requests.
-    // axum's default is 2 MB, which would reject them with 413 before routing.
-    Router::new()
-        .route("/v1/chat/completions", post(handle_oai_chat))
-        .route("/v1/messages", post(handle_anth_messages))
-        .route("/v1/responses", post(handle_oai_responses))
-        .route("/v1/models", get(handle_models))
-        .route("/health", get(handle_health))
-        .route("/admin/model", post(handle_admin_switch))
-        .route("/admin/model/status", get(handle_admin_status))
-        .route("/admin/model/ctx", post(handle_model_set_ctx))
-        .route("/admin/model/profile", post(handle_model_set_profile))
-        .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
-        .route("/manager", get(handle_manager_page))
-        .route("/manager/app.js", get(handle_manager_js))
-        .route("/manager/style.css", get(handle_manager_css))
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-        .with_state(state)
+    build_router_inner(state)
 }
 
 /// Verify the `X-Admin-Token` header against the configured token (constant-time).
@@ -509,6 +518,13 @@ struct SetProfileBody {
     history_turns: Option<u32>,
     #[serde(default)]
     quant: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SetToolsBody {
+    surface: String,
+    #[serde(default)]
+    disabled: Vec<String>,
 }
 
 /// A model `file` must be a bare filename (no path components), so it can never
@@ -768,6 +784,72 @@ async fn handle_model_set_profile(
         }
     } else {
         (StatusCode::OK, Json(json!({"saved": true}))).into_response()
+    }
+}
+
+/// The three known API surfaces (must stay in sync with shape_tools call-sites).
+const KNOWN_SURFACES: [&str; 3] = ["anthropic", "openai", "openai-responses"];
+
+/// GET /admin/tools — per-surface { seen, disabled } (token-guarded).
+async fn handle_tools_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let reg = state
+        .tool_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut out = serde_json::Map::new();
+    for surface in KNOWN_SURFACES {
+        let seen = reg.get(surface).cloned().unwrap_or_default();
+        let disabled = crate::settings::load_tool_filter(surface);
+        if seen.is_empty() && disabled.is_empty() {
+            continue;
+        }
+        out.insert(
+            surface.to_string(),
+            json!({ "seen": seen, "disabled": disabled }),
+        );
+    }
+    Json(serde_json::Value::Object(out)).into_response()
+}
+
+/// POST /admin/tools — set a surface's blocklist (token-guarded).
+async fn handle_tools_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: SetToolsBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+                .into_response()
+        }
+    };
+    if !KNOWN_SURFACES.contains(&body.surface.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unknown surface"})),
+        )
+            .into_response();
+    }
+    match crate::settings::save_tool_filter(&body.surface, &body.disabled) {
+        Ok(()) => Json(json!({"saved": true})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1268,6 +1350,48 @@ async fn handle_health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// Test-only: build a router whose tool registry is pre-seeded, so tests can
+/// verify that `GET /admin/tools` merges in-memory `seen` with saved `disabled`.
+#[cfg(test)]
+fn make_seeded_test_router(
+    tool_registry: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
+    >,
+) -> Router {
+    use crate::model_manager::{EngineBuilder, ModelManager, ModelSpec};
+    let policy = Arc::new(std::sync::RwLock::new(
+        crate::route::Profile::default().policy(),
+    ));
+    let usage = std::sync::Arc::new(crate::usage::Usage::new());
+    let builder: EngineBuilder = Box::new(|_spec| {
+        Box::pin(async {
+            Ok(Arc::new(crate::test_support::TaggedGen("switched")) as Arc<dyn Generator>)
+        })
+    });
+    let manager = ModelManager::new(
+        Arc::new(crate::test_support::TaggedGen("test")) as Arc<dyn Generator>,
+        ModelSpec {
+            repo: "test".into(),
+            file: "test".into(),
+            quant: None,
+        },
+        builder,
+    );
+    build_router_inner(Arc::new(AppState {
+        manager,
+        model_id: "test-model".to_string(),
+        policy,
+        local_ctx_window: 1000,
+        usage,
+        cloud_token_alert: 200_000,
+        admin_token: Arc::from("test-token"),
+        total_ram_mb: 16384,
+        requested_ctx_ceiling: 32768,
+        kv_kind: crate::fit::KvKind::Q8,
+        tool_registry,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1296,6 +1420,122 @@ mod tests {
         let r = super::resolve_admin_token(None);
         assert_eq!(r.len(), 32); // random 32-hex
         assert_ne!(super::resolve_admin_token(None), r); // different each call
+    }
+
+    /// GET /admin/tools — merges registry (seen) with settings (disabled).
+    #[tokio::test]
+    async fn get_tools_merges_registry_and_settings() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        use std::sync::Arc;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let settings_file = std::env::temp_dir()
+            .join(format!("localllm-srvtest-tools-get-{}.json", uuid::Uuid::new_v4()));
+        std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
+
+        // Seed settings: "anthropic" blocklist = ["Read"]
+        crate::settings::save_tool_filter("anthropic", &["Read".to_string()]).unwrap();
+
+        // Seed the in-memory registry: "anthropic" -> ["Bash", "Read"]
+        let mut initial_registry = std::collections::BTreeMap::new();
+        initial_registry.insert(
+            "anthropic".to_string(),
+            vec!["Bash".to_string(), "Read".to_string()],
+        );
+        let tool_registry = Arc::new(std::sync::Mutex::new(initial_registry));
+
+        // Build the router with the seeded registry via the test-only helper.
+        let app = super::make_seeded_test_router(tool_registry);
+
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/tools")
+            .header("x-admin-token", "test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_default();
+
+        assert_eq!(status, 200, "expected 200, got {status}: {body}");
+        let anthropic = body.get("anthropic").expect("anthropic key in response");
+        assert_eq!(anthropic["seen"], serde_json::json!(["Bash", "Read"]));
+        assert_eq!(anthropic["disabled"], serde_json::json!(["Read"]));
+
+        let _ = std::fs::remove_file(&settings_file);
+        std::env::remove_var("LOCALLLM_SETTINGS");
+    }
+
+    /// POST /admin/tools — persists blocklist and rejects unknown surface.
+    #[tokio::test]
+    async fn post_tools_persists_and_rejects_unknown_surface() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let settings_file = std::env::temp_dir()
+            .join(format!("localllm-srvtest-tools-post-{}.json", uuid::Uuid::new_v4()));
+        std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
+
+        let app = crate::router_for_test_with(
+            std::sync::Arc::new(crate::test_support::TaggedGen("test")),
+            crate::route::Profile::default().policy(),
+            1000,
+        );
+
+        // POST with valid surface → 200 and persists.
+        let body = serde_json::json!({"surface": "openai", "disabled": ["Foo"]});
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/tools")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(status, 200, "expected 200 for valid surface: {resp}");
+        assert_eq!(resp["saved"], serde_json::json!(true));
+        // Verify the filter was actually persisted.
+        assert_eq!(
+            crate::settings::load_tool_filter("openai"),
+            vec!["Foo".to_string()]
+        );
+
+        // POST with bogus surface → 400.
+        let body2 = serde_json::json!({"surface": "bogus", "disabled": []});
+        let request2 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/tools")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-token")
+            .body(Body::from(body2.to_string()))
+            .unwrap();
+        let response2 = app.clone().oneshot(request2).await.unwrap();
+        let status2 = response2.status().as_u16();
+        let bytes2 = response2.into_body().collect().await.unwrap().to_bytes();
+        let resp2: serde_json::Value =
+            serde_json::from_slice(&bytes2).unwrap_or_default();
+        assert_eq!(status2, 400, "expected 400 for unknown surface: {resp2}");
+        assert!(
+            resp2["error"]
+                .as_str()
+                .map(|s| s.contains("unknown"))
+                .unwrap_or(false),
+            "error should mention 'unknown': {resp2}"
+        );
+
+        let _ = std::fs::remove_file(&settings_file);
+        std::env::remove_var("LOCALLLM_SETTINGS");
     }
 
     #[cfg(unix)]
