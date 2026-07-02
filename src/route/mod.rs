@@ -215,9 +215,9 @@ mod tests {
 
     #[test]
     fn high_difficulty_in_window_routes_cloud() {
-        // Balanced threshold 0.6; a large NEW turn pushes the score over it.
+        // Balanced threshold 0.45; a large NEW turn pushes the score over it.
         let p = Profile::Balanced.policy();
-        // last_turn 1600 → turn 0.8 → 0.8*0.8 = 0.64; +depth ~0.01 → 0.65 > 0.6.
+        // last_turn 1600 → turn 0.8 → 0.8*0.8 = 0.64; +depth ~0.01 → 0.65 > 0.45.
         // The prompt still fits the window (no overflow gate).
         let s = Signals {
             prompt_tokens: 1600,
@@ -348,26 +348,26 @@ mod tests {
         assert!(estimate_prompt_tokens(&req) > 9000); // prompt is huge, but the turn is tiny
     }
 
-    // A request scoring ~0.55: last_turn 1350/2000=0.675→0.8*0.675=0.54, 1 msg→~0.01.
+    // A request scoring ~0.41: last_turn 1000/2000=0.5→0.8*0.5=0.40, 1 msg→~0.01.
     fn mid_sig(cap: f32) -> Signals {
         Signals {
-            prompt_tokens: 1350, local_ctx_window: 32768, n_tools: 6,
-            n_messages: 1, last_turn_tokens: 1350, has_cloud_creds: true, local_capability_b: cap,
+            prompt_tokens: 1000, local_ctx_window: 32768, n_tools: 6,
+            n_messages: 1, last_turn_tokens: 1000, has_cloud_creds: true, local_capability_b: cap,
         }
     }
 
     #[test]
     fn weak_local_lowers_threshold_to_cloud() {
-        let p = Profile::Balanced.policy(); // threshold 0.6
-        // neutral (0.0) and 7B: score ~0.55 < 0.6 → stays local (cascade).
+        let p = Profile::Balanced.policy(); // threshold 0.45
+        // neutral (0.0) and 7B: score ~0.41 < 0.45 → stays local (cascade).
         assert_eq!(decide(&mid_sig(0.0), &p), Decision::LocalThenCascade);
         assert_eq!(decide(&mid_sig(7.0), &p), Decision::LocalThenCascade);
-        // 3B: adj −0.12 → effective 0.48 → 0.55 > 0.48 → cloud.
+        // 3B: adj −0.12 → effective 0.33 → 0.41 > 0.33 → cloud.
         assert_eq!(decide(&mid_sig(3.0), &p), Decision::Cloud(RouteReason::Difficulty));
     }
 
     // A request scoring ~0.65: last_turn 1600/2000=0.8→0.8*0.8=0.64, 1 msg→~0.01.
-    // This sits ABOVE the 7B/neutral threshold (0.60) but BELOW the 14B one (0.81),
+    // This sits ABOVE the 7B/neutral threshold (0.45) but BELOW the 14B one (0.66),
     // so a strong model is what flips it Cloud→Local.
     fn high_sig(cap: f32) -> Signals {
         Signals {
@@ -378,8 +378,8 @@ mod tests {
 
     #[test]
     fn strong_local_raises_threshold_to_local() {
-        let p = Profile::Balanced.policy(); // threshold 0.6
-        // Score ~0.615: at 7B (effective 0.60) → Cloud; at 14B (effective 0.81) → local.
+        let p = Profile::Balanced.policy(); // threshold 0.45
+        // Score ~0.65: at 7B (effective 0.45) → Cloud; at 14B (effective 0.66) → local.
         // This proves the strong model RAISES the cutoff enough to flip the decision.
         assert_eq!(decide(&high_sig(7.0), &p), Decision::Cloud(RouteReason::Difficulty));
         assert_eq!(decide(&high_sig(14.0), &p), Decision::LocalThenCascade);

@@ -51,7 +51,9 @@ impl Profile {
                 allow_cloud: true,
             },
             Profile::Balanced => RoutingPolicy {
-                escalation_threshold: 0.6,
+                // Lowered 0.6 → 0.45 so medium-difficulty turns escalate to cloud
+                // more readily (Balanced was staying too local on real workloads).
+                escalation_threshold: 0.45,
                 cascade: true,
                 ctx_gate_frac: 0.9,
                 allow_cloud: true,
