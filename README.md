@@ -1,17 +1,70 @@
 # localllm
 
-A lightweight local LLM inference server. Loads a Qwen2.5 GGUF model via
-[mistralrs](https://github.com/EricLBuehler/mistral.rs), runs it on the Apple
-GPU (Metal), and serves two API surfaces so existing AI tools can point at it:
+A **local-first LLM gateway** for your Mac. It runs a local model, exposes the
+OpenAI and Anthropic APIs so existing AI tools can point at it unchanged, and
+**routes each request local-vs-cloud on the fly** — keeping cheap/easy work on
+the local model and escalating the hard stuff to the cloud provider using the
+caller's own credentials. It ships as a macOS **menu-bar app** with a built-in
+**Config** UI (model picker, tool filter, routing, dashboard).
 
-- **OpenAI** — `POST /v1/chat/completions`, `GET /v1/models`
-- **Anthropic** — `POST /v1/messages`
-- **Health** — `GET /health`
+The goal: cut cloud token spend without giving up quality — trivial turns stay
+local and free, difficult turns still get a frontier model.
 
-Both APIs support tool calling (function calling) with full two-step tool
-chaining, and SSE streaming. The default model is the lightweight
-**Qwen2.5-3B-Instruct** so it coexists with your other apps for small local
-tasks; swap in a larger model when you have RAM to spare (see below).
+---
+
+## Highlights
+
+- **Two API surfaces** — OpenAI (`/v1/chat/completions`, `/v1/responses`,
+  `/v1/models`) and Anthropic (`/v1/messages`), with tool calling + SSE streaming.
+- **Smart routing** — a cheap pre-generation score decides local vs cloud per
+  request; a hard context gate sends over-window prompts to cloud; optional
+  cascade escalates a weak local answer.
+- **Local engine** — embedded **llama.cpp** (default) on the Apple GPU (Metal),
+  with KV-cache quantization and on-disk prefix-cache persistence. `mistralrs`
+  is available as an alternate backend.
+- **Menu-bar app** — status, live model, and a webview **Config** window:
+  Models · Tools · Dashboard, plus routing profile, app wiring, and the smart
+  history toggle. Opens on the last-used model; hides on blur to save memory.
+- **Dashboard** — persistent routing log: where each prompt went and *why*
+  (score breakdown), tokens saved per hour/day/month, and what it would have
+  cost if everything went to cloud.
+- **Per-model profiles** — context window, KV-cache type, GPU layers, history
+  turns, and quant variant, persisted per model and restored on switch.
+- **Tool filter** — per-client allow/block list applied at request time.
+- **Auto-wiring** — one toggle points Claude Code / Codex at localllm and
+  reverts them on quit.
+
+---
+
+## How routing works
+
+For every request localllm computes cheap signals (no generation) and decides:
+
+1. **Context gate** — if the prompt exceeds `ctx_len × ctx_gate_frac`, it can't
+   fit locally → **cloud** (`ContextOverflow`). No creds/cloud disallowed →
+   local, best-effort.
+2. **Difficulty score** in `[0,1]` from the *latest turn* size and conversation
+   depth: `0.8·min(1, last_turn_tok/2000) + 0.2·min(1, n_messages/20)`. It
+   deliberately ignores the big static prefix/tool schemas agents resend every
+   turn, so a trivial `ls` doesn't score like a refactor.
+3. If `score > threshold` (the profile's cutoff, adjusted for the local model's
+   capability) → **cloud** (`Difficulty`); otherwise **local**, with an optional
+   **cascade** to cloud if the local answer comes back weak (length-truncated).
+
+Cloud requests are reverse-proxied to the provider with the caller's own
+`x-api-key` / `authorization` header. If the cloud call fails (auth/quota/
+offline), it **degrades** to local and notifies once.
+
+### Routing profiles
+
+Selectable live from the Config page (persisted). Lower threshold = more cloud.
+
+| Profile | Threshold | Cascade | Cloud | Behavior |
+|---|---|---|---|---|
+| **Save tokens** (default) | 0.90 | yes | yes | Local-first; cloud only when local truly can't serve |
+| **Balanced** | 0.45 | yes | yes | Local for easy/medium, cloud for harder turns |
+| **Max quality** | 0.20 | no | yes | Cloud-first; local only for trivial calls |
+| **Local only** | 1.00 | no | no | Never cloud; zero tokens |
 
 ---
 
@@ -21,193 +74,295 @@ tasks; swap in a larger model when you have RAM to spare (see below).
 cargo build --release
 ```
 
-> **Metal toolchain note.** Building the Metal GPU shaders requires Apple's
-> Metal Toolchain (`xcrun metal`). If you hit
-> `cannot execute tool 'metal' due to missing Metal Toolchain`, install it:
-> ```bash
-> xcodebuild -runFirstLaunch          # repairs Xcode plugins if needed
-> xcodebuild -downloadComponent MetalToolchain
-> ```
-> As a fallback (no GPU), you can build with `MISTRALRS_METAL_PRECOMPILE=0` and
-> run with `--force-cpu true` — that skips shader precompilation and runs on CPU.
+Default backend is embedded **llama.cpp** — no special toolchain needed. The
+optional `mistralrs` backend uses Metal GPU shaders; if you build/run it and hit
+`missing Metal Toolchain`, install it:
+
+```bash
+xcodebuild -runFirstLaunch
+xcodebuild -downloadComponent MetalToolchain
+# or build CPU-only: MISTRALRS_METAL_PRECOMPILE=0 … --force-cpu true
+```
+
+### macOS menu-bar app
+
+```bash
+bash scripts/build-app.sh      # produces target/localllm.app
+```
+
+Launch the `.app` (menu-bar agent, no Dock icon). It starts the server in the
+background and shows a status-bar menu.
 
 ---
 
 ## Run
 
+Headless server:
+
 ```bash
 ./target/release/localllm --port 31415
 ```
 
-The model is downloaded to the HuggingFace cache on first run, then loaded
-(~10s). You'll see:
+Menu-bar app (from a terminal):
 
-```
-INFO  localllm: loading model Qwen/Qwen2.5-3B-Instruct-GGUF (force_cpu=false)…
-INFO  localllm: listening on http://127.0.0.1:31415
+```bash
+./target/release/localllm --tray
 ```
 
-### Options
+First run downloads the model to the HuggingFace cache, then loads it. Boot
+restores the **last activated model** unless `--model-id` is passed explicitly.
+
+### CLI options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | `31415` | TCP port (binds `127.0.0.1` only) |
 | `--model-id` | `Qwen/Qwen2.5-3B-Instruct-GGUF` | HuggingFace GGUF repo |
 | `--gguf-file` | `qwen2.5-3b-instruct-q4_k_m.gguf` | GGUF filename(s); repeat for split models |
-| `--ctx-len` | `8192` | Context window in tokens (sizes the GPU KV cache) |
-| `--no-paged-attn` | `false` | Disable PagedAttention |
+| `--ctx-len` | `32768` | Context window in tokens (sizes the KV cache) |
+| `--backend` | `llama` | `llama` (embedded llama.cpp) or `mistralrs` |
+| `--kv-type` | `q8` | KV-cache quant: `q8` (½ RAM), `f16` (max quality), `q4` (min RAM) |
+| `--kv-cache-dir` | `<cache>/localllm/kvcache` | On-disk prefix-cache dir |
+| `--no-kv-persist` | `false` | Disable on-disk KV persistence |
+| `--profile` | *(saved)* | Routing profile for this run (`save-tokens`, `balanced`, `max-quality`, `local-only`) |
+| `--cloud-token-alert` | `200000` | Session cloud prompt-token total that fires a one-shot high-usage alert |
+| `--admin-token` | *(random)* | Token for `/admin/*`; else generated + written to `<config>/localllm/admin-token` (0600) |
 | `--force-cpu` | `false` | Force CPU instead of the Apple GPU |
-
----
-
-## Choosing a model and context size
-
-The two levers that matter on a 16 GB Mac:
-
-- **Model size (parameters)** — bigger = smarter, slower, more RAM.
-- **`--ctx-len` (context window)** — bigger = handles longer input, more KV-cache
-  RAM (~55 KB/token: 8k ≈ 0.3 GB, 32k ≈ 1.8 GB).
-
-### Light + fast (default) — small tasks alongside other apps
-```bash
-./target/release/localllm
-# Qwen2.5-3B, 8k context. ~2.3 GB, ~39 tok/s on M1 Pro.
-```
-
-### Smarter — when you have RAM free
-First download the model, then point the flags at it:
-```bash
-hf download Qwen/Qwen2.5-7B-Instruct-GGUF \
-  qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf \
-  qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
-
-./target/release/localllm \
-  --model-id Qwen/Qwen2.5-7B-Instruct-GGUF \
-  --gguf-file qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf \
-  --gguf-file qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
-# Qwen2.5-7B. Smarter but ~15 tok/s and heavier on RAM.
-```
-
-### Longer context (e.g. bigger documents)
-```bash
-./target/release/localllm --ctx-len 32768
-# More KV-cache RAM; watch swap on a 16 GB machine.
-```
-
-The tokenizer repo is derived automatically by stripping `-GGUF` from
-`--model-id`, so any `Qwen/...-GGUF` repo works out of the box.
-
----
-
-## API examples
-
-### OpenAI
-```bash
-curl http://localhost:31415/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"local","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128}'
-```
-
-### Anthropic
-```bash
-curl http://localhost:31415/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{"model":"local","max_tokens":128,"messages":[{"role":"user","content":"Hello!"}]}'
-```
-
-### Health
-```bash
-curl http://localhost:31415/health   # {"status":"ok"}
-```
+| `--no-paged-attn` | `false` | Disable PagedAttention (mistralrs) |
+| `--tray` | `false` | Run as a macOS menu-bar app |
 
 ---
 
 ## Pointing AI tools at localllm
 
-### Codex CLI
+Manual:
+
 ```bash
+# Codex CLI
 export OPENAI_BASE_URL=http://localhost:31415/v1
 codex "explain this code"
+
+# Claude Code
+ANTHROPIC_BASE_URL=http://localhost:31415 ANTHROPIC_API_KEY=<your-key> claude
 ```
 
-### Claude Code
+Or use the **Config → "Rotear apps pelo localllm"** toggle (or the tray state
+line): it rewrites the Claude Code / Codex client configs to point at localllm,
+and **un-wires them automatically when you quit** so the tools fall back to the
+provider directly.
+
+> Cloud escalation forwards the caller's real API key. Point tools at localllm
+> with your normal provider key and localllm decides per request whether to
+> answer locally (free) or relay to the provider (your key, your bill).
+
+> **Claude Code note.** It sends a ~26k-token system+tools prefix every turn, so
+> keep `--ctx-len 32768`. On a 16 GB Mac the model + KV cache + your apps can
+> swap; a smaller model or more RAM helps. Simple clients run great.
+
+---
+
+## The Config app
+
+Opened from the tray (**Config**, or its Models / Tools / Dashboard items), a
+single webview reused across sections (hash routes `#/config`, `#/models`,
+`#/tools`, `#/dashboard`).
+
+- **Models** — a column drilldown (Family → Model → Detail). Switch models,
+  download quant variants, and set per-model **context window, KV-cache type,
+  GPU layers, history turns, and quant** — persisted per model.
+- **Tools** — per-client tool allow/block list with text + status filters and
+  collapsible descriptions. Blocked tools stay blocked (and listed) even when an
+  agent stops sending them; discovered tools accumulate and survive restart.
+- **Dashboard** — routing rollups + a recent-decisions table (date/time,
+  surface, destination, reason, score, tokens). Click a score for the **calc
+  breakdown** (why it routed); click a row to see the latest-turn **prompt**.
+  Filter by text, destination, and date/time. Clear/refresh actions included.
+- **Roteamento** — routing profile selector (applies live, persists).
+- **Filtro inteligente de histórico** — global toggle (below).
+
+---
+
+## Dashboard & routing log
+
+Every routing decision is appended as one JSON line to
+`<config>/localllm/routing-log.jsonl` (`ts, surface, dest, reason, score,
+prompt_tok`, plus the score breakdown and a truncated latest-turn prompt
+snippet). Old lines are pruned (~30 days) on boot; the plain-text app log is
+size-capped.
+
+- **Tokens saved** = prompt(+completion) of requests served **locally**.
+- **If all cloud** = the same for **all** requests (the hypothetical bill).
+- Rolled up per **hour / day / month**; served via `GET /admin/dashboard`.
+
+---
+
+## Smart history filter
+
+When history is trimmed to a model's `history_turns` budget, the default keeps
+the most **recent** turns. Toggle **Filtro inteligente de histórico** (global,
+Config page, default off) to instead select the most **relevant** turns to the
+current ask:
+
+- **BM25** lexical relevance to the latest turn + recency, re-ranked with
+  **MMR** for diversity. Pure Rust, zero deps, deterministic.
+- Always pins the system prompt and the latest turn, re-sorts kept turns
+  chronologically, and trims to exactly N.
+
+Research + alternatives (incl. `model2vec` static embeddings) are in
+`docs/superpowers/specs/2026-07-02-smart-history-filter-research.md`.
+
+---
+
+## API examples
+
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:31415 ANTHROPIC_API_KEY=local claude
+# OpenAI
+curl http://localhost:31415/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128}'
+
+# Anthropic
+curl http://localhost:31415/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local","max_tokens":128,"messages":[{"role":"user","content":"Hello!"}]}'
+
+# Health
+curl http://localhost:31415/health   # {"status":"ok"}
 ```
-
-> **Heads-up on Claude Code.** Claude Code sends a large agentic prompt
-> (~26k tokens of system instructions + ~27 tool schemas) on *every* turn. To
-> use it you must raise `--ctx-len` to at least `32768`, and on a 16 GB machine
-> that combination (model + 1.8 GB KV cache + your other apps) will swap and
-> respond slowly. It works, but local agentic coding wants more RAM or a
-> smaller model. Simple clients and small prompts run great.
-
----
-
-## Request logging
-
-Every request is logged with a short id so concurrent prompts are easy to
-follow:
-
-```
-req-1a2b3c4d [anthropic] start: model=local msgs=3 tools=1 stream=true
-req-1a2b3c4d [anthropic] done (buffered stream): finish=ToolCalls completion_tok=20 0.9s 22.1 tok/s
-```
-
-Set `RUST_LOG=localllm=info` (or `debug`) to control verbosity.
-
----
-
-## Tool calling
 
 Both APIs support function calling with two-step chaining. Streaming requests
-that carry tools use a "buffered streaming" path: the response is generated in
-full (reusing the non-streaming tool-call path) then replayed as correct SSE
-(`tool_calls` for OpenAI, `tool_use` blocks for Anthropic). Tool-less streaming
-requests stream token-by-token.
+that carry tools use a buffered path (generated in full, replayed as correct SSE
+— `tool_calls` for OpenAI, `tool_use` blocks for Anthropic); tool-less streaming
+is token-by-token.
 
 ```bash
 bash scripts/test_openai_tools.sh
 bash scripts/test_anthropic_tools.sh
 ```
 
+### Admin API (token-guarded via `x-admin-token`)
+
+Used by the Config UI; all under `/admin`:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /admin/model`, `GET /admin/model/status` | switch model / progress |
+| `GET/DELETE /admin/models` | annotated catalog / delete a downloaded model |
+| `POST /admin/model/ctx`, `POST /admin/model/profile` | per-model ctx / exec profile |
+| `GET/POST /admin/tools` | per-surface discovered tools + blocklist |
+| `GET/POST /admin/routing` | routing profile |
+| `GET/POST /admin/integrations` | app wiring state / toggle |
+| `GET/POST /admin/history-filter` | smart-history toggle |
+| `GET/DELETE /admin/dashboard` | rollups + recent / clear log |
+
 ---
 
-## Optimizations
+## Choosing a model and context size
+
+Two levers on a 16 GB Mac: **model size** (bigger = smarter, slower, more RAM)
+and **`--ctx-len`** (bigger = longer input, more KV-cache RAM; `q8` KV ≈ half of
+`f16`). The tokenizer repo is derived by stripping `-GGUF` from `--model-id`, so
+any `Qwen/…-GGUF` repo works out of the box. You can also switch models and quant
+variants live from the Config app.
+
+```bash
+# Light + fast (default): Qwen2.5-3B
+./target/release/localllm
+
+# Smarter: Qwen2.5-7B (split GGUF)
+hf download Qwen/Qwen2.5-7B-Instruct-GGUF \
+  qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf \
+  qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
+./target/release/localllm \
+  --model-id Qwen/Qwen2.5-7B-Instruct-GGUF \
+  --gguf-file qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf \
+  --gguf-file qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
+```
+
+---
+
+## Optimizations (llama.cpp backend)
 
 | Optimization | Status | Notes |
 |---|---|---|
-| GGUF Q4_K_M weights | **ACTIVE** | Loaded via mmap |
-| Metal GPU acceleration | **ACTIVE** | Runs on the Apple GPU (BF16 compute) |
-| PagedAttention | **ACTIVE** | OS-style KV paging on the GPU; sized to `--ctx-len` |
-| Prefix caching | **ACTIVE** | Reuses shared prompt prefixes across turns |
-| mmap weight loading | **ACTIVE** | GGUF files are memory-mapped |
-| Flash Attention | **UNAVAILABLE** | Requires CUDA (`flash-attn` feature); Metal uses its own kernels |
-| KV-cache quantization | **UNAVAILABLE** | Not exposed by `GgufModelBuilder` |
-| ISQ re-quantization | **UNAVAILABLE** | GGUF is already quantized; ISQ is for `TextModelBuilder` |
+| GGUF Q4_K_M weights | **ACTIVE** | mmap-loaded |
+| Metal GPU acceleration | **ACTIVE** | Apple GPU; `--force-cpu` to disable |
+| KV-cache quantization | **ACTIVE** | `--kv-type q8`/`q4`/`f16` |
+| Prefix caching (in-process) | **ACTIVE** | Reuses shared prompt prefixes |
+| On-disk KV persistence | **ACTIVE** | Prefix state saved under `<cache>/localllm/kvcache` (`--no-kv-persist` off) |
+| Flash Attention | **UNAVAILABLE** | CUDA-only; Metal uses its own kernels |
 
-To fall back to CPU (no Metal), build with `MISTRALRS_METAL_PRECOMPILE=0` and run
-with `--force-cpu true`. PagedAttention is GPU-only and is skipped on CPU.
+The `mistralrs` backend adds PagedAttention (GPU-only) but does not expose
+KV-cache quantization.
 
 ---
 
-## Performance (measured on this machine — Apple M1 Pro, 16 GB)
+## Persistence
 
-| Model | Context | Throughput | KV cache | Notes |
-|---|---|---|---|---|
-| **Qwen2.5-3B** (default) | 8k | **~39 tok/s** | 288 MB | Light; coexists with other apps |
-| Qwen2.5-7B | 16k | ~15 tok/s | 896 MB | Smarter; heavier on 16 GB |
+Settings live at `<config>/localllm/settings.json` (macOS:
+`~/Library/Application Support/localllm/`), overridable via `LOCALLLM_SETTINGS`:
+routing profile, integration wiring, per-model exec profiles, tool block/seen
+lists, active model, and the smart-history toggle. Routing history is
+`routing-log.jsonl` in the same dir (`LOCALLLM_ROUTE_LOG` to override).
 
-Prefill of very large prompts (e.g. Claude Code's ~26k tokens) is the slow part
-on this hardware, especially when the machine is already low on RAM and swapping.
+---
+
+## Logging
+
+Every request logs a short id so concurrent prompts are easy to follow, plus a
+`route:` line explaining each decision (score, threshold, signals):
+
+```
+req-1a2b3c4d route: Cloud(Difficulty) score=0.66 threshold=0.45 (last_turn_tok=1600 msgs=2 …)
+req-1a2b3c4d [anthropic] done: finish=ToolCalls completion_tok=20 0.9s 22.1 tok/s
+```
+
+Control verbosity with `RUST_LOG=localllm=info` (or `debug`). File log path:
+`LOCALLLM_LOG` (default `/tmp/localllm.log`).
+
+---
+
+## Project layout
+
+```
+src/
+  main.rs            CLI entry; boot model resolution
+  lib.rs             server wiring, test helpers
+  server.rs          axum routes, routing decision, admin API
+  route/             local-vs-cloud decision (pure) + profiles
+  cloud.rs           provider reverse-proxy + degrade
+  engine_llama.rs    llama.cpp backend      engine.rs / mistralrs
+  model_manager.rs   hot-swappable model + switch state machine
+  catalog*.rs        model catalog, quant variants, fit verdicts
+  history_select.rs  smart history selection (BM25 + MMR)
+  route_log.rs       routing-log JSONL + dashboard rollups
+  settings.rs        persisted settings
+  integrations/      Claude Code / Codex auto-wiring
+  tray.rs            macOS menu-bar app + Config webview
+  manager_ui/        Config SPA (vanilla JS)
+docs/superpowers/    specs & plans
+```
+
+---
+
+## Testing
+
+```bash
+cargo test                       # full suite
+cargo test --lib route::         # routing decision
+cargo test --lib history_select  # smart history
+cargo test --test http           # API/admin integration
+```
+
+> Note: a few settings tests can flake under the full parallel `cargo test` due
+> to a shared `LOCALLLM_SETTINGS` env var; they pass when run per-module
+> (`cargo test --lib settings::`).
 
 ---
 
 ## Model
 
-**Qwen2.5-3B-Instruct-GGUF** (Q4_K_M) by default.
-
-- HuggingFace: [Qwen/Qwen2.5-3B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF)
-- Native context: 32,768 tokens (server default KV cache: 8,192)
-- Architecture: Qwen2; strong open-source tool-calling in its size class
-- Quantization: GGUF Q4_K_M (BF16 compute on the GPU)
+**Qwen2.5-3B-Instruct-GGUF** (Q4_K_M) by default —
+[HF](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF). Native context
+32,768; strong tool-calling for its size. Switch to any `Qwen/…-GGUF` (or other
+GGUF) from the CLI or the Config app.
