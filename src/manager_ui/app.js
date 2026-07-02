@@ -547,24 +547,22 @@ async function renderTools() {
       box.append(el("div", "ctxnote", "envie um request deste cliente para descobrir as tools"));
     }
     const boxes = [];
-    seen.forEach(name => {
-      const row = el("label", "toolrow");
+    const addRow = (name, blocked, notSeen) => {
+      const row = el("label", "toolrow" + (blocked ? " blocked" : ""));
       const cb = el("input", "toolcb");
       cb.type = "checkbox";
-      cb.checked = !disabled.includes(name); // checked = enabled
+      cb.checked = !blocked; // checked = enabled
       cb.dataset.name = name;
       row.append(cb, el("span", "toolname", name));
+      if (blocked) row.append(el("span", "toolflag", "bloqueada"));
+      if (notSeen) row.append(el("span", "toolmuted", "não vista agora"));
       box.append(row);
       boxes.push(cb);
-    });
-    // include any disabled-but-not-currently-seen tools so they can be re-enabled
-    disabled.filter(n => !seen.includes(n)).forEach(name => {
-      const row = el("label", "toolrow");
-      const cb = el("input", "toolcb");
-      cb.type = "checkbox"; cb.checked = false; cb.dataset.name = name;
-      row.append(cb, el("span", "toolname", `${name} (não visto agora)`));
-      box.append(row); boxes.push(cb);
-    });
+    };
+    seen.forEach(name => addRow(name, disabled.includes(name), false));
+    // Blocked tools the agent isn't currently sending stay listed as blocked,
+    // so the persisted block is always visible (and can be lifted).
+    disabled.filter(n => !seen.includes(n)).forEach(name => addRow(name, true, true));
     if (boxes.length) {
       const actions = el("div", "actions");
       const saveBtn = el("button", "btn primary", "Salvar");

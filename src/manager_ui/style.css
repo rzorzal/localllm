@@ -355,3 +355,11 @@ body {
 /* Dashboard toolbar */
 .dash-bar { display: flex; align-items: center; justify-content: space-between; }
 .dash-bar-title { font-size: 20px; font-weight: 700; }
+
+/* Blocked-tool row emphasis (persists even when not currently sent) */
+.toolrow.blocked .toolname { color: var(--muted); text-decoration: line-through; text-decoration-color: rgba(248,81,73,.6); }
+.toolflag {
+  font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  background: rgba(248,81,73,.14); color: var(--red); border: 1px solid rgba(248,81,73,.3);
+}
+.toolmuted { font-size: 11px; color: var(--muted); font-style: italic; }
