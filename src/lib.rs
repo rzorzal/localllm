@@ -1,5 +1,6 @@
 pub mod api;
 pub mod catalog;
+pub mod catalog_variants;
 pub mod cloud;
 pub mod config;
 pub mod download;

@@ -67,6 +67,55 @@ pub struct FamilyView {
     pub models: Vec<ModelView>,
 }
 
+/// A quant variant as stored in the generated table (`catalog_variants.rs`).
+#[derive(Debug, Clone, Copy)]
+pub struct QuantVariant {
+    pub quant: &'static str,
+    pub files: &'static [&'static str], // >1 = split model
+    pub size_mb: u32,
+}
+
+/// An owned quant variant returned to callers. Owned so the fallback can be
+/// synthesized from a `CatalogEntry` at runtime (which cannot produce a
+/// `&'static` slice).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ResolvedVariant {
+    pub quant: String,
+    pub files: Vec<String>,
+    pub size_mb: u32,
+}
+
+/// All quant variants available for a model: the generated table entry for its
+/// repo, or a single-element fallback synthesized from the model's default file.
+pub fn variants_for(entry: &CatalogEntry) -> Vec<ResolvedVariant> {
+    if let Some((_, vs)) = crate::catalog_variants::QUANT_VARIANTS
+        .iter()
+        .find(|(repo, _)| *repo == entry.repo)
+    {
+        return vs
+            .iter()
+            .map(|v| ResolvedVariant {
+                quant: v.quant.to_string(),
+                files: v.files.iter().map(|f| f.to_string()).collect(),
+                size_mb: v.size_mb,
+            })
+            .collect();
+    }
+    vec![ResolvedVariant {
+        quant: entry.quant.to_string(),
+        files: vec![entry.file.to_string()],
+        size_mb: entry.size_mb,
+    }]
+}
+
+/// The file list for a specific quant of a model, or `None` if not available.
+pub fn files_for_quant(entry: &CatalogEntry, quant: &str) -> Option<Vec<String>> {
+    variants_for(entry)
+        .into_iter()
+        .find(|v| v.quant.eq_ignore_ascii_case(quant))
+        .map(|v| v.files)
+}
+
 /// Curated models, smallest→largest within each family. Sizes are approximate
 /// download sizes (MB) used only for the RAM estimate; verify against the repo
 /// when editing. The default model MUST appear here.
@@ -503,5 +552,23 @@ mod tests {
         assert!(with_f16[0].models[0].ctx_max <= with_q8[0].models[0].ctx_max);
         assert_eq!(with_f16[0].models[0].kv_current, "f16");
         assert_eq!(with_q8[0].models[0].kv_current, "q8");
+    }
+
+    #[test]
+    fn variants_for_falls_back_to_default_when_repo_absent() {
+        // A repo not present in QUANT_VARIANTS → single synthesized variant from the entry.
+        let e = entry("Qwen2.5", "Qwen 3B", 3.0, "q/absent", "model-q4_k_m.gguf", 2000);
+        let vs = variants_for(&e);
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].quant, "Q4_K_M");
+        assert_eq!(vs[0].files, vec!["model-q4_k_m.gguf".to_string()]);
+        assert_eq!(vs[0].size_mb, 2000);
+    }
+
+    #[test]
+    fn files_for_quant_returns_default_variant_files_or_none() {
+        let e = entry("Qwen2.5", "Qwen 3B", 3.0, "q/absent", "model-q4_k_m.gguf", 2000);
+        assert_eq!(files_for_quant(&e, "q4_k_m"), Some(vec!["model-q4_k_m.gguf".to_string()]));
+        assert_eq!(files_for_quant(&e, "Q8_0"), None); // not available for this (fallback) model
     }
 }
