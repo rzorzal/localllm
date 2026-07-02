@@ -229,6 +229,27 @@ fn handle_degrade(
     }
 }
 
+/// Resolve the active model's history window: saved profile → catalog rec → None.
+fn resolve_history_turns(active: &crate::model_manager::ModelSpec) -> Option<u32> {
+    let key = crate::settings::model_ctx_key(&active.repo, &active.file);
+    let saved = crate::settings::load_model_profile(&key).history_turns;
+    let rec = crate::catalog::CATALOG
+        .iter()
+        .find(|e| e.repo == active.repo && e.file == active.file)
+        .and_then(|e| e.rec_history_turns);
+    saved.or(rec)
+}
+
+/// Trim a request's history to the active model's window, in place.
+fn apply_history_window(state: &AppState, req: &mut ChatRequest) {
+    let active = state.manager.status().current;
+    let keep = resolve_history_turns(&active);
+    if keep.is_some() {
+        let msgs = std::mem::take(&mut req.messages);
+        req.messages = crate::api::common::truncate_history(msgs, keep);
+    }
+}
+
 /// Bridge a local generation result into the cascade decision.
 ///
 /// - `Ok(result)` and (cascade off OR result is strong) → returns `Ok(result)`;
@@ -657,6 +678,8 @@ async fn handle_oai_chat(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
         }
     };
+    let mut internal = internal;
+    apply_history_window(&state, &mut internal);
 
     // --- Routing decision ---
     if state.manager.is_errored() {
@@ -842,6 +865,8 @@ async fn handle_oai_responses(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
         }
     };
+    let mut internal = internal;
+    apply_history_window(&state, &mut internal);
 
     if state.manager.is_errored() {
         return (StatusCode::SERVICE_UNAVAILABLE,
@@ -938,6 +963,8 @@ async fn handle_anth_messages(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
         }
     };
+    let mut internal = internal;
+    apply_history_window(&state, &mut internal);
 
     // --- Routing decision ---
     if state.manager.is_errored() {

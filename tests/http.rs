@@ -585,3 +585,80 @@ async fn responses_overflow_routes_to_cloud() {
 
     std::env::remove_var("LOCALLLM_OPENAI_BASE");
 }
+
+// --- History truncation (Task 7) ---
+
+/// Verify that `apply_history_window` trims the conversation before local
+/// inference: a 4-message request (system + 2 full turns) with history_turns=1
+/// saved for the active model ("test/test") should deliver only 3 messages
+/// to the generator: [system, last-user, last-assistant].
+#[tokio::test]
+async fn active_model_history_turns_truncates_request() {
+    let _guard = ENV_LOCK.lock().await;
+
+    // Point LOCALLLM_SETTINGS at a temp file with history_turns=1 for "test/test".
+    let dir = std::env::temp_dir().join(format!(
+        "localllm-hist-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    std::fs::write(
+        &path,
+        r#"{"model_profiles":{"test/test":{"history_turns":1}}}"#,
+    )
+    .unwrap();
+    std::env::set_var("LOCALLLM_SETTINGS", &path);
+
+    // Build router wired to a RecordingGen so we can inspect what reaches generate().
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let gen = std::sync::Arc::new(localllm::RecordingGen(recorded.clone()));
+    let app = localllm::router_for_test_with(
+        gen,
+        localllm::route::Profile::SaveTokens.policy(),
+        128_000,
+    );
+
+    // POST [system, u1, a1, u2, a2] — 2 full turns plus leading system.
+    let body = r#"{
+        "model": "m",
+        "max_tokens": 256,
+        "system": "be terse",
+        "messages": [
+            {"role": "user",      "content": "turn one"},
+            {"role": "assistant", "content": [{"type": "text", "text": "resp one"}]},
+            {"role": "user",      "content": "turn two"},
+            {"role": "assistant", "content": [{"type": "text", "text": "resp two"}]}
+        ]
+    }"#;
+    localllm::axum_test_request(app, "/v1/messages", body).await;
+
+    let msgs = recorded.lock().unwrap().clone();
+
+    std::env::remove_var("LOCALLLM_SETTINGS");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // history_turns=1 → keep last turn plus leading system → [sys, u2, a2] = 3 msgs.
+    assert_eq!(
+        msgs.len(),
+        3,
+        "expected [system, u2, a2] (len 3) after truncation, got {} messages: {:?}",
+        msgs.len(),
+        msgs.iter().map(|m| format!("{:?}", m.role)).collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(msgs[0].role, localllm::api::common::Role::System),
+        "first message must be System"
+    );
+    assert!(
+        matches!(msgs[1].role, localllm::api::common::Role::User),
+        "second message must be User (last turn's user)"
+    );
+    assert!(
+        matches!(msgs[2].role, localllm::api::common::Role::Assistant),
+        "third message must be Assistant (last turn's assistant)"
+    );
+}
