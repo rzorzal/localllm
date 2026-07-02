@@ -309,13 +309,19 @@ fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
     }
 }
 
-/// Trim a request's history to the active model's window, in place.
+/// Trim a request's history to the active model's window, in place. When the
+/// global smart-history toggle is on, selects turns by relevance (BM25+MMR)
+/// instead of pure recency; otherwise falls back to recency truncation.
 fn apply_history_window(state: &AppState, req: &mut ChatRequest) {
     let active = state.manager.status().current;
     let keep = resolve_history_turns(&active);
-    if keep.is_some() {
+    if let Some(n) = keep {
         let msgs = std::mem::take(&mut req.messages);
-        req.messages = crate::api::common::truncate_history(msgs, keep);
+        req.messages = if crate::settings::load_smart_history() {
+            crate::history_select::select_history_smart(msgs, n)
+        } else {
+            crate::api::common::truncate_history(msgs, Some(n))
+        };
     }
 }
 
@@ -485,6 +491,7 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
         .route("/admin/integrations", get(handle_integrations_get).post(handle_integrations_set))
         .route("/admin/routing", get(handle_routing_get).post(handle_routing_set))
+        .route("/admin/history-filter", get(handle_history_filter_get).post(handle_history_filter_set))
         .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
@@ -530,6 +537,45 @@ pub fn router(
         port,
     });
     build_router_inner(state)
+}
+
+/// GET /admin/history-filter — global smart-history toggle state (token-guarded).
+async fn handle_history_filter_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    Json(json!({ "enabled": crate::settings::load_smart_history() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryFilterSetBody {
+    enabled: bool,
+}
+
+/// POST /admin/history-filter {enabled} — set the global smart-history toggle.
+async fn handle_history_filter_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: HistoryFilterSetBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    if let Err(e) = crate::settings::save_smart_history(body.enabled) {
+        tracing::warn!("failed to persist smart-history toggle: {e}");
+    }
+    Json(json!({ "enabled": body.enabled })).into_response()
 }
 
 /// GET /admin/routing — current routing profile + selectable options (token-guarded).

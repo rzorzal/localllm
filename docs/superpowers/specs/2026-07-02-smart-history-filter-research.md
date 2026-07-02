@@ -1,7 +1,9 @@
 # Smart History Filter — Research & Design (decision deferred)
 
 Date: 2026-07-02
-Status: **research captured; engine not yet chosen; not implemented.**
+Status: **Engine A (BM25 + MMR) IMPLEMENTED** — `src/history_select.rs`,
+global toggle on the Config page (`GET/POST /admin/history-filter`), wired into
+`server::apply_history_window`, default OFF. Options B/C remain future upgrades.
 
 ## Goal
 

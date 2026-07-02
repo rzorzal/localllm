@@ -66,6 +66,10 @@ struct Settings {
     tool_seen: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_model: Option<ActiveModel>,
+    /// Global toggle: when true, history trimming selects turns by relevance
+    /// (BM25+MMR) instead of pure recency. Default false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    smart_history: bool,
 }
 
 /// Resolve the settings file path. `LOCALLLM_SETTINGS` (full file path) wins;
@@ -235,6 +239,18 @@ pub fn save_tool_filter(surface: &str, disabled: &[String]) -> anyhow::Result<()
     } else {
         s.tool_filters.insert(surface.to_string(), disabled.to_vec());
     }
+    save_settings(&s)
+}
+
+/// Load the global smart-history toggle (default false = recency truncation).
+pub fn load_smart_history() -> bool {
+    load_settings().smart_history
+}
+
+/// Persist the global smart-history toggle, preserving the rest of settings.
+pub fn save_smart_history(on: bool) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.smart_history = on;
     save_settings(&s)
 }
 

@@ -816,3 +816,20 @@ async fn admin_routing_get_returns_current_and_options() {
     assert_eq!(opts.len(), 4);
     assert!(opts[0].get("value").is_some() && opts[0].get("label").is_some());
 }
+
+// --- Smart history filter toggle (config-nav-dashboard, follow-up) ---
+
+#[tokio::test]
+async fn admin_history_filter_get_requires_token() {
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_get_status(app, "/admin/history-filter").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn admin_history_filter_get_returns_enabled_bool() {
+    let app = localllm::router_for_test();
+    let body = localllm::axum_test_get_with_header(
+        app, "/admin/history-filter", "x-admin-token", "test-token").await;
+    assert!(body.get("enabled").and_then(|v| v.as_bool()).is_some());
+}
