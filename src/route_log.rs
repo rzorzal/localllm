@@ -73,6 +73,26 @@ pub fn prune_file(now: i64, max_age_secs: i64) {
     let _ = crate::integrations::atomic_write(&path, buf.as_bytes());
 }
 
+/// Best-effort app-log rotation: cap the plain-text app log at a line budget so
+/// it cannot grow unbounded. `LOCALLLM_LOG` (default `/tmp/localllm.log`).
+/// `_now`/`_max_age_secs` are accepted for symmetry with `prune_file`, but
+/// line-count capping is the robust mechanism (the app log has no guaranteed
+/// machine-parsable per-line timestamp).
+pub fn rotate_app_log(_now: i64, _max_age_secs: i64) {
+    const MAX_LINES: usize = 50_000;
+    let path = std::env::var("LOCALLLM_LOG").unwrap_or_else(|_| "/tmp/localllm.log".to_string());
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= MAX_LINES {
+        return;
+    }
+    let tail = lines[lines.len() - MAX_LINES..].join("\n");
+    let _ = crate::integrations::atomic_write(
+        std::path::Path::new(&path),
+        format!("{tail}\n").as_bytes(),
+    );
+}
+
 /// Current unix seconds.
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()

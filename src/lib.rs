@@ -132,6 +132,11 @@ pub async fn run_server_with_ready_policy_token(
         tracing::warn!("sysinfo reported 0 total RAM; catalog fit verdicts will use budget=0");
     }
 
+    // Rolling retention: drop routing-log lines older than ~30 days at boot,
+    // and cap the plain-text app log so neither grows unbounded.
+    crate::route_log::prune_file(crate::route_log::now_secs(), 30 * 24 * 3600);
+    crate::route_log::rotate_app_log(crate::route_log::now_secs(), 7 * 24 * 3600);
+
     let (engine, effective_ctx): (Arc<dyn Generator>, usize) = match cfg.backend {
         Backend::Llama => {
             let kv_cache_dir = cfg.resolved_kv_cache_dir();
