@@ -388,6 +388,9 @@ pub struct AppState {
     /// Per-surface discovery of the tool names seen on recent requests
     /// (surface -> latest sorted-unique names). In-memory; re-discovered on restart.
     pub tool_registry: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
+    /// TCP port this server listens on — needed to (re)wire agent client configs
+    /// via `POST /admin/integrations`.
+    pub port: u16,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -427,6 +430,7 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/model/profile", post(handle_model_set_profile))
         .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
         .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
+        .route("/admin/integrations", get(handle_integrations_get).post(handle_integrations_set))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
         .route("/manager/style.css", get(handle_manager_css))
@@ -449,6 +453,7 @@ pub fn router(
     total_ram_mb: u64,
     requested_ctx_ceiling: u32,
     kv_kind: crate::fit::KvKind,
+    port: u16,
 ) -> Router {
     let state = Arc::new(AppState {
         manager,
@@ -464,8 +469,65 @@ pub fn router(
         tool_registry: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::new(),
         )),
+        port,
     });
     build_router_inner(state)
+}
+
+/// GET /admin/integrations — current wiring state (token-guarded).
+async fn handle_integrations_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let st = crate::settings::load_integrations();
+    let wired: Vec<String> = st.priors.keys().cloned().collect();
+    Json(json!({ "enabled": st.enabled, "wired": wired })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct IntegrationsSetBody {
+    enabled: bool,
+}
+
+/// POST /admin/integrations {enabled} — wire or unwire agent clients (token-guarded).
+async fn handle_integrations_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: IntegrationsSetBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    let injectors = crate::integrations::injectors_default();
+    let new_state = if body.enabled {
+        let outcome = crate::integrations::enable_all(state.port, &injectors);
+        crate::settings::IntegrationState {
+            enabled: !outcome.priors.is_empty(),
+            priors: outcome.priors,
+        }
+    } else {
+        let mut st = crate::settings::load_integrations();
+        let summary = crate::integrations::disable_all(&st.priors, &injectors);
+        let failed: std::collections::HashSet<&String> =
+            summary.failed.iter().map(|(id, _)| id).collect();
+        st.priors.retain(|id, _| failed.contains(id));
+        st.enabled = !st.priors.is_empty();
+        st
+    };
+    let _ = crate::settings::save_integrations(&new_state);
+    let wired: Vec<String> = new_state.priors.keys().cloned().collect();
+    Json(json!({ "enabled": new_state.enabled, "wired": wired })).into_response()
 }
 
 /// Verify the `X-Admin-Token` header against the configured token (constant-time).
