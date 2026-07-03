@@ -150,6 +150,12 @@ pub fn estimate_prompt_tokens(req: &ChatRequest) -> usize {
     chars / 4
 }
 
+/// Estimate the token count of a bare text string with the same cheap `chars/4`
+/// heuristic used for prompts. Used to count streamed completion deltas.
+pub fn estimate_text_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
 /// Character count of a single message's content (text + tool-call args +
 /// tool-result content).
 fn message_chars(m: &crate::api::common::ChatMessage) -> usize {

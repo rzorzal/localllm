@@ -347,13 +347,14 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashbo
     }
 }
 
+/// Serialises tests (in any module) that mutate the process-global
+/// LOCALLLM_ROUTE_LOG env var, so parallel runs don't clobber each other's path.
+#[cfg(test)]
+pub(crate) static ROUTE_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Serialise tests that mutate the process-global LOCALLLM_ROUTE_LOG env var,
-    // so parallel runs don't clobber each other's log path.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn entry(ts: i64, dest: &str) -> RouteEntry {
         RouteEntry {
@@ -467,7 +468,7 @@ mod tests {
 
     #[test]
     fn clear_empties_the_log() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTE_LOG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("localllm-rl-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing-log.jsonl");
@@ -482,7 +483,7 @@ mod tests {
 
     #[test]
     fn read_all_parses_new_and_legacy_lines() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTE_LOG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("localllm-ll-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing-log.jsonl");

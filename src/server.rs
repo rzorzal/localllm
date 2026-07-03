@@ -238,6 +238,32 @@ fn route_decision(
     (decision, prompt_tokens)
 }
 
+/// Record a request's post-generation outcome. `cost_saved_usd` is what a LOCAL
+/// request would have cost on cloud (0 for cloud requests). Best-effort.
+fn record_outcome(
+    rid: &str,
+    dest: &str,
+    model: Option<&str>,
+    prompt_tok: u64,
+    completion_tok: Option<u64>,
+    ttft_ms: Option<u64>,
+    gen_ms: Option<u64>,
+) {
+    let cost_saved_usd = if dest == "local" {
+        crate::pricing::price_for(model.unwrap_or("")).cost(prompt_tok, completion_tok.unwrap_or(0))
+    } else {
+        0.0
+    };
+    crate::route_log::append_outcome(&crate::route_log::OutcomeEntry {
+        rid: rid.to_string(),
+        ts: crate::route_log::now_secs(),
+        completion_tok,
+        ttft_ms,
+        gen_ms,
+        cost_saved_usd,
+    });
+}
+
 /// Record a successful cloud call and fire the one-shot high-usage alert if the
 /// session just crossed the threshold. Also clears the degrade gate so a later
 /// failure notifies again.
@@ -1307,6 +1333,7 @@ async fn handle_oai_chat(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [openai] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
         let mut lines = crate::api::openai::stream_chunks_from_result(&result, &id, &model);
         lines.push("[DONE]".to_string());
         let sse_stream = futures::stream::iter(
@@ -1336,16 +1363,28 @@ async fn handle_oai_chat(
             }
         };
 
-        // Thread the `started` flag so the first chunk includes "role":"assistant"
-        // per the OpenAI streaming spec.
+        // Scan state: (started, completion_tok_estimate, first_delta_at). `started`
+        // threads the "role":"assistant" flag per the OpenAI streaming spec; the
+        // other two capture latency (TTFT) and an estimated completion count so we
+        // can record the outcome when the stream finishes.
+        let est_prompt_tokens = est_prompt_tokens;
         let sse_stream = delta_stream
-            .scan(false, move |started, result| {
+            .scan((false, 0u64, None::<Instant>), move |st, result| {
+                let (started, ctok, first_at) = st;
                 let was_started = *started;
                 let event: Result<Event, Infallible> = match result {
                     Ok(delta) => {
+                        if first_at.is_none() { *first_at = Some(Instant::now()); }
+                        if let Some(t) = &delta.text {
+                            *ctok += crate::route::estimate_text_tokens(t) as u64;
+                        }
                         if delta.done {
                             let secs = started_at.elapsed().as_secs_f64();
                             tracing::info!(target: "localllm::req", "{rid_stream} [openai] done (stream): {secs:.1}s");
+                            let ttft = first_at.map(|f| (f - started_at).as_millis() as u64);
+                            record_outcome(&rid_stream, "local", Some(&model_clone),
+                                est_prompt_tokens as u64, Some(*ctok), ttft,
+                                Some(started_at.elapsed().as_millis() as u64));
                         }
                         let line = crate::api::openai::stream_chunk(&delta, &id_clone, &model_clone, was_started);
                         *started = true;
@@ -1387,6 +1426,7 @@ async fn handle_oai_chat(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [openai] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
         let resp = crate::api::openai::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }
@@ -1478,6 +1518,7 @@ async fn handle_oai_responses(
     let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
     tracing::info!(target: "localllm::req", "{rid} [responses] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s",
         result.finish_reason, result.prompt_tokens, result.completion_tokens);
+    record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
 
     if stream_flag {
         let events = crate::api::openai_responses::stream_events_from_result(&result, &resp_id, &model);
@@ -1593,6 +1634,7 @@ async fn handle_anth_messages(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [anthropic] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
         let events = crate::api::anthropic::stream_events_from_result(&result, &model);
         let sse_stream = futures::stream::iter(events.into_iter().map(|e_str| {
             let mut lines = e_str.splitn(2, '\n');
@@ -1674,6 +1716,7 @@ async fn handle_anth_messages(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [anthropic] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
         let resp = crate::api::anthropic::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }
@@ -1744,6 +1787,28 @@ fn make_seeded_test_router(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_outcome_saves_cost_only_for_local() {
+        let _guard = crate::route_log::ROUTE_LOG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("localllm-ro-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+        super::record_outcome("r1", "local", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000));
+        super::record_outcome("r2", "cloud", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000));
+        let lines = crate::route_log::read_all();
+        let cost = |rid: &str| lines.iter().find_map(|l| match l {
+            crate::route_log::LogLine::Outcome(o) if o.rid == rid => Some(o.cost_saved_usd),
+            _ => None,
+        }).unwrap();
+        assert!((cost("r1") - 18.0).abs() < 1e-6); // sonnet: 1M*3 + 1M*15 = 18
+        assert_eq!(cost("r2"), 0.0); // cloud saves nothing
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn manager_init_script_injects_token() {
         let s = super::manager_init_script("abc123");
