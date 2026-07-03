@@ -2089,7 +2089,7 @@ mod tests {
         use tower::ServiceExt;
         use std::sync::Arc;
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let settings_file = std::env::temp_dir()
             .join(format!("localllm-srvtest-tools-get-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
@@ -2137,7 +2137,7 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let settings_file = std::env::temp_dir()
             .join(format!("localllm-srvtest-tools-post-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
@@ -2211,8 +2211,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Serialise tests that set LOCALLLM_SETTINGS so they don't race each other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// POST then GET /admin/budget round-trips the config.
     #[tokio::test]
@@ -2221,7 +2219,7 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let settings_file = std::env::temp_dir()
             .join(format!("localllm-bud-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
@@ -2267,7 +2265,7 @@ mod tests {
         use crate::config::KvType;
 
         // Isolate settings storage so this test never touches the real file.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let settings_file = std::env::temp_dir()
             .join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
@@ -2324,7 +2322,7 @@ mod tests {
         use tower::ServiceExt;
 
         // Isolate settings storage so this test never touches the real file.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let settings_file = std::env::temp_dir()
             .join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);

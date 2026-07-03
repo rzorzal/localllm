@@ -349,12 +349,14 @@ pub fn save_tool_descs(
     save_settings(&s)
 }
 
+/// Serialises tests (in any module) that mutate the process-global
+/// LOCALLLM_SETTINGS env var, so parallel runs don't clobber each other.
+#[cfg(test)]
+pub(crate) static SETTINGS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Mutex to serialise tests that mutate the LOCALLLM_SETTINGS env var.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn tool_seen_round_trips_and_clears_and_preserves_filter() {
@@ -421,7 +423,7 @@ mod tests {
     }
 
     fn with_temp_settings<F: FnOnce()>(f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("localllm-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
