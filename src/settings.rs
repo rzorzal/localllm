@@ -78,6 +78,16 @@ struct Settings {
     /// `None` keeps the built-in default. Only affects the Balanced profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     balanced_threshold: Option<f64>,
+    /// Whether the daily cloud-spend budget cap is enforced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    budget_enabled: bool,
+    /// Daily cloud-spend cap in USD. 0 = no cap.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    budget_daily_usd: f64,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Resolve the settings file path. `LOCALLLM_SETTINGS` (full file path) wins;
@@ -151,6 +161,20 @@ pub fn load_balanced_threshold() -> f64 {
 pub fn save_balanced_threshold(t: f64) -> anyhow::Result<()> {
     let mut s = load_settings();
     s.balanced_threshold = Some(t.clamp(0.0, 1.0));
+    save_settings(&s)
+}
+
+/// Load (enabled, daily_usd) for the budget cap.
+pub fn load_budget() -> (bool, f64) {
+    let s = load_settings();
+    (s.budget_enabled, s.budget_daily_usd)
+}
+
+/// Persist the budget cap config, preserving the rest.
+pub fn save_budget(enabled: bool, daily_usd: f64) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.budget_enabled = enabled;
+    s.budget_daily_usd = daily_usd.max(0.0);
     save_settings(&s)
 }
 
@@ -361,6 +385,18 @@ mod tests {
             save_tool_descs("claude-code", &std::collections::BTreeMap::new()).unwrap();
             assert!(load_tool_descs("claude-code").is_empty());
             assert_eq!(load_tool_seen("claude-code"), vec!["Bash".to_string()]);
+        });
+    }
+
+    #[test]
+    fn budget_round_trips_and_preserves_profile() {
+        with_temp_settings(|| {
+            save_profile(Profile::Balanced).unwrap();
+            save_budget(true, 5.0).unwrap();
+            assert_eq!(load_budget(), (true, 5.0));
+            assert_eq!(load_profile(), Profile::Balanced);
+            save_budget(false, 0.0).unwrap();
+            assert_eq!(load_budget(), (false, 0.0));
         });
     }
 
