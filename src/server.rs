@@ -613,6 +613,7 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/history-filter", get(handle_history_filter_get).post(handle_history_filter_set))
         .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
         .route("/admin/export", get(handle_export))
+        .route("/metrics", get(handle_metrics))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
         .route("/manager/style.css", get(handle_manager_css))
@@ -988,6 +989,38 @@ async fn handle_export(
         ],
         body,
     ).into_response()
+}
+
+/// Render 30-day routing counters in Prometheus text format.
+fn metrics_text(lines: &[crate::route_log::LogLine], now: i64) -> String {
+    let d = crate::route_log::build_dashboard(lines, now, 0);
+    format!(
+        "# HELP localllm_requests_total Requests by destination (30d)\n\
+         # TYPE localllm_requests_total counter\n\
+         localllm_requests_total{{dest=\"local\"}} {}\n\
+         localllm_requests_total{{dest=\"cloud\"}} {}\n\
+         # HELP localllm_cost_saved_usd_total USD saved by local routing (30d)\n\
+         # TYPE localllm_cost_saved_usd_total counter\n\
+         localllm_cost_saved_usd_total {:.6}\n\
+         # HELP localllm_ttft_ms Average TTFT by route (30d)\n\
+         # TYPE localllm_ttft_ms gauge\n\
+         localllm_ttft_ms{{dest=\"local\"}} {}\n\
+         localllm_ttft_ms{{dest=\"cloud\"}} {}\n",
+        d.month.local_count, d.month.cloud_count, d.month.cost_saved_usd,
+        d.local_latency.avg_ttft_ms, d.cloud_latency.avg_ttft_ms)
+}
+
+/// GET /metrics — Prometheus text (token-guarded via header; scrapers set it).
+async fn handle_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let text = metrics_text(&crate::route_log::read_all(), crate::route_log::now_secs());
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
 }
 
 /// Verify the `X-Admin-Token` header against the configured token (constant-time).
@@ -1983,6 +2016,20 @@ mod tests {
         assert_eq!(cost("r2"), 0.0); // cloud saves nothing
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metrics_text_has_counters() {
+        let now = 1_000i64;
+        let lines = vec![
+            crate::route_log::LogLine::Decision(crate::route_log::RouteEntry {
+                ts: now, rid: "r".into(), dest: "local".into(), prompt_tok: 10, ..Default::default() }),
+            crate::route_log::LogLine::Outcome(crate::route_log::OutcomeEntry {
+                rid: "r".into(), ts: now, cost_saved_usd: 1.5, ..Default::default() }),
+        ];
+        let text = super::metrics_text(&lines, now);
+        assert!(text.contains("localllm_requests_total{dest=\"local\"} 1"));
+        assert!(text.contains("localllm_cost_saved_usd_total"));
     }
 
     #[test]
