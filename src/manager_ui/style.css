@@ -240,6 +240,11 @@ body {
 }
 .thresh-unit { font-size: 16px; font-weight: 600; color: var(--muted); }
 
+/* Budget screen */
+.budget-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+.budget-readout { margin-top: 14px; font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.budget-readout.over { color: var(--red); font-weight: 600; }
+
 /* ============================================================= *
  * Firestore-style column drilldown for models
  * ============================================================= */

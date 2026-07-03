@@ -107,6 +107,7 @@ function el(tag, cls, html) {
 const NAV_CARDS = [
   { route: "/models", icon: "◈", title: "Models", desc: "Escolher, baixar e configurar modelos locais" },
   { route: "/tools", icon: "⛭", title: "Tools", desc: "Filtrar tools por cliente" },
+  { route: "/budget", icon: "$", title: "Budget", desc: "Teto de gasto cloud por dia" },
   { route: "/dashboard", icon: "▤", title: "Dashboard", desc: "Roteamento local↔cloud e tokens economizados" },
 ];
 
@@ -1015,11 +1016,65 @@ function renderDecisionsTable(panel, recent) {
   }
 }
 
+// ---- Pane: Budget (daily cloud-spend cap) ----
+async function renderBudget() {
+  currentView = renderBudget;
+  setCrumbs([{ label: "Config", onClick: renderConfig }, { label: "Budget" }]);
+  const wrap = el("div", "detail");
+  wrap.append(el("h2", null, "Budget diário"));
+  wrap.append(el("div", "ctxhint", "Teto de gasto cloud por dia (estimado pela tabela de preços). Ao estourar, roteia tudo local até o dia virar (UTC). Zera sozinho no dia seguinte."));
+
+  const panel = el("div", "intpanel");
+  const head = el("div", "intpanel-head");
+  const txt = el("div", "intpanel-txt");
+  txt.append(el("div", "intpanel-title", "Ativar budget"));
+  txt.append(el("div", "intpanel-sub", "Quando ligado e o gasto do dia atinge o teto, força local."));
+  head.append(txt);
+  const sw = el("button", "switch"); sw.setAttribute("role", "switch");
+  sw.append(el("span", "switch-knob"));
+  head.append(sw);
+  panel.append(head);
+
+  const row = el("div", "budget-row");
+  const input = el("input", "ctxinput"); input.type = "number"; input.min = 0; input.step = 0.5;
+  const saveBtn = el("button", "btn primary", "Salvar");
+  row.append(el("span", "dt-lbl", "Teto $/dia"), input, saveBtn);
+  panel.append(row);
+
+  const readout = el("div", "budget-readout");
+  panel.append(readout);
+  wrap.append(panel);
+  view.innerHTML = ""; view.append(wrap);
+
+  let enabled = false;
+  const paint = (b) => {
+    enabled = !!b.enabled;
+    sw.classList.toggle("on", enabled);
+    sw.setAttribute("aria-checked", enabled ? "true" : "false");
+    input.value = b.daily_usd;
+    readout.className = "budget-readout" + (b.over ? " over" : "");
+    readout.textContent = `gasto hoje $${(b.spent_today || 0).toFixed(2)} / $${(b.daily_usd || 0).toFixed(2)} · resta $${(b.remaining || 0).toFixed(2)}` + (b.over ? " · ESTOUROU (local)" : "");
+  };
+  try { paint(await api("GET", "/admin/budget")); }
+  catch (e) { readout.textContent = e.message; return; }
+
+  sw.onclick = async () => {
+    try { paint(await api("POST", "/admin/budget", { enabled: !enabled })); toast("Budget atualizado"); }
+    catch (e) { toast(e.message, true); }
+  };
+  saveBtn.onclick = async () => {
+    const v = Number(input.value);
+    try { paint(await api("POST", "/admin/budget", { daily_usd: isNaN(v) ? 0 : v })); toast("Teto salvo"); }
+    catch (e) { toast(e.message, true); }
+  };
+}
+
 // ---- hash router ----
 function routeFromHash() {
   const h = (location.hash || "#/config").replace(/^#/, "");
   if (h.startsWith("/models")) return renderFamilies();
   if (h.startsWith("/tools")) return renderTools();
+  if (h.startsWith("/budget")) return renderBudget();
   if (h.startsWith("/dashboard")) return renderDashboard();
   return renderConfig();
 }
