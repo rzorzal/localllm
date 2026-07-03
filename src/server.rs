@@ -264,6 +264,38 @@ fn record_outcome(
     });
 }
 
+/// Stable short label for a degrade reason, logged so the dashboard can group
+/// provider-fallback windows.
+fn degrade_reason_label(r: crate::usage::DegradeReason) -> &'static str {
+    match r {
+        crate::usage::DegradeReason::Auth => "Auth",
+        crate::usage::DegradeReason::Quota => "Quota",
+        crate::usage::DegradeReason::ServerError => "ServerError",
+        crate::usage::DegradeReason::Offline => "Offline",
+    }
+}
+
+/// Log that a cloud request fell back to local with the given provider reason,
+/// so the dashboard can render "cloud unavailable HH:MM–HH:MM" windows.
+fn log_degrade_fallback(
+    rid: &str,
+    surface: &str,
+    model: Option<&str>,
+    prompt_tok: u64,
+    reason: crate::usage::DegradeReason,
+) {
+    crate::route_log::append(&crate::route_log::RouteEntry {
+        ts: crate::route_log::now_secs(),
+        rid: rid.to_string(),
+        surface: surface.to_string(),
+        dest: "local".to_string(),
+        prompt_tok,
+        model: model.map(|m| m.to_string()),
+        degrade_reason: Some(degrade_reason_label(reason).to_string()),
+        ..Default::default()
+    });
+}
+
 /// Record a successful cloud call and fire the one-shot high-usage alert if the
 /// session just crossed the threshold. Also clears the degrade gate so a later
 /// failure notifies again.
@@ -1294,6 +1326,7 @@ async fn handle_oai_chat(
                         return resp;
                     }
                     tracing::warn!(target: "localllm::req", "{rid} [openai] cloud degraded ({d:?}) → serving local");
+                    log_degrade_fallback(&rid, "openai", Some(&model), est_prompt_tokens as u64, d);
                     false
                 }
             }
@@ -1485,6 +1518,7 @@ async fn handle_oai_responses(
                 crate::cloud::ForwardOutcome::Degrade(d) => {
                     if let Some(resp) = handle_degrade(&state, d, reason) { return resp; }
                     tracing::warn!(target: "localllm::req", "{rid} [responses] cloud degraded ({d:?}) → serving local");
+                    log_degrade_fallback(&rid, "openai-responses", Some(&model), est_prompt_tokens as u64, d);
                     false
                 }
             }
@@ -1596,6 +1630,7 @@ async fn handle_anth_messages(
                         return resp;
                     }
                     tracing::warn!(target: "localllm::req", "{rid} [anthropic] cloud degraded ({d:?}) → serving local");
+                    log_degrade_fallback(&rid, "anthropic", Some(&model), est_prompt_tokens as u64, d);
                     false
                 }
             }
@@ -1807,6 +1842,15 @@ mod tests {
         assert_eq!(cost("r2"), 0.0); // cloud saves nothing
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn degrade_reason_label_is_stable() {
+        use crate::usage::DegradeReason;
+        assert_eq!(super::degrade_reason_label(DegradeReason::Quota), "Quota");
+        assert_eq!(super::degrade_reason_label(DegradeReason::Auth), "Auth");
+        assert_eq!(super::degrade_reason_label(DegradeReason::ServerError), "ServerError");
+        assert_eq!(super::degrade_reason_label(DegradeReason::Offline), "Offline");
     }
 
     #[test]
