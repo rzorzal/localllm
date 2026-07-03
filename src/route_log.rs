@@ -38,6 +38,52 @@ pub struct RouteEntry {
     /// Truncated latest-turn prompt text (the ask only, not full history).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_snippet: Option<String>,
+    /// Correlation id shared with the request's OutcomeEntry (e.g. "req-1a2b3c4d").
+    #[serde(default)]
+    pub rid: String,
+    /// Cloud model the client asked for (the one that WOULD have served). Used
+    /// to price $ saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// When this request fell back to local due to a provider degrade, the reason
+    /// (Quota/Auth/ServerError/Offline). None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degrade_reason: Option<String>,
+}
+
+/// Post-generation outcome for a request, correlated to its RouteEntry by `rid`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OutcomeEntry {
+    pub rid: String,
+    pub ts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tok: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_ms: Option<u64>,
+    /// What this LOCAL request would have cost on cloud (0.0 for cloud requests).
+    #[serde(default)]
+    pub cost_saved_usd: f64,
+}
+
+/// A parsed log line: a routing decision or a post-generation outcome.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind")]
+pub enum LogLine {
+    #[serde(rename = "d")]
+    Decision(RouteEntry),
+    #[serde(rename = "o")]
+    Outcome(OutcomeEntry),
+}
+
+impl LogLine {
+    pub fn ts(&self) -> i64 {
+        match self {
+            LogLine::Decision(d) => d.ts,
+            LogLine::Outcome(o) => o.ts,
+        }
+    }
 }
 
 /// Resolve the log path. `LOCALLLM_ROUTE_LOG` (full file path) wins.
@@ -50,30 +96,43 @@ pub fn log_path() -> Option<PathBuf> {
 
 /// Append one entry as a JSON line. Best-effort; never panics.
 pub fn append(entry: &RouteEntry) {
+    append_line(&LogLine::Decision(entry.clone()));
+}
+
+/// Append one outcome as a JSON line. Best-effort; never panics.
+pub fn append_outcome(entry: &OutcomeEntry) {
+    append_line(&LogLine::Outcome(entry.clone()));
+}
+
+fn append_line(line: &LogLine) {
     let Some(path) = log_path() else { return };
-    let Ok(line) = serde_json::to_string(entry) else { return };
+    let Ok(text) = serde_json::to_string(line) else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{line}");
+        let _ = writeln!(f, "{text}");
     }
 }
 
-/// Read every entry, skipping malformed lines. Empty when the file is absent.
-pub fn read_all() -> Vec<RouteEntry> {
+/// Read every line: new tagged lines, or legacy untagged decision lines.
+pub fn read_all() -> Vec<LogLine> {
     let Some(path) = log_path() else { return Vec::new() };
     let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
     text.lines()
-        .filter_map(|l| serde_json::from_str::<RouteEntry>(l).ok())
+        .filter_map(|l| {
+            serde_json::from_str::<LogLine>(l).ok().or_else(|| {
+                serde_json::from_str::<RouteEntry>(l).ok().map(LogLine::Decision)
+            })
+        })
         .collect()
 }
 
 /// Pure retention filter: keep entries with `ts >= now - max_age_secs`.
-pub fn prune(entries: &[RouteEntry], now: i64, max_age_secs: i64) -> Vec<RouteEntry> {
+pub fn prune(entries: &[LogLine], now: i64, max_age_secs: i64) -> Vec<LogLine> {
     let cutoff = now - max_age_secs;
-    entries.iter().filter(|e| e.ts >= cutoff).cloned().collect()
+    entries.iter().filter(|e| e.ts() >= cutoff).cloned().collect()
 }
 
 /// Read, prune, and atomically rewrite the log. Best-effort.
@@ -150,8 +209,8 @@ const HOUR: i64 = 3600;
 const DAY: i64 = 86_400;
 const MONTH: i64 = 2_592_000; // 30 days
 
-fn accumulate(bucket: &mut Bucket, e: &RouteEntry) {
-    let toks = e.prompt_tok + e.completion_tok.unwrap_or(0);
+fn accumulate(bucket: &mut Bucket, e: &RouteEntry, completion_tok: u64) {
+    let toks = e.prompt_tok + completion_tok;
     bucket.tokens_if_all_cloud += toks;
     if e.dest == "local" {
         bucket.local_count += 1;
@@ -162,30 +221,59 @@ fn accumulate(bucket: &mut Bucket, e: &RouteEntry) {
 }
 
 /// Build the dashboard rollups: rolling hour/day/month buckets plus the newest
-/// `recent_n` entries (newest first).
-pub fn build_dashboard(entries: &[RouteEntry], now: i64, recent_n: usize) -> Dashboard {
-    let (mut hour, mut day, mut month) = (Bucket::default(), Bucket::default(), Bucket::default());
-    for e in entries {
-        let age = now - e.ts;
-        if age <= MONTH {
-            accumulate(&mut month, e);
-        }
-        if age <= DAY {
-            accumulate(&mut day, e);
-        }
-        if age <= HOUR {
-            accumulate(&mut hour, e);
+/// `recent_n` entries (newest first). Accepts the full `Vec<LogLine>` from
+/// `read_all()`; splits decisions vs outcomes, indexes outcomes by `rid`, and
+/// joins for token math.
+pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashboard {
+    // Index outcomes by rid for O(1) join.
+    let mut outcomes: std::collections::HashMap<&str, &OutcomeEntry> =
+        std::collections::HashMap::new();
+    for line in entries {
+        if let LogLine::Outcome(o) = line {
+            outcomes.insert(o.rid.as_str(), o);
         }
     }
-    let mut recent: Vec<RouteEntry> = entries.to_vec();
-    recent.sort_by(|a, b| b.ts.cmp(&a.ts));
-    recent.truncate(recent_n);
+
+    let (mut hour, mut day, mut month) = (Bucket::default(), Bucket::default(), Bucket::default());
+    let mut decisions: Vec<&RouteEntry> = Vec::new();
+
+    for line in entries {
+        if let LogLine::Decision(e) = line {
+            decisions.push(e);
+            // Resolve completion tokens: outcome by rid first, then legacy field.
+            let completion_tok = outcomes
+                .get(e.rid.as_str())
+                .and_then(|o| o.completion_tok)
+                .or(e.completion_tok)
+                .unwrap_or(0);
+
+            let age = now - e.ts;
+            if age <= MONTH {
+                accumulate(&mut month, e, completion_tok);
+            }
+            if age <= DAY {
+                accumulate(&mut day, e, completion_tok);
+            }
+            if age <= HOUR {
+                accumulate(&mut hour, e, completion_tok);
+            }
+        }
+    }
+
+    decisions.sort_by(|a, b| b.ts.cmp(&a.ts));
+    decisions.truncate(recent_n);
+    let recent: Vec<RouteEntry> = decisions.into_iter().cloned().collect();
+
     Dashboard { hour, day, month, recent }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Serialise tests that mutate the process-global LOCALLLM_ROUTE_LOG env var,
+    // so parallel runs don't clobber each other's log path.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn entry(ts: i64, dest: &str) -> RouteEntry {
         RouteEntry {
@@ -203,15 +291,29 @@ mod tests {
     fn prune_drops_entries_older_than_max_age() {
         let now = 1_000_000i64;
         let month = 30 * 24 * 3600;
-        let kept = prune(&[entry(now - month - 1, "local"), entry(now - 10, "cloud")], now, month);
+        let kept = prune(
+            &[
+                LogLine::Decision(entry(now - month - 1, "local")),
+                LogLine::Decision(entry(now - 10, "cloud")),
+            ],
+            now,
+            month,
+        );
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].dest, "cloud");
+        assert!(matches!(&kept[0], LogLine::Decision(d) if d.dest == "cloud"));
     }
 
     #[test]
     fn prune_keeps_everything_when_all_fresh() {
         let now = 1_000_000i64;
-        let kept = prune(&[entry(now - 5, "local"), entry(now - 6, "cloud")], now, 100);
+        let kept = prune(
+            &[
+                LogLine::Decision(entry(now - 5, "local")),
+                LogLine::Decision(entry(now - 6, "cloud")),
+            ],
+            now,
+            100,
+        );
         assert_eq!(kept.len(), 2);
     }
 
@@ -230,10 +332,11 @@ mod tests {
     #[test]
     fn dashboard_buckets_and_token_math() {
         let now = 10_000_000i64;
-        let entries = vec![
-            e(now - 10, "local", 100, 20),      // in hour/day/month
-            e(now - 7200, "cloud", 200, 50),    // in day/month, not hour
-            e(now - 200_000, "local", 300, 30), // in month only
+        // completion_tok is kept in RouteEntry for legacy compat; dashboard uses it as fallback.
+        let entries: Vec<LogLine> = vec![
+            LogLine::Decision(e(now - 10, "local", 100, 20)),      // in hour/day/month
+            LogLine::Decision(e(now - 7200, "cloud", 200, 50)),    // in day/month, not hour
+            LogLine::Decision(e(now - 200_000, "local", 300, 30)), // in month only
         ];
         let d = build_dashboard(&entries, now, 10);
         // hour: only the first local entry
@@ -257,13 +360,14 @@ mod tests {
     #[test]
     fn dashboard_recent_is_capped() {
         let now = 100i64;
-        let entries: Vec<RouteEntry> = (0..20).map(|i| e(now - i, "local", 1, 1)).collect();
+        let entries: Vec<LogLine> = (0..20).map(|i| LogLine::Decision(e(now - i, "local", 1, 1))).collect();
         let d = build_dashboard(&entries, now, 5);
         assert_eq!(d.recent.len(), 5);
     }
 
     #[test]
     fn clear_empties_the_log() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("localllm-rl-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing-log.jsonl");
@@ -272,6 +376,29 @@ mod tests {
         assert!(!read_all().is_empty());
         assert!(clear());
         assert!(read_all().is_empty());
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_all_parses_new_and_legacy_lines() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("localllm-ll-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+        // legacy decision line (no "kind")
+        let legacy = r#"{"ts":10,"surface":"openai","dest":"local","score":0.1,"prompt_tok":5}"#;
+        std::fs::write(&path, format!("{legacy}\n")).unwrap();
+        // new decision + outcome via the API
+        append(&RouteEntry { ts: 20, rid: "req-1".into(), surface: "openai".into(),
+            dest: "local".into(), prompt_tok: 7, ..Default::default() });
+        append_outcome(&OutcomeEntry { rid: "req-1".into(), ts: 21, completion_tok: Some(9),
+            ttft_ms: Some(30), gen_ms: Some(100), cost_saved_usd: 0.5 });
+        let lines = read_all();
+        assert_eq!(lines.len(), 3);
+        assert!(matches!(lines[0], LogLine::Decision(ref d) if d.prompt_tok == 5));
+        assert!(matches!(lines[2], LogLine::Outcome(ref o) if o.completion_tok == Some(9)));
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
     }

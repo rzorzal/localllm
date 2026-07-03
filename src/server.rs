@@ -199,7 +199,10 @@ fn route_decision(
         crate::route::Decision::Cloud(r) => ("cloud", Some(format!("{r:?}"))),
         _ => ("local", None),
     };
-    // Latest-turn prompt snippet (the ask only, not full history), truncated.
+    // Latest-turn prompt text (the ask only, not full history). Kept near-whole
+    // so the dashboard can show the full prompt in its scrollable box; capped
+    // generously to bound the route-log file size.
+    const PROMPT_SNIPPET_MAX: usize = 8000;
     let prompt_snippet = internal
         .messages
         .iter()
@@ -208,14 +211,15 @@ fn route_decision(
         .and_then(|m| m.text.clone())
         .map(|t| {
             let t = t.trim();
-            if t.chars().count() > 600 {
-                format!("{}…", t.chars().take(600).collect::<String>())
+            if t.chars().count() > PROMPT_SNIPPET_MAX {
+                format!("{}…", t.chars().take(PROMPT_SNIPPET_MAX).collect::<String>())
             } else {
                 t.to_string()
             }
         });
     crate::route_log::append(&crate::route_log::RouteEntry {
         ts: crate::route_log::now_secs(),
+        rid: rid.to_string(),
         surface: surface.to_string(),
         dest: dest.to_string(),
         reason,
@@ -228,6 +232,7 @@ fn route_decision(
         threshold: Some(threshold),
         capability_b: Some(local_capability_b as f64),
         prompt_snippet,
+        ..Default::default()
     });
 
     (decision, prompt_tokens)
@@ -289,14 +294,25 @@ fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
     // tool that stops being sent stays listed so it (and its block) persist if
     // it ever returns. Persist on growth so the Tools view survives a restart.
     {
-        // Capture descriptions for this session (rendered in the Tools view).
-        {
+        // Capture descriptions (seeded from disk the first time this surface is
+        // touched this session), then persist on growth so the Tools view can
+        // expand descriptions right after a restart, before any new request.
+        let descs_grown: Option<std::collections::BTreeMap<String, String>> = {
             let mut descs = state.tool_descs.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = descs.entry(surface.to_string()).or_default();
+            let entry = descs
+                .entry(surface.to_string())
+                .or_insert_with(|| crate::settings::load_tool_descs(surface));
+            let before = entry.len();
             for t in &req.tools {
                 if !t.description.is_empty() {
                     entry.insert(t.name.clone(), t.description.clone());
                 }
+            }
+            if entry.len() != before { Some(entry.clone()) } else { None }
+        };
+        if let Some(descs) = descs_grown {
+            if let Err(e) = crate::settings::save_tool_descs(surface, &descs) {
+                tracing::warn!("failed to persist tool descriptions for {surface}: {e}");
             }
         }
         // Union the request's tool names into the seen set (seeded from the
@@ -512,6 +528,7 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
         .route("/admin/integrations", get(handle_integrations_get).post(handle_integrations_set))
         .route("/admin/routing", get(handle_routing_get).post(handle_routing_set))
+        .route("/admin/threshold", get(handle_threshold_get).post(handle_threshold_set))
         .route("/admin/history-filter", get(handle_history_filter_get).post(handle_history_filter_set))
         .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
         .route("/manager", get(handle_manager_page))
@@ -637,11 +654,59 @@ async fn handle_routing_set(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
         }
     };
-    crate::route::policy::apply_profile(&state.policy, body.profile);
+    // Resolve applies the user's Balanced threshold override, if any.
+    *state.policy.write().unwrap_or_else(|e| e.into_inner()) =
+        crate::settings::resolve_policy(body.profile);
     if let Err(e) = crate::settings::save_profile(body.profile) {
         tracing::warn!("failed to persist routing profile: {e}");
     }
     Json(json!({ "current": body.profile })).into_response()
+}
+
+/// GET /admin/threshold — the Balanced difficulty cutoff as a percent (token-guarded).
+async fn handle_threshold_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let t = crate::settings::load_balanced_threshold();
+    Json(json!({ "percent": (t * 100.0).round() as i64, "value": t })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ThresholdSetBody {
+    percent: f64,
+}
+
+/// POST /admin/threshold {percent} — set the Balanced difficulty cutoff (0–100).
+/// Persists and, if Balanced is the active profile, updates the live policy.
+async fn handle_threshold_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: ThresholdSetBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    let t = (body.percent / 100.0).clamp(0.0, 1.0);
+    if let Err(e) = crate::settings::save_balanced_threshold(t) {
+        tracing::warn!("failed to persist balanced threshold: {e}");
+    }
+    // Live-apply only when Balanced is active; other profiles keep their knobs.
+    if crate::settings::load_profile() == crate::route::Profile::Balanced {
+        state.policy.write().unwrap_or_else(|e| e.into_inner()).escalation_threshold = t;
+    }
+    Json(json!({ "percent": (t * 100.0).round() as i64, "value": t })).into_response()
 }
 
 /// GET /admin/integrations — current wiring state (token-guarded).
@@ -1086,7 +1151,12 @@ async fn handle_tools_get(
         if seen.is_empty() && disabled.is_empty() {
             continue;
         }
-        let descriptions = descs.get(surface).cloned().unwrap_or_default();
+        // Live map once a request has arrived this session; else the persisted
+        // set so descriptions expand right after boot.
+        let descriptions = match descs.get(surface) {
+            Some(d) => d.clone(),
+            None => crate::settings::load_tool_descs(surface),
+        };
         out.insert(
             surface.to_string(),
             json!({ "seen": seen, "disabled": disabled, "descriptions": descriptions }),
