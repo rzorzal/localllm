@@ -770,6 +770,9 @@ async function renderDashboard() {
   const refreshBtn = el("button", "btn", "↻ Atualizar");
   refreshBtn.onclick = () => renderDashboard();
   barActions.append(refreshBtn);
+  const exportBtn = el("button", "btn", "⇩ Exportar CSV");
+  exportBtn.onclick = () => window.open(`/admin/export?format=csv&token=${encodeURIComponent(TOKEN)}`, "_blank");
+  barActions.append(exportBtn);
   const clearBtn = el("button", "btn danger", "Limpar dados");
   let armed = false, armTimer = null;
   clearBtn.onclick = async () => {

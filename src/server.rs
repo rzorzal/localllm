@@ -612,6 +612,7 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/budget", get(handle_budget_get).post(handle_budget_set))
         .route("/admin/history-filter", get(handle_history_filter_get).post(handle_history_filter_set))
         .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
+        .route("/admin/export", get(handle_export))
         .route("/manager", get(handle_manager_page))
         .route("/manager/app.js", get(handle_manager_js))
         .route("/manager/style.css", get(handle_manager_css))
@@ -924,6 +925,69 @@ async fn handle_dashboard_clear(
     }
     let cleared = crate::route_log::clear();
     Json(json!({ "cleared": cleared })).into_response()
+}
+
+/// Flatten the log to CSV (decisions + outcomes, one row each).
+fn export_csv(lines: &[crate::route_log::LogLine]) -> String {
+    use crate::route_log::LogLine;
+    let mut out = String::from(
+        "kind,rid,ts,surface,dest,reason,degrade_reason,model,prompt_tok,completion_tok,ttft_ms,gen_ms,cost_saved_usd\n");
+    let esc = |s: &str| if s.contains(',') || s.contains('"') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    };
+    for l in lines {
+        match l {
+            LogLine::Decision(d) => out.push_str(&format!(
+                "d,{},{},{},{},{},{},{},{},,,,\n",
+                esc(&d.rid), d.ts, esc(&d.surface), esc(&d.dest),
+                esc(d.reason.as_deref().unwrap_or("")),
+                esc(d.degrade_reason.as_deref().unwrap_or("")),
+                esc(d.model.as_deref().unwrap_or("")), d.prompt_tok)),
+            LogLine::Outcome(o) => out.push_str(&format!(
+                "o,{},{},,,,,,,{},{},{},{}\n",
+                esc(&o.rid), o.ts,
+                o.completion_tok.map(|v| v.to_string()).unwrap_or_default(),
+                o.ttft_ms.map(|v| v.to_string()).unwrap_or_default(),
+                o.gen_ms.map(|v| v.to_string()).unwrap_or_default(),
+                o.cost_saved_usd)),
+        }
+    }
+    out
+}
+
+#[derive(serde::Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+    token: Option<String>,
+}
+
+/// GET /admin/export?format=jsonl|csv&token=… — download the routing log.
+/// Token comes via query (browser downloads can't set headers).
+async fn handle_export(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<ExportQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !constant_time_eq(q.token.as_deref().unwrap_or("").as_bytes(), state.admin_token.as_bytes()) {
+        return (StatusCode::UNAUTHORIZED, "invalid admin token").into_response();
+    }
+    let lines = crate::route_log::read_all();
+    let (body, ct, disp) = if q.format.as_deref() == Some("csv") {
+        (export_csv(&lines), "text/csv", "attachment; filename=\"routing-log.csv\"")
+    } else {
+        let jsonl = lines.iter().filter_map(|l| serde_json::to_string(l).ok())
+            .collect::<Vec<_>>().join("\n");
+        (jsonl, "application/x-ndjson", "attachment; filename=\"routing-log.jsonl\"")
+    };
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            (axum::http::header::CONTENT_DISPOSITION, disp),
+        ],
+        body,
+    ).into_response()
 }
 
 /// Verify the `X-Admin-Token` header against the configured token (constant-time).
@@ -1919,6 +1983,18 @@ mod tests {
         assert_eq!(cost("r2"), 0.0); // cloud saves nothing
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_csv_has_header_and_rows() {
+        let lines = vec![
+            crate::route_log::LogLine::Decision(crate::route_log::RouteEntry {
+                ts: 10, rid: "r1".into(), surface: "openai".into(), dest: "local".into(),
+                prompt_tok: 5, ..Default::default() }),
+        ];
+        let csv = super::export_csv(&lines);
+        assert!(csv.starts_with("kind,rid,ts,surface,dest,reason,degrade_reason,model,prompt_tok"));
+        assert!(csv.contains("d,r1,10,openai,local"));
     }
 
     #[test]
