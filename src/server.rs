@@ -174,7 +174,18 @@ fn route_decision(
         local_capability_b,
     };
     let policy = *state.policy.read().unwrap();
-    let decision = crate::route::decide(&signals, &policy);
+    let raw_decision = crate::route::decide(&signals, &policy);
+    // Budget cap: if enabled and today's cloud spend is over the daily limit,
+    // force a cloud decision back to local (until the UTC day rolls over).
+    let (budget_enabled, budget_daily) = crate::settings::load_budget();
+    let budget_forced = budget_enabled
+        && matches!(raw_decision, crate::route::Decision::Cloud(_))
+        && state.budget.is_over(crate::route_log::now_secs(), budget_daily);
+    let decision = if budget_forced {
+        crate::route::Decision::Local
+    } else {
+        raw_decision
+    };
 
     // Log WHY this decision was made: the difficulty score and its inputs, the
     // capability-adjusted threshold, and the outcome — so the log explains each
@@ -195,9 +206,13 @@ fn route_decision(
     // dashboard. Completion tokens are unknown at decision time → None. Records
     // the DECISION, not the eventual outcome (a cloud decision that degrades to
     // local still reads "cloud"). Best-effort — never fails the request.
-    let (dest, reason) = match decision {
-        crate::route::Decision::Cloud(r) => ("cloud", Some(format!("{r:?}"))),
-        _ => ("local", None),
+    let (dest, reason) = if budget_forced {
+        ("local", Some("BudgetExceeded".to_string()))
+    } else {
+        match decision {
+            crate::route::Decision::Cloud(r) => ("cloud", Some(format!("{r:?}"))),
+            _ => ("local", None),
+        }
     };
     // Latest-turn prompt text (the ask only, not full history). Kept near-whole
     // so the dashboard can show the full prompt in its scrollable box; capped
@@ -301,6 +316,11 @@ fn log_degrade_fallback(
 /// failure notifies again.
 fn record_cloud_success(state: &AppState, est_prompt_tokens: usize) {
     state.usage.note_success();
+    // Charge the budget with a prompt-only estimate. The model id is not known
+    // here (raw passthrough), so this uses the fallback price — a safety-cap
+    // estimate, not an exact invoice.
+    let cost = crate::pricing::price_for("").cost(est_prompt_tokens as u64, 0);
+    state.budget.note_cloud_cost(cost);
     if state
         .usage
         .record_cloud_call(est_prompt_tokens, state.cloud_token_alert)
@@ -545,6 +565,8 @@ pub struct AppState {
     /// TCP port this server listens on — needed to (re)wire agent client configs
     /// via `POST /admin/integrations`.
     pub port: u16,
+    /// Daily cloud-spend tracker for the budget cap.
+    pub budget: std::sync::Arc<crate::budget::Budget>,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -587,6 +609,7 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/integrations", get(handle_integrations_get).post(handle_integrations_set))
         .route("/admin/routing", get(handle_routing_get).post(handle_routing_set))
         .route("/admin/threshold", get(handle_threshold_get).post(handle_threshold_set))
+        .route("/admin/budget", get(handle_budget_get).post(handle_budget_set))
         .route("/admin/history-filter", get(handle_history_filter_get).post(handle_history_filter_set))
         .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
         .route("/manager", get(handle_manager_page))
@@ -631,6 +654,11 @@ pub fn router(
             std::collections::BTreeMap::new(),
         )),
         port,
+        budget: {
+            let b = std::sync::Arc::new(crate::budget::Budget::new());
+            b.seed_from_log(&crate::route_log::read_all(), crate::route_log::now_secs());
+            b
+        },
     });
     build_router_inner(state)
 }
@@ -765,6 +793,54 @@ async fn handle_threshold_set(
         state.policy.write().unwrap_or_else(|e| e.into_inner()).escalation_threshold = t;
     }
     Json(json!({ "percent": (t * 100.0).round() as i64, "value": t })).into_response()
+}
+
+/// GET /admin/budget — budget cap config + today's spend (token-guarded).
+async fn handle_budget_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let (enabled, daily_usd) = crate::settings::load_budget();
+    let spent = state.budget.spent_today(crate::route_log::now_secs());
+    let remaining = (daily_usd - spent).max(0.0);
+    let over = enabled && daily_usd > 0.0 && spent >= daily_usd;
+    Json(json!({ "enabled": enabled, "daily_usd": daily_usd,
+        "spent_today": spent, "remaining": remaining, "over": over })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct BudgetSetBody {
+    enabled: Option<bool>,
+    daily_usd: Option<f64>,
+}
+
+/// POST /admin/budget {enabled?, daily_usd?} — update the budget cap (token-guarded).
+async fn handle_budget_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: BudgetSetBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    };
+    let (cur_en, cur_usd) = crate::settings::load_budget();
+    let enabled = body.enabled.unwrap_or(cur_en);
+    let daily_usd = body.daily_usd.unwrap_or(cur_usd).max(0.0);
+    if let Err(e) = crate::settings::save_budget(enabled, daily_usd) {
+        tracing::warn!("failed to persist budget: {e}");
+    }
+    handle_budget_get(State(state), headers).await
 }
 
 /// GET /admin/integrations — current wiring state (token-guarded).
@@ -1817,6 +1893,7 @@ fn make_seeded_test_router(
             std::collections::BTreeMap::new(),
         )),
         port: 31415,
+        budget: std::sync::Arc::new(crate::budget::Budget::new()),
     }))
 }
 
@@ -2013,6 +2090,50 @@ mod tests {
 
     /// Serialise tests that set LOCALLLM_SETTINGS so they don't race each other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// POST then GET /admin/budget round-trips the config.
+    #[tokio::test]
+    async fn budget_get_post_round_trip() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let settings_file = std::env::temp_dir()
+            .join(format!("localllm-bud-{}.json", uuid::Uuid::new_v4()));
+        std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
+
+        let app = crate::router_for_test_with(
+            std::sync::Arc::new(crate::test_support::TaggedGen("test")),
+            crate::route::Profile::default().policy(),
+            1000,
+        );
+
+        let post = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/budget")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-token")
+            .body(Body::from(r#"{"enabled":true,"daily_usd":5.0}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(post).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let get = axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/budget")
+            .header("x-admin-token", "test-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = app.oneshot(get).await.unwrap();
+        let bytes = resp2.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["daily_usd"], 5.0);
+
+        let _ = std::fs::remove_file(&settings_file);
+        std::env::remove_var("LOCALLLM_SETTINGS");
+    }
 
     /// POST /admin/model/profile — happy path: kv_type and history_turns persist.
     #[tokio::test]
