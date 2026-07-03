@@ -86,7 +86,7 @@ pub async fn run_server_with_ready(
     use std::sync::{Arc, RwLock};
     let profile = crate::settings::resolve_profile(cfg.profile);
     tracing::info!("routing profile: {profile:?}");
-    let policy = Arc::new(RwLock::new(profile.policy()));
+    let policy = Arc::new(RwLock::new(crate::settings::resolve_policy(profile)));
     run_server_with_ready_and_policy(cfg, ready, policy).await
 }
 

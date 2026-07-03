@@ -341,11 +341,29 @@ fn wired_label(state: &crate::settings::IntegrationState) -> String {
 // Tray entry point
 // ---------------------------------------------------------------------------
 
+/// Terminate the process immediately without running C/C++ atexit handlers or
+/// static destructors. The GGML Metal backend aborts (`ggml_abort` inside
+/// `ggml_metal_rsets_free`) when its context is torn down by static destructors
+/// during libc `exit()`, which turns a normal Quit into a SIGABRT crash. Since
+/// the OS reclaims all memory and GPU resources on exit anyway, we skip the
+/// finalizers entirely.
+fn hard_exit(code: i32) -> ! {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn _exit(code: i32) -> !;
+        }
+        unsafe { _exit(code) }
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
+}
+
 /// Run the server in a background thread and drive the event loop +
 /// tray icon on the main thread.
 ///
-/// This function is `-> !` — it blocks forever (exits via
-/// `std::process::exit(0)` on Quit, or the OS kills the process).
+/// This function is `-> !` — it blocks forever (exits via `hard_exit(0)` on
+/// Quit, or the OS kills the process).
 pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let port = cfg.port;
     let url = format!("http://127.0.0.1:{port}");
@@ -364,7 +382,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // policy the menu and server share. The menu mutates it live.
     let initial_profile = crate::settings::resolve_profile(cfg.profile);
     let policy: Arc<RwLock<RoutingPolicy>> =
-        Arc::new(RwLock::new(initial_profile.policy()));
+        Arc::new(RwLock::new(crate::settings::resolve_policy(initial_profile)));
     let policy_for_server = policy.clone();
 
     // Clone the token for the server thread; keep the original for Task 3's window.
@@ -391,7 +409,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 Some(manager_slot_for_server),
             )) {
                 tracing::error!("server exited with error: {e:#}");
-                std::process::exit(1);
+                hard_exit(1);
             }
         })
         .expect("failed to spawn server thread");
@@ -606,7 +624,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                             new_state.enabled = !new_state.priors.is_empty();
                             let _ = crate::settings::save_integrations(&new_state);
                         }
-                        std::process::exit(0);
+                        hard_exit(0);
                     } else if logs_id.as_ref() == Some(&menu_event.id) {
                         platform::open_path(&log_path);
                         tracing::info!("opening log file {log_path}");

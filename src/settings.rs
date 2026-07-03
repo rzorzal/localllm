@@ -64,12 +64,20 @@ struct Settings {
     /// shows them immediately after a restart (before any new request refreshes).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     tool_seen: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-surface tool descriptions (name -> desc), persisted so the Tools view
+    /// can expand descriptions right after a restart, before any new request.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    tool_descs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_model: Option<ActiveModel>,
     /// Global toggle: when true, history trimming selects turns by relevance
     /// (BM25+MMR) instead of pure recency. Default false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     smart_history: bool,
+    /// User override for the Balanced profile's difficulty cutoff (`[0.0, 1.0]`).
+    /// `None` keeps the built-in default. Only affects the Balanced profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    balanced_threshold: Option<f64>,
 }
 
 /// Resolve the settings file path. `LOCALLLM_SETTINGS` (full file path) wins;
@@ -127,6 +135,34 @@ pub fn save_profile(p: Profile) -> anyhow::Result<()> {
     let mut s = load_settings();
     s.profile = p;
     save_settings(&s)
+}
+
+/// The Balanced profile's difficulty cutoff — the user override if set, else the
+/// built-in default. Always clamped to `[0.0, 1.0]`.
+pub fn load_balanced_threshold() -> f64 {
+    load_settings()
+        .balanced_threshold
+        .unwrap_or(crate::route::Profile::Balanced.policy().escalation_threshold)
+        .clamp(0.0, 1.0)
+}
+
+/// Persist the Balanced difficulty cutoff (clamped to `[0.0, 1.0]`), preserving
+/// the rest of the settings file.
+pub fn save_balanced_threshold(t: f64) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.balanced_threshold = Some(t.clamp(0.0, 1.0));
+    save_settings(&s)
+}
+
+/// The concrete policy for a profile, applying any user overrides. The Balanced
+/// profile's difficulty cutoff comes from [`load_balanced_threshold`]; every
+/// other profile uses its built-in knobs unchanged.
+pub fn resolve_policy(p: Profile) -> crate::route::RoutingPolicy {
+    let mut pol = p.policy();
+    if p == Profile::Balanced {
+        pol.escalation_threshold = load_balanced_threshold();
+    }
+    pol
 }
 
 /// Load the last-activated model, if any was saved.
@@ -270,6 +306,25 @@ pub fn save_tool_seen(surface: &str, seen: &[String]) -> anyhow::Result<()> {
     save_settings(&s)
 }
 
+/// Load a surface's persisted tool descriptions (name -> desc).
+pub fn load_tool_descs(surface: &str) -> std::collections::BTreeMap<String, String> {
+    load_settings().tool_descs.get(surface).cloned().unwrap_or_default()
+}
+
+/// Persist a surface's tool descriptions (empty clears it), preserving the rest.
+pub fn save_tool_descs(
+    surface: &str,
+    descs: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    if descs.is_empty() {
+        s.tool_descs.remove(surface);
+    } else {
+        s.tool_descs.insert(surface.to_string(), descs.clone());
+    }
+    save_settings(&s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +344,43 @@ mod tests {
             save_tool_seen("claude-code", &[]).unwrap();
             assert!(load_tool_seen("claude-code").is_empty());
             assert_eq!(load_tool_filter("claude-code"), vec!["Bash".to_string()]);
+        });
+    }
+
+    #[test]
+    fn tool_descs_round_trip_and_clear_and_preserve_seen() {
+        with_temp_settings(|| {
+            save_tool_seen("claude-code", &["Bash".to_string()]).unwrap();
+            let mut d = std::collections::BTreeMap::new();
+            d.insert("Bash".to_string(), "Run a shell command".to_string());
+            save_tool_descs("claude-code", &d).unwrap();
+            assert_eq!(load_tool_descs("claude-code"), d);
+            // desc persistence must not disturb the seen set
+            assert_eq!(load_tool_seen("claude-code"), vec!["Bash".to_string()]);
+            // empty clears
+            save_tool_descs("claude-code", &std::collections::BTreeMap::new()).unwrap();
+            assert!(load_tool_descs("claude-code").is_empty());
+            assert_eq!(load_tool_seen("claude-code"), vec!["Bash".to_string()]);
+        });
+    }
+
+    #[test]
+    fn balanced_threshold_round_trips_clamps_and_resolves() {
+        with_temp_settings(|| {
+            // Default = the profile's built-in threshold.
+            let default_t = Profile::Balanced.policy().escalation_threshold;
+            assert!((load_balanced_threshold() - default_t).abs() < 1e-9);
+            // Save + read back; out-of-range clamps to [0,1].
+            save_balanced_threshold(0.7).unwrap();
+            assert!((load_balanced_threshold() - 0.7).abs() < 1e-9);
+            save_balanced_threshold(1.5).unwrap();
+            assert!((load_balanced_threshold() - 1.0).abs() < 1e-9);
+            // resolve_policy applies the override only to Balanced.
+            assert!((resolve_policy(Profile::Balanced).escalation_threshold - 1.0).abs() < 1e-9);
+            assert_eq!(
+                resolve_policy(Profile::MaxQuality).escalation_threshold,
+                Profile::MaxQuality.policy().escalation_threshold
+            );
         });
     }
 

@@ -134,8 +134,46 @@ function renderConfig() {
   view.innerHTML = "";
   view.append(shell);
   renderRoutingSelector(shell);
+  renderThresholdConfig(shell);
   renderSmartHistoryToggle(shell);
   renderIntegrationToggle(shell);
+}
+
+// Balanced-profile difficulty cutoff, as a percentage. GET/POST /admin/threshold.
+// Higher % = harder to escalate = more local; lower = more cloud.
+async function renderThresholdConfig(container) {
+  const panel = el("div", "intpanel");
+  panel.append(el("div", "intpanel-title", "Limiar do Balanced"));
+  panel.append(el("div", "intpanel-sub",
+    "Dificuldade do pedido acima deste ponto vai para a cloud. Maior % = mais local; menor % = mais cloud. Usado no perfil Balanced."));
+
+  const row = el("div", "thresh-row");
+  const range = el("input", "thresh-range");
+  range.type = "range"; range.min = 0; range.max = 100; range.step = 1;
+  const num = el("div", "thresh-num");
+  const pct = el("span", "thresh-pct", "—");
+  num.append(pct, el("span", "thresh-unit", "%"));
+  row.append(range, num);
+  panel.append(row);
+  const status = el("div", "intpanel-status");
+  panel.append(status);
+  container.append(panel);
+
+  const paint = (p) => { range.value = p; pct.textContent = p; };
+  try { const r = await api("GET", "/admin/threshold"); paint(r.percent); }
+  catch (e) { status.textContent = e.message; return; }
+
+  let busy = false;
+  range.oninput = () => { pct.textContent = range.value; };
+  range.onchange = async () => {
+    if (busy) return;
+    busy = true; range.disabled = true;
+    try {
+      const r = await api("POST", "/admin/threshold", { percent: Number(range.value) });
+      paint(r.percent); toast(`Limiar em ${r.percent}%`);
+    } catch (e) { toast(e.message, true); }
+    finally { busy = false; range.disabled = false; }
+  };
 }
 
 // Global smart-history filter toggle. GET/POST /admin/history-filter.
@@ -922,9 +960,20 @@ function renderDecisionsTable(panel, recent) {
       closePop();
       pop = scoreExplainNode(e);
       document.body.append(pop);
+      // Position after it's in the DOM so we can measure real size and keep it
+      // fully on-screen: clamp horizontally, flip above the row if it would
+      // overflow the bottom, then clamp vertically.
       const r = scWrap.getBoundingClientRect();
-      pop.style.left = Math.min(r.left, window.innerWidth - 320) + "px";
-      pop.style.top = (r.bottom + 6) + "px";
+      const pr = pop.getBoundingClientRect();
+      const M = 8; // viewport margin
+      const left = Math.max(M, Math.min(r.left, window.innerWidth - pr.width - M));
+      let top = r.bottom + 6;
+      if (top + pr.height + M > window.innerHeight) {
+        top = r.top - pr.height - 6; // flip above
+      }
+      top = Math.max(M, Math.min(top, window.innerHeight - pr.height - M));
+      pop.style.left = left + "px";
+      pop.style.top = top + "px";
     };
     sc.append(scWrap);
     tr.append(sc);
