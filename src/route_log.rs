@@ -194,6 +194,42 @@ pub struct Bucket {
     pub tokens_saved: u64,
     /// Σ(prompt+completion) of ALL requests — the hypothetical all-cloud cost.
     pub tokens_if_all_cloud: u64,
+    /// Σ cost_saved_usd of local requests in this window.
+    pub cost_saved_usd: f64,
+}
+
+/// Average latency for one route (local or cloud) over the log.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RouteLatency {
+    pub avg_ttft_ms: u64,
+    pub avg_tok_s: f64,
+    pub n: u64,
+}
+
+/// A contiguous window where requests fell back to local, one reason.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FallbackWindow {
+    /// "budget" | "provider"
+    pub kind: String,
+    /// human reason (e.g. "Quota", "BudgetExceeded")
+    pub reason: String,
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub count: u64,
+}
+
+/// A recent decision joined to its outcome, for the dashboard table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecentRow {
+    #[serde(flatten)]
+    pub entry: RouteEntry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tok: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen_ms: Option<u64>,
+    pub cost_saved_usd: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -201,70 +237,114 @@ pub struct Dashboard {
     pub hour: Bucket,
     pub day: Bucket,
     pub month: Bucket,
+    pub local_latency: RouteLatency,
+    pub cloud_latency: RouteLatency,
+    pub windows: Vec<FallbackWindow>,
     /// Newest-first, capped at `recent_n`.
-    pub recent: Vec<RouteEntry>,
+    pub recent: Vec<RecentRow>,
 }
 
 const HOUR: i64 = 3600;
 const DAY: i64 = 86_400;
 const MONTH: i64 = 2_592_000; // 30 days
 
-fn accumulate(bucket: &mut Bucket, e: &RouteEntry, completion_tok: u64) {
-    let toks = e.prompt_tok + completion_tok;
+fn accumulate(bucket: &mut Bucket, d: &RouteEntry, o: Option<&OutcomeEntry>) {
+    // Completion tokens: outcome by rid first, then the legacy RouteEntry field.
+    let completion = o.and_then(|o| o.completion_tok).or(d.completion_tok).unwrap_or(0);
+    let toks = d.prompt_tok + completion;
     bucket.tokens_if_all_cloud += toks;
-    if e.dest == "local" {
+    if d.dest == "local" {
         bucket.local_count += 1;
         bucket.tokens_saved += toks;
+        bucket.cost_saved_usd += o.map(|o| o.cost_saved_usd).unwrap_or(0.0);
     } else {
         bucket.cloud_count += 1;
     }
 }
 
-/// Build the dashboard rollups: rolling hour/day/month buckets plus the newest
-/// `recent_n` entries (newest first). Accepts the full `Vec<LogLine>` from
-/// `read_all()`; splits decisions vs outcomes, indexes outcomes by `rid`, and
-/// joins for token math.
+/// Build the dashboard rollups: rolling hour/day/month buckets (with $ saved),
+/// per-route latency, contiguous fallback windows, plus the newest `recent_n`
+/// decisions joined to their outcomes. Accepts the full `Vec<LogLine>`.
 pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashboard {
-    // Index outcomes by rid for O(1) join.
-    let mut outcomes: std::collections::HashMap<&str, &OutcomeEntry> =
-        std::collections::HashMap::new();
-    for line in entries {
-        if let LogLine::Outcome(o) = line {
-            outcomes.insert(o.rid.as_str(), o);
-        }
-    }
-
-    let (mut hour, mut day, mut month) = (Bucket::default(), Bucket::default(), Bucket::default());
+    use std::collections::HashMap;
     let mut decisions: Vec<&RouteEntry> = Vec::new();
-
-    for line in entries {
-        if let LogLine::Decision(e) = line {
-            decisions.push(e);
-            // Resolve completion tokens: outcome by rid first, then legacy field.
-            let completion_tok = outcomes
-                .get(e.rid.as_str())
-                .and_then(|o| o.completion_tok)
-                .or(e.completion_tok)
-                .unwrap_or(0);
-
-            let age = now - e.ts;
-            if age <= MONTH {
-                accumulate(&mut month, e, completion_tok);
-            }
-            if age <= DAY {
-                accumulate(&mut day, e, completion_tok);
-            }
-            if age <= HOUR {
-                accumulate(&mut hour, e, completion_tok);
+    let mut outcomes: HashMap<&str, &OutcomeEntry> = HashMap::new();
+    for l in entries {
+        match l {
+            LogLine::Decision(d) => decisions.push(d),
+            LogLine::Outcome(o) => { outcomes.insert(o.rid.as_str(), o); }
+        }
+    }
+    let (mut hour, mut day, mut month) = (Bucket::default(), Bucket::default(), Bucket::default());
+    let (mut l_ttft, mut l_tps, mut l_n) = (0u64, 0f64, 0u64);
+    let (mut c_ttft, mut c_tps, mut c_n) = (0u64, 0f64, 0u64);
+    for d in &decisions {
+        let o = outcomes.get(d.rid.as_str()).copied();
+        let age = now - d.ts;
+        if age <= MONTH { accumulate(&mut month, d, o); }
+        if age <= DAY { accumulate(&mut day, d, o); }
+        if age <= HOUR { accumulate(&mut hour, d, o); }
+        if let Some(o) = o {
+            let tps = match (o.completion_tok, o.gen_ms) {
+                (Some(ct), Some(ms)) if ms > 0 => ct as f64 / (ms as f64 / 1000.0),
+                _ => 0.0,
+            };
+            if d.dest == "local" {
+                if let Some(t) = o.ttft_ms { l_ttft += t; }
+                l_tps += tps; l_n += 1;
+            } else {
+                if let Some(t) = o.ttft_ms { c_ttft += t; }
+                c_tps += tps; c_n += 1;
             }
         }
     }
-
-    decisions.sort_by(|a, b| b.ts.cmp(&a.ts));
-    decisions.truncate(recent_n);
-    let recent: Vec<RouteEntry> = decisions.into_iter().cloned().collect();
-
-    Dashboard { hour, day, month, recent }
+    let latency = |ttft: u64, tps: f64, n: u64| RouteLatency {
+        avg_ttft_ms: if n > 0 { ttft / n } else { 0 },
+        avg_tok_s: if n > 0 { tps / n as f64 } else { 0.0 },
+        n,
+    };
+    // Fallback windows: group contiguous same-reason local decisions.
+    let mut flagged: Vec<&RouteEntry> = decisions.iter().filter(|d| {
+        d.degrade_reason.is_some() || d.reason.as_deref() == Some("BudgetExceeded")
+    }).copied().collect();
+    flagged.sort_by_key(|d| d.ts);
+    let mut windows: Vec<FallbackWindow> = Vec::new();
+    const GAP: i64 = 120; // seconds; same-reason events within this gap merge
+    for d in flagged {
+        let (kind, reason) = if let Some(r) = &d.degrade_reason {
+            ("provider", r.clone())
+        } else {
+            ("budget", "BudgetExceeded".to_string())
+        };
+        match windows.last_mut() {
+            Some(w) if w.kind == kind && w.reason == reason && d.ts - w.end_ts <= GAP => {
+                w.end_ts = d.ts; w.count += 1;
+            }
+            _ => windows.push(FallbackWindow {
+                kind: kind.to_string(), reason, start_ts: d.ts, end_ts: d.ts, count: 1,
+            }),
+        }
+    }
+    // Recent rows: newest-first decisions joined to their outcome.
+    let mut recent: Vec<RecentRow> = decisions.iter().map(|d| {
+        let o = outcomes.get(d.rid.as_str()).copied();
+        RecentRow {
+            entry: (*d).clone(),
+            completion_tok: o.and_then(|o| o.completion_tok),
+            ttft_ms: o.and_then(|o| o.ttft_ms),
+            gen_ms: o.and_then(|o| o.gen_ms),
+            cost_saved_usd: o.map(|o| o.cost_saved_usd).unwrap_or(0.0),
+        }
+    }).collect();
+    recent.sort_by(|a, b| b.entry.ts.cmp(&a.entry.ts));
+    recent.truncate(recent_n);
+    Dashboard {
+        hour, day, month,
+        local_latency: latency(l_ttft, l_tps, l_n),
+        cloud_latency: latency(c_ttft, c_tps, c_n),
+        windows,
+        recent,
+    }
 }
 
 #[cfg(test)]
@@ -330,31 +410,51 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_buckets_and_token_math() {
+    fn dashboard_buckets_cost_and_join() {
         let now = 10_000_000i64;
-        // completion_tok is kept in RouteEntry for legacy compat; dashboard uses it as fallback.
-        let entries: Vec<LogLine> = vec![
-            LogLine::Decision(e(now - 10, "local", 100, 20)),      // in hour/day/month
-            LogLine::Decision(e(now - 7200, "cloud", 200, 50)),    // in day/month, not hour
-            LogLine::Decision(e(now - 200_000, "local", 300, 30)), // in month only
+        let mut lines = vec![
+            LogLine::Decision(RouteEntry { ts: now - 10, rid: "a".into(), surface: "openai".into(),
+                dest: "local".into(), prompt_tok: 100, ..Default::default() }),
+            LogLine::Decision(RouteEntry { ts: now - 20, rid: "b".into(), surface: "openai".into(),
+                dest: "cloud".into(), prompt_tok: 200, ..Default::default() }),
         ];
-        let d = build_dashboard(&entries, now, 10);
-        // hour: only the first local entry
-        assert_eq!(d.hour.local_count, 1);
-        assert_eq!(d.hour.cloud_count, 0);
+        lines.push(LogLine::Outcome(OutcomeEntry { rid: "a".into(), ts: now - 9,
+            completion_tok: Some(20), ttft_ms: Some(30), gen_ms: Some(100), cost_saved_usd: 0.42 }));
+        lines.push(LogLine::Outcome(OutcomeEntry { rid: "b".into(), ts: now - 19,
+            completion_tok: Some(50), ttft_ms: Some(80), gen_ms: Some(500), cost_saved_usd: 0.0 }));
+        let d = build_dashboard(&lines, now, 10);
+        // hour bucket: local 120 saved, all-cloud 120+250
         assert_eq!(d.hour.tokens_saved, 120);
-        assert_eq!(d.hour.tokens_if_all_cloud, 120);
-        // day: local(120) + cloud(250)
-        assert_eq!(d.day.local_count, 1);
-        assert_eq!(d.day.cloud_count, 1);
-        assert_eq!(d.day.tokens_saved, 120); // only local counts as saved
-        assert_eq!(d.day.tokens_if_all_cloud, 370); // all requests
-        // month: all three
-        assert_eq!(d.month.tokens_saved, 120 + 330); // two local
-        assert_eq!(d.month.tokens_if_all_cloud, 120 + 250 + 330);
-        // recent newest-first
-        assert_eq!(d.recent.len(), 3);
-        assert_eq!(d.recent[0].ts, now - 10);
+        assert_eq!(d.hour.tokens_if_all_cloud, 370);
+        assert!((d.hour.cost_saved_usd - 0.42).abs() < 1e-9);
+        // local latency: 20 tok / 0.1s = 200 tok/s, ttft 30
+        assert_eq!(d.local_latency.n, 1);
+        assert_eq!(d.local_latency.avg_ttft_ms, 30);
+        assert!((d.local_latency.avg_tok_s - 200.0).abs() < 1.0);
+        // recent carries the joined completion_tok
+        assert_eq!(d.recent.len(), 2);
+        let row_a = d.recent.iter().find(|r| r.entry.rid == "a").unwrap();
+        assert_eq!(row_a.completion_tok, Some(20));
+    }
+
+    #[test]
+    fn dashboard_groups_fallback_windows() {
+        let now = 1_000_000i64;
+        let lines = vec![
+            LogLine::Decision(RouteEntry { ts: now - 300, rid: "1".into(), surface: "openai".into(),
+                dest: "local".into(), degrade_reason: Some("Quota".into()), ..Default::default() }),
+            LogLine::Decision(RouteEntry { ts: now - 290, rid: "2".into(), surface: "openai".into(),
+                dest: "local".into(), degrade_reason: Some("Quota".into()), ..Default::default() }),
+            LogLine::Decision(RouteEntry { ts: now - 100, rid: "3".into(), surface: "openai".into(),
+                dest: "local".into(), reason: Some("BudgetExceeded".into()), ..Default::default() }),
+        ];
+        let d = build_dashboard(&lines, now, 10);
+        assert_eq!(d.windows.len(), 2);
+        let prov = d.windows.iter().find(|w| w.kind == "provider").unwrap();
+        assert_eq!(prov.count, 2);
+        assert_eq!(prov.reason, "Quota");
+        let bud = d.windows.iter().find(|w| w.kind == "budget").unwrap();
+        assert_eq!(bud.count, 1);
     }
 
     #[test]
