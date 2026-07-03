@@ -245,6 +245,13 @@ body {
 .budget-readout { margin-top: 14px; font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .budget-readout.over { color: var(--red); font-weight: 600; }
 
+/* Dashboard fallback windows */
+.fallback-box { border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; background: var(--panel); }
+.fallback-title { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
+.fallback-line { font-size: 12.5px; line-height: 1.6; padding-left: 12px; border-left: 3px solid var(--line); margin-bottom: 6px; }
+.fallback-line.budget { border-left-color: var(--amber); }
+.fallback-line.provider { border-left-color: var(--indigo); }
+
 /* ============================================================= *
  * Firestore-style column drilldown for models
  * ============================================================= */

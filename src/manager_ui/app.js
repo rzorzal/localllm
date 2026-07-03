@@ -839,9 +839,40 @@ async function renderDashboard() {
     card.append(bar);
     card.append(el("div", "dash-card-split",
       `${b.local_count} local · ${b.cloud_count} cloud`));
+    card.append(el("div", "dash-card-split",
+      `$ ${(b.cost_saved_usd || 0).toFixed(2)} economizado`));
     cards.append(card);
   });
   wrap.append(cards);
+
+  // Latency by route (from post-generation outcomes)
+  const L = d.local_latency || { avg_ttft_ms: 0, avg_tok_s: 0, n: 0 };
+  const C = d.cloud_latency || { avg_ttft_ms: 0, avg_tok_s: 0, n: 0 };
+  const lat = el("div", "dash-card");
+  lat.append(el("div", "dash-card-head", "LATÊNCIA (30d)"));
+  lat.append(el("div", "dash-card-alt",
+    `local: TTFT ${L.avg_ttft_ms}ms · ${(L.avg_tok_s || 0).toFixed(0)} tok/s (${L.n})`));
+  lat.append(el("div", "dash-card-alt",
+    `cloud: TTFT ${C.avg_ttft_ms}ms · ${(C.avg_tok_s || 0).toFixed(0)} tok/s (${C.n})`));
+  wrap.append(lat);
+
+  // Fallback windows — why routing went local (budget or provider)
+  if (d.windows && d.windows.length) {
+    const box = el("div", "fallback-box");
+    box.append(el("div", "fallback-title", "Períodos em local"));
+    d.windows.slice().reverse().forEach((w) => {
+      const when = w.start_ts === w.end_ts
+        ? fmtDateTime(w.start_ts)
+        : `${fmtDateTime(w.start_ts)} – ${fmtDateTime(w.end_ts)}`;
+      const why = w.kind === "budget"
+        ? "budget diário estourado"
+        : `cloud indisponível (${w.reason})`;
+      const line = el("div", "fallback-line " + (w.kind === "budget" ? "budget" : "provider"));
+      line.textContent = `${when} · ${why} · ${w.count} pedido(s) atendido(s) local · você seguiu trabalhando`;
+      box.append(line);
+    });
+    wrap.append(box);
+  }
 
   // Recent decisions table (with filters, score popover, prompt row-expand)
   const panel = el("div", "dash-table-wrap");
