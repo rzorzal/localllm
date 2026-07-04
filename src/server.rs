@@ -661,6 +661,8 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/routing", get(handle_routing_get).post(handle_routing_set))
         .route("/admin/threshold", get(handle_threshold_get).post(handle_threshold_set))
         .route("/admin/budget", get(handle_budget_get).post(handle_budget_set))
+        .route("/admin/breaker", get(handle_breaker_get))
+        .route("/admin/breaker/reset", post(handle_breaker_reset))
         .route("/admin/history-filter", get(handle_history_filter_get).post(handle_history_filter_set))
         .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
         .route("/admin/export", get(handle_export))
@@ -896,6 +898,37 @@ async fn handle_budget_set(
         tracing::warn!("failed to persist budget: {e}");
     }
     handle_budget_get(State(state), headers).await
+}
+
+/// GET /admin/breaker — current circuit-breaker status (token-guarded).
+async fn handle_breaker_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let s = state.breaker.snapshot(crate::route_log::now_secs() as u64);
+    Json(json!({
+        "state": s.state,
+        "reason": s.reason,
+        "next_probe_secs": s.next_probe_secs,
+    }))
+    .into_response()
+}
+
+/// POST /admin/breaker/reset — manually force-close the breaker (retry cloud now).
+async fn handle_breaker_reset(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    state.breaker.reset(crate::route_log::now_secs() as u64);
+    Json(json!({ "ok": true, "state": "closed" })).into_response()
 }
 
 /// GET /admin/integrations — current wiring state (token-guarded).
@@ -2536,5 +2569,25 @@ mod tests {
         let state = wiring_state(breaker.clone());
         super::record_cloud_success(&state, 10);
         assert_eq!(breaker.snapshot(crate::route_log::now_secs() as u64).state, "closed");
+    }
+
+    #[tokio::test]
+    async fn breaker_get_requires_token() {
+        let app = super::make_seeded_test_router(std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        )));
+        let code = crate::axum_test_get_status(app, "/admin/breaker").await;
+        assert_eq!(code, 401);
+    }
+
+    #[tokio::test]
+    async fn breaker_get_reports_closed_by_default() {
+        let app = super::make_seeded_test_router(std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        )));
+        let body = crate::axum_test_get_with_header(
+            app, "/admin/breaker", "x-admin-token", "test-token",
+        ).await;
+        assert_eq!(body["state"], "closed");
     }
 }
