@@ -11,6 +11,7 @@ pub mod history_select;
 pub mod model_manager;
 pub mod profile;
 pub mod budget;
+pub mod breaker;
 pub mod pricing;
 pub mod route;
 pub mod route_log;

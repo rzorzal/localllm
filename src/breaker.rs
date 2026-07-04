@@ -1,0 +1,286 @@
+//! Global in-memory cloud circuit breaker.
+//!
+//! After a cloud request fails, the breaker opens for an exponential cooldown
+//! (30s doubling to a 300s cap). While open, cloud-bound requests are served
+//! locally without touching cloud. When the cooldown elapses the breaker goes
+//! half-open and the next cloud-bound request is allowed through as a single
+//! probe: success closes the breaker (and signals recovery), failure reopens it
+//! with a longer cooldown. A manual `reset` force-closes it (tray / dashboard).
+//!
+//! State is process-global and in-memory only — a restart starts Closed. Time is
+//! injected as `now` (seconds since epoch) so the state machine is deterministic
+//! under test.
+
+use std::sync::Mutex;
+
+use crate::usage::DegradeReason;
+
+/// First cooldown after a trip, in seconds.
+pub const BASE_COOLDOWN_SECS: u64 = 30;
+/// Cooldown ceiling, in seconds.
+pub const MAX_COOLDOWN_SECS: u64 = 300;
+
+/// Verdict for a cloud-bound request consulting the breaker.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// Cloud may proceed (Closed, or Open with cooldown elapsed → this is a probe).
+    Allow,
+    /// Cloud blocked; serve local. `next_probe_in` = seconds until a probe is allowed.
+    Block {
+        reason: DegradeReason,
+        next_probe_in: u64,
+    },
+}
+
+/// Read-only view for the dashboard endpoint.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BreakerSnapshot {
+    pub state: &'static str,          // "closed" | "open" | "half-open"
+    pub reason: Option<&'static str>, // DegradeReason label; None when Closed
+    pub next_probe_secs: Option<u64>, // seconds until probe; None unless Open
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BreakerState {
+    Closed,
+    Open {
+        until: u64,
+        backoff: u64,
+        reason: DegradeReason,
+    },
+    HalfOpen {
+        /// Carried from the Open state so a failed probe doubles from here.
+        backoff: u64,
+        reason: DegradeReason,
+    },
+}
+
+/// Stable short label for a degrade reason (shared with the route-log/dashboard).
+pub fn reason_label(r: DegradeReason) -> &'static str {
+    match r {
+        DegradeReason::Auth => "Auth",
+        DegradeReason::Quota => "Quota",
+        DegradeReason::ServerError => "ServerError",
+        DegradeReason::Offline => "Offline",
+    }
+}
+
+/// Global cloud circuit breaker. Cheap to share behind an `Arc`.
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    inner: Mutex<BreakerState>,
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CircuitBreaker {
+    /// A fresh, Closed breaker.
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(BreakerState::Closed),
+        }
+    }
+
+    /// Consult before a cloud-bound request. In Open with an elapsed cooldown,
+    /// transitions to HalfOpen and returns `Allow` (this request is the probe).
+    pub fn gate(&self, now: u64) -> Gate {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match *st {
+            BreakerState::Closed | BreakerState::HalfOpen { .. } => Gate::Allow,
+            BreakerState::Open {
+                until,
+                backoff,
+                reason,
+            } => {
+                if now >= until {
+                    // Cooldown elapsed → half-open; this caller is the probe.
+                    // Carry backoff so a failed probe doubles from the current value.
+                    *st = BreakerState::HalfOpen { backoff, reason };
+                    Gate::Allow
+                } else {
+                    Gate::Block {
+                        reason,
+                        next_probe_in: until - now,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a failed cloud attempt. Closed→Open(base); HalfOpen→Open(backoff*2
+    /// capped); Open stays Open with its existing schedule.
+    pub fn on_failure(&self, now: u64, reason: DegradeReason) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let next_backoff = match *st {
+            BreakerState::Closed => BASE_COOLDOWN_SECS,
+            // A failed probe (or a direct failure while Open): double the carried
+            // backoff, capped. HalfOpen and Open both carry the current value.
+            BreakerState::HalfOpen { backoff, .. } => (backoff * 2).min(MAX_COOLDOWN_SECS),
+            BreakerState::Open { backoff, .. } => (backoff * 2).min(MAX_COOLDOWN_SECS),
+        };
+        *st = BreakerState::Open {
+            until: now + next_backoff,
+            backoff: next_backoff,
+            reason,
+        };
+    }
+
+    /// Record a successful cloud attempt. →Closed, reset backoff. Returns `true`
+    /// iff the breaker was recovering (Open or HalfOpen) so the caller notifies.
+    pub fn on_success(&self, _now: u64) -> bool {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let was_recovering = !matches!(*st, BreakerState::Closed);
+        *st = BreakerState::Closed;
+        was_recovering
+    }
+
+    /// Manual force-close (tray / dashboard "retry now").
+    pub fn reset(&self, _now: u64) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *st = BreakerState::Closed;
+    }
+
+    /// Read-only snapshot for the dashboard.
+    pub fn snapshot(&self, now: u64) -> BreakerSnapshot {
+        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match *st {
+            BreakerState::Closed => BreakerSnapshot {
+                state: "closed",
+                reason: None,
+                next_probe_secs: None,
+            },
+            BreakerState::HalfOpen { reason, .. } => BreakerSnapshot {
+                state: "half-open",
+                reason: Some(reason_label(reason)),
+                next_probe_secs: None,
+            },
+            BreakerState::Open { until, reason, .. } => BreakerSnapshot {
+                state: "open",
+                reason: Some(reason_label(reason)),
+                next_probe_secs: Some(until.saturating_sub(now)),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usage::DegradeReason;
+
+    #[test]
+    fn closed_allows_and_snapshots_closed() {
+        let b = CircuitBreaker::new();
+        assert_eq!(b.gate(100), Gate::Allow);
+        assert_eq!(
+            b.snapshot(100),
+            BreakerSnapshot { state: "closed", reason: None, next_probe_secs: None }
+        );
+    }
+
+    #[test]
+    fn first_failure_opens_for_base_cooldown() {
+        let b = CircuitBreaker::new();
+        b.on_failure(100, DegradeReason::Quota);
+        assert_eq!(
+            b.gate(100),
+            Gate::Block { reason: DegradeReason::Quota, next_probe_in: BASE_COOLDOWN_SECS }
+        );
+        let s = b.snapshot(100);
+        assert_eq!(s.state, "open");
+        assert_eq!(s.reason, Some("Quota"));
+        assert_eq!(s.next_probe_secs, Some(30));
+    }
+
+    #[test]
+    fn cooldown_elapsed_gate_goes_half_open_and_allows_probe() {
+        let b = CircuitBreaker::new();
+        b.on_failure(100, DegradeReason::ServerError);
+        // Still cooling at t=120.
+        assert!(matches!(b.gate(120), Gate::Block { .. }));
+        // At t=130 (>= until=130) the probe is allowed and state is half-open.
+        assert_eq!(b.gate(130), Gate::Allow);
+        assert_eq!(b.snapshot(130).state, "half-open");
+    }
+
+    #[test]
+    fn failed_probe_reopens_with_doubled_cooldown() {
+        let b = CircuitBreaker::new();
+        b.on_failure(100, DegradeReason::Offline); // open until 130, backoff 30
+        assert_eq!(b.gate(130), Gate::Allow); // half-open probe
+        b.on_failure(130, DegradeReason::Offline); // probe failed → doubled to 60
+        assert_eq!(
+            b.gate(130),
+            Gate::Block { reason: DegradeReason::Offline, next_probe_in: 60 }
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps_at_max() {
+        let b = CircuitBreaker::new();
+        let mut now = 0u64;
+        b.on_failure(now, DegradeReason::ServerError); // 30
+        // Drive repeated failed probes: 30→60→120→240→300(cap)→300.
+        let expected = [60u64, 120, 240, 300, 300];
+        for exp in expected {
+            // advance to the probe window
+            let s = b.snapshot(now);
+            now += s.next_probe_secs.unwrap();
+            assert_eq!(b.gate(now), Gate::Allow); // half-open
+            b.on_failure(now, DegradeReason::ServerError);
+            assert_eq!(b.snapshot(now).next_probe_secs, Some(exp));
+        }
+    }
+
+    #[test]
+    fn successful_probe_closes_and_signals_recovery() {
+        let b = CircuitBreaker::new();
+        b.on_failure(100, DegradeReason::Quota);
+        assert_eq!(b.gate(130), Gate::Allow); // half-open probe
+        assert!(b.on_success(130)); // was recovering → true
+        assert_eq!(b.snapshot(130).state, "closed");
+        // A success while already closed does not re-signal.
+        assert!(!b.on_success(140));
+    }
+
+    #[test]
+    fn success_resets_backoff_to_base() {
+        let b = CircuitBreaker::new();
+        b.on_failure(0, DegradeReason::Quota); // 30
+        assert_eq!(b.gate(30), Gate::Allow);
+        b.on_failure(30, DegradeReason::Quota); // 60
+        assert_eq!(b.gate(90), Gate::Allow);
+        assert!(b.on_success(90)); // recover → reset
+        // Next trip starts from base again.
+        b.on_failure(200, DegradeReason::Quota);
+        assert_eq!(b.snapshot(200).next_probe_secs, Some(BASE_COOLDOWN_SECS));
+    }
+
+    #[test]
+    fn manual_reset_force_closes() {
+        let b = CircuitBreaker::new();
+        b.on_failure(100, DegradeReason::Auth);
+        assert!(matches!(b.gate(105), Gate::Block { .. }));
+        b.reset(105);
+        assert_eq!(b.gate(105), Gate::Allow);
+        assert_eq!(b.snapshot(105).state, "closed");
+    }
+
+    #[test]
+    fn all_reasons_trip_and_label() {
+        for r in [
+            DegradeReason::Auth,
+            DegradeReason::Quota,
+            DegradeReason::ServerError,
+            DegradeReason::Offline,
+        ] {
+            let b = CircuitBreaker::new();
+            b.on_failure(0, r);
+            assert_eq!(b.snapshot(0).reason, Some(reason_label(r)));
+        }
+    }
+}
