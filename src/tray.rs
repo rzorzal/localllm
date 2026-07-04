@@ -407,6 +407,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 policy_for_server,
                 admin_token_for_server,
                 Some(manager_slot_for_server),
+                std::sync::Arc::new(crate::breaker::CircuitBreaker::new()),
             )) {
                 tracing::error!("server exited with error: {e:#}");
                 hard_exit(1);

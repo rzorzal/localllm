@@ -102,7 +102,8 @@ pub async fn run_server_with_ready_and_policy(
     policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
 ) -> anyhow::Result<()> {
     let admin_token = std::sync::Arc::from(crate::server::resolve_admin_token(cfg.admin_token.clone()));
-    run_server_with_ready_policy_token(cfg, ready, policy, admin_token, None).await
+    let breaker = std::sync::Arc::new(crate::breaker::CircuitBreaker::new());
+    run_server_with_ready_policy_token(cfg, ready, policy, admin_token, None, breaker).await
 }
 
 /// Like [`run_server_with_ready_and_policy`] but takes an externally-resolved
@@ -117,6 +118,7 @@ pub async fn run_server_with_ready_policy_token(
     policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
     admin_token: std::sync::Arc<str>,
     manager_out: Option<std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::model_manager::ModelManager>>>>,
+    breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use crate::config::Backend;
@@ -264,6 +266,7 @@ pub async fn run_server_with_ready_policy_token(
             crate::config::KvType::F16 => crate::fit::KvKind::F16,
         },
         cfg.port,
+        breaker,
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
@@ -470,6 +473,7 @@ pub fn router_for_test_with(
         32768,
         crate::fit::KvKind::Q8,
         31415,
+        Arc::new(crate::breaker::CircuitBreaker::new()),
     )
 }
 

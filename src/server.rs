@@ -149,6 +149,29 @@ fn request_summary(req: &ChatRequest) -> (usize, usize) {
     (req.messages.len(), req.tools.len())
 }
 
+/// Decide whether the circuit breaker forces a cloud-bound decision to local.
+/// Returns the tripping `DegradeReason` when the raw decision is cloud, budget
+/// did not already force local, and the breaker gate is closed to cloud (Open,
+/// cooldown not elapsed). Consulting `gate` may consume a half-open probe, so
+/// only call this once per decision and only for cloud-bound decisions.
+fn breaker_gate_block(
+    breaker: &crate::breaker::CircuitBreaker,
+    decision: &crate::route::Decision,
+    budget_forced: bool,
+    now: u64,
+) -> Option<crate::usage::DegradeReason> {
+    if budget_forced {
+        return None;
+    }
+    if !matches!(decision, crate::route::Decision::Cloud(_)) {
+        return None;
+    }
+    match breaker.gate(now) {
+        crate::breaker::Gate::Block { reason, .. } => Some(reason),
+        crate::breaker::Gate::Allow => None,
+    }
+}
+
 /// Returns the routing decision plus the estimated prompt token count (so the
 /// caller can record cloud usage without recomputing).
 fn route_decision(
@@ -187,6 +210,21 @@ fn route_decision(
         raw_decision
     };
 
+    // Circuit breaker: if cloud recently failed, skip it during the cooldown and
+    // serve local. Budget takes precedence (already forced above). A half-open
+    // probe is consumed here only when the decision is cloud-bound.
+    let breaker_block = breaker_gate_block(
+        &state.breaker,
+        &decision,
+        budget_forced,
+        crate::route_log::now_secs() as u64,
+    );
+    let decision = if breaker_block.is_some() {
+        crate::route::Decision::Local
+    } else {
+        decision
+    };
+
     // Log WHY this decision was made: the difficulty score and its inputs, the
     // capability-adjusted threshold, and the outcome — so the log explains each
     // local-vs-cloud choice.
@@ -208,6 +246,8 @@ fn route_decision(
     // local still reads "cloud"). Best-effort — never fails the request.
     let (dest, reason) = if budget_forced {
         ("local", Some("BudgetExceeded".to_string()))
+    } else if breaker_block.is_some() {
+        ("local", Some("CloudDown".to_string()))
     } else {
         match decision {
             crate::route::Decision::Cloud(r) => ("cloud", Some(format!("{r:?}"))),
@@ -567,6 +607,8 @@ pub struct AppState {
     pub port: u16,
     /// Daily cloud-spend tracker for the budget cap.
     pub budget: std::sync::Arc<crate::budget::Budget>,
+    /// Global cloud circuit breaker (skip cloud during cooldown after failures).
+    pub breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -637,6 +679,7 @@ pub fn router(
     requested_ctx_ceiling: u32,
     kv_kind: crate::fit::KvKind,
     port: u16,
+    breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
 ) -> Router {
     let state = Arc::new(AppState {
         manager,
@@ -661,6 +704,7 @@ pub fn router(
             b.seed_from_log(&crate::route_log::read_all(), crate::route_log::now_secs());
             b
         },
+        breaker,
     });
     build_router_inner(state)
 }
@@ -1991,11 +2035,36 @@ fn make_seeded_test_router(
         )),
         port: 31415,
         budget: std::sync::Arc::new(crate::budget::Budget::new()),
+        breaker: std::sync::Arc::new(crate::breaker::CircuitBreaker::new()),
     }))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn breaker_gate_block_forces_local_only_for_cloud_when_open() {
+        use crate::route::{Decision, RouteReason};
+        let b = crate::breaker::CircuitBreaker::new();
+        // Closed → never blocks.
+        assert_eq!(
+            super::breaker_gate_block(&b, &Decision::Cloud(RouteReason::Difficulty), false, 0),
+            None
+        );
+        // Open → blocks a cloud decision with the tripping reason.
+        b.on_failure(0, crate::usage::DegradeReason::Quota);
+        assert_eq!(
+            super::breaker_gate_block(&b, &Decision::Cloud(RouteReason::Difficulty), false, 5),
+            Some(crate::usage::DegradeReason::Quota)
+        );
+        // Open but the decision is Local → nothing to block.
+        assert_eq!(super::breaker_gate_block(&b, &Decision::Local, false, 5), None);
+        // Budget already forced local → breaker defers (budget precedence).
+        assert_eq!(
+            super::breaker_gate_block(&b, &Decision::Cloud(RouteReason::Difficulty), true, 5),
+            None
+        );
+    }
+
     #[test]
     fn record_outcome_saves_cost_only_for_local() {
         let _guard = crate::route_log::ROUTE_LOG_ENV_LOCK
