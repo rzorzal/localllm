@@ -910,7 +910,9 @@ async function paintBreaker(host) {
     : `Cloud indisponível (${b.reason || "erro"})`;
   const line = el("div", "brk-line");
   line.append(dot);
-  line.append(el("span", "brk-text", label));
+  const brkText = el("span", "brk-text");
+  brkText.textContent = label;
+  line.append(brkText);
   if (state === "open" && typeof b.next_probe_secs === "number") {
     line.append(el("span", "brk-eta", `· nova tentativa em ${b.next_probe_secs}s`));
   }
@@ -922,7 +924,7 @@ async function paintBreaker(host) {
       btn.disabled = true;
       try { await api("POST", "/admin/breaker/reset"); toast("Breaker resetado"); }
       catch (e) { toast(e.message, true); }
-      paintBreaker(host);
+      await paintBreaker(host);
     };
     host.append(btn);
   }
