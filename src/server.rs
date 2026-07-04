@@ -200,10 +200,11 @@ fn route_decision(
     let raw_decision = crate::route::decide(&signals, &policy);
     // Budget cap: if enabled and today's cloud spend is over the daily limit,
     // force a cloud decision back to local (until the UTC day rolls over).
+    let now = crate::route_log::now_secs();
     let (budget_enabled, budget_daily) = crate::settings::load_budget();
     let budget_forced = budget_enabled
         && matches!(raw_decision, crate::route::Decision::Cloud(_))
-        && state.budget.is_over(crate::route_log::now_secs(), budget_daily);
+        && state.budget.is_over(now, budget_daily);
     let decision = if budget_forced {
         crate::route::Decision::Local
     } else {
@@ -217,7 +218,7 @@ fn route_decision(
         &state.breaker,
         &decision,
         budget_forced,
-        crate::route_log::now_secs() as u64,
+        now as u64,
     );
     let decision = if breaker_block.is_some() {
         crate::route::Decision::Local
@@ -273,7 +274,7 @@ fn route_decision(
             }
         });
     crate::route_log::append(&crate::route_log::RouteEntry {
-        ts: crate::route_log::now_secs(),
+        ts: now,
         rid: rid.to_string(),
         surface: surface.to_string(),
         dest: dest.to_string(),
@@ -2052,6 +2053,7 @@ mod tests {
         );
         // Open → blocks a cloud decision with the tripping reason.
         b.on_failure(0, crate::usage::DegradeReason::Quota);
+        // now=5 is still within the base cooldown (30s), so the breaker is Open, not half-open
         assert_eq!(
             super::breaker_gate_block(&b, &Decision::Cloud(RouteReason::Difficulty), false, 5),
             Some(crate::usage::DegradeReason::Quota)
