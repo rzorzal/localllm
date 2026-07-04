@@ -803,6 +803,11 @@ async function renderDashboard() {
   bar.append(barActions);
   wrap.append(bar);
 
+  // Circuit-breaker status strip (live cloud availability).
+  const brk = el("div", "brk-strip");
+  wrap.append(brk);
+  paintBreaker(brk);
+
   const m = d.month || { tokens_saved: 0, tokens_if_all_cloud: 0, local_count: 0, cloud_count: 0 };
 
   // Hero — monthly savings
@@ -889,6 +894,38 @@ async function renderDashboard() {
   wrap.append(panel);
 
   view.innerHTML = ""; view.append(wrap);
+}
+
+// Fetch + render the circuit-breaker status strip. Re-fetches on reset.
+async function paintBreaker(host) {
+  host.innerHTML = "";
+  let b;
+  try { b = await api("GET", "/admin/breaker"); }
+  catch (e) { host.append(el("div", "brk-line", "breaker: " + e.message)); return; }
+
+  const state = b.state || "closed";
+  const dot = el("span", "brk-dot brk-" + state);
+  const label = state === "closed" ? "Cloud disponível"
+    : state === "half-open" ? "Testando cloud (probe)…"
+    : `Cloud indisponível (${b.reason || "erro"})`;
+  const line = el("div", "brk-line");
+  line.append(dot);
+  line.append(el("span", "brk-text", label));
+  if (state === "open" && typeof b.next_probe_secs === "number") {
+    line.append(el("span", "brk-eta", `· nova tentativa em ${b.next_probe_secs}s`));
+  }
+  host.append(line);
+
+  if (state !== "closed") {
+    const btn = el("button", "btn", "↻ Tentar cloud agora");
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try { await api("POST", "/admin/breaker/reset"); toast("Breaker resetado"); }
+      catch (e) { toast(e.message, true); }
+      paintBreaker(host);
+    };
+    host.append(btn);
+  }
 }
 
 // Local date+time from unix seconds: "DD/MM HH:MM:SS".

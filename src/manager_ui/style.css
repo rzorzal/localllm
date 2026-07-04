@@ -462,3 +462,15 @@ body {
 .score-pop-line { color: var(--muted); line-height: 1.7; }
 .score-pop-line b { color: var(--txt); }
 .score-pop-why { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--teal); }
+
+/* Circuit-breaker status strip on the dashboard */
+.brk-strip { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: 4px 0 12px; padding: 10px 14px; border-radius: 10px;
+  background: var(--panel); border: 1px solid var(--line); }
+.brk-line { display: flex; align-items: center; gap: 8px; }
+.brk-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.brk-closed { background: var(--green); }
+.brk-open { background: var(--red); }
+.brk-half-open { background: var(--amber); }
+.brk-text { font-weight: 600; }
+.brk-eta { color: var(--muted); font-size: .9em; }
