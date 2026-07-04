@@ -357,6 +357,9 @@ fn log_degrade_fallback(
 /// failure notifies again.
 fn record_cloud_success(state: &AppState, est_prompt_tokens: usize) {
     state.usage.note_success();
+    if state.breaker.on_success(crate::route_log::now_secs() as u64) {
+        crate::usage::notify("localllm — cloud recovered", "Cloud back — resuming.");
+    }
     // Charge the budget with a prompt-only estimate. The model id is not known
     // here (raw passthrough), so this uses the fallback price — a safety-cap
     // estimate, not an exact invoice.
@@ -385,6 +388,9 @@ fn handle_degrade(
     if state.usage.note_degrade() {
         crate::usage::notify("localllm — cloud degraded", reason.message());
     }
+    state
+        .breaker
+        .on_failure(crate::route_log::now_secs() as u64, reason);
     if route_reason == crate::route::RouteReason::ContextOverflow {
         // Prompt cannot fit the local window → no local fallback.
         Some(crate::cloud::degrade_error(reason))
@@ -520,6 +526,7 @@ async fn cascade_or_result(
                         if state.usage.note_degrade() {
                             crate::usage::notify("localllm — cloud degraded", d.message());
                         }
+                        state.breaker.on_failure(crate::route_log::now_secs() as u64, d);
                         tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade cloud degraded ({d:?}) → keeping local result");
                         Ok(result) // serve the (truncated) local answer we already have
                     }
@@ -540,6 +547,7 @@ async fn cascade_or_result(
                         if state.usage.note_degrade() {
                             crate::usage::notify("localllm — cloud degraded", d.message());
                         }
+                        state.breaker.on_failure(crate::route_log::now_secs() as u64, d);
                         Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("local generation failed and cloud degraded ({d:?})")}))).into_response())
                     }
                 }
@@ -2461,5 +2469,72 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_file(&settings_file);
         std::env::remove_var("LOCALLLM_SETTINGS");
+    }
+
+    /// Minimal AppState for wiring tests: TaggedGen engine, Closed-by-default
+    /// breaker (caller may pre-trip). No network, no files touched by the paths
+    /// under test (record_cloud_success and handle_degrade are pure w.r.t. disk).
+    #[cfg(test)]
+    fn wiring_state(breaker: std::sync::Arc<crate::breaker::CircuitBreaker>) -> super::AppState {
+        use crate::model_manager::{EngineBuilder, ModelManager, ModelSpec};
+        let builder: EngineBuilder = Box::new(|_spec| {
+            Box::pin(async {
+                Ok(std::sync::Arc::new(crate::test_support::TaggedGen("switched"))
+                    as std::sync::Arc<dyn super::Generator>)
+            })
+        });
+        let manager = ModelManager::new(
+            std::sync::Arc::new(crate::test_support::TaggedGen("test"))
+                as std::sync::Arc<dyn super::Generator>,
+            ModelSpec { repo: "test".into(), file: "test".into(), quant: None },
+            builder,
+        );
+        super::AppState {
+            manager,
+            model_id: "test-model".to_string(),
+            policy: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::route::Profile::default().policy(),
+            )),
+            local_ctx_window: 1000,
+            usage: std::sync::Arc::new(crate::usage::Usage::new()),
+            cloud_token_alert: 200_000,
+            admin_token: std::sync::Arc::from("test-token"),
+            total_ram_mb: 16384,
+            requested_ctx_ceiling: 32768,
+            kv_kind: crate::fit::KvKind::Q8,
+            tool_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
+            tool_descs: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
+            port: 31415,
+            budget: std::sync::Arc::new(crate::budget::Budget::new()),
+            breaker,
+        }
+    }
+
+    #[test]
+    fn handle_degrade_trips_breaker() {
+        let breaker = std::sync::Arc::new(crate::breaker::CircuitBreaker::new());
+        let state = wiring_state(breaker.clone());
+        // Non-overflow reason → handle_degrade returns None (local can serve) and
+        // the breaker opens.
+        let out = super::handle_degrade(
+            &state,
+            crate::usage::DegradeReason::Quota,
+            crate::route::RouteReason::Difficulty,
+        );
+        assert!(out.is_none());
+        assert_eq!(breaker.snapshot(crate::route_log::now_secs() as u64).state, "open");
+    }
+
+    #[test]
+    fn record_cloud_success_closes_breaker() {
+        let breaker = std::sync::Arc::new(crate::breaker::CircuitBreaker::new());
+        breaker.on_failure(0, crate::usage::DegradeReason::ServerError);
+        let state = wiring_state(breaker.clone());
+        super::record_cloud_success(&state, 10);
+        assert_eq!(breaker.snapshot(crate::route_log::now_secs() as u64).state, "closed");
     }
 }
