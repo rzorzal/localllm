@@ -385,6 +385,12 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
         Arc::new(RwLock::new(crate::settings::resolve_policy(initial_profile)));
     let policy_for_server = policy.clone();
 
+    // Shared circuit breaker: the server reads/trips it per request; the tray
+    // "Retry cloud now" item force-closes it. Same Arc on both sides.
+    let breaker: Arc<crate::breaker::CircuitBreaker> =
+        Arc::new(crate::breaker::CircuitBreaker::new());
+    let breaker_for_server = breaker.clone();
+
     // Clone the token for the server thread; keep the original for Task 3's window.
     let admin_token_for_server = admin_token.clone();
 
@@ -407,7 +413,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 policy_for_server,
                 admin_token_for_server,
                 Some(manager_slot_for_server),
-                std::sync::Arc::new(crate::breaker::CircuitBreaker::new()),
+                breaker_for_server,
             )) {
                 tracing::error!("server exited with error: {e:#}");
                 hard_exit(1);
@@ -437,6 +443,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let mut quit_id: Option<tray_icon::menu::MenuId> = None;
     let mut logs_id: Option<tray_icon::menu::MenuId> = None;
     let mut url_id: Option<tray_icon::menu::MenuId> = None;
+    let mut retry_cloud_id: Option<tray_icon::menu::MenuId> = None;
     // Kept so we can live-update the status text from the server/switch state.
     // last_status avoids redundant set_text on every poll tick.
     let mut status_handle: Option<MenuItem> = None;
@@ -468,6 +475,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
 
     // Poll interval for the menu-event channel.
     let poll_interval = Duration::from_millis(100);
+
+    let breaker_for_menu = breaker.clone();
 
     event_loop.run(move |event, target, control_flow| {
         // Wake up periodically to poll the menu-event channel.
@@ -513,6 +522,9 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let quit_item = MenuItem::new("⏻  Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
+                let retry_cloud_item = MenuItem::new("↻  Retry cloud now", true, None);
+                retry_cloud_id = Some(retry_cloud_item.id().clone());
+
                 // Routing is now chosen from the Config page; the tray shows the
                 // current profile as a read-only line, refreshed each poll tick.
                 let routing_line = MenuItem::new(
@@ -540,6 +552,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&backend_line).expect("append backend");
                 menu.append(&PredefinedMenuItem::separator()).expect("sep2");
                 menu.append(&routing_line).expect("append routing line");
+                menu.append(&retry_cloud_item).expect("append retry cloud item");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator");
                 menu.append(&wired_line).expect("append wired line");
                 menu.append(&PredefinedMenuItem::separator()).expect("append separator2");
@@ -632,6 +645,9 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     } else if url_id.as_ref() == Some(&menu_event.id) {
                         platform::copy_to_clipboard(&url_for_tray);
                         tracing::info!("copied to clipboard: {url_for_tray}");
+                    } else if retry_cloud_id.as_ref() == Some(&menu_event.id) {
+                        breaker_for_menu.reset(crate::route_log::now_secs() as u64);
+                        tracing::info!("circuit breaker manually reset via tray");
                     } else if config_home_id.as_ref() == Some(&menu_event.id)
                         || config_models_id.as_ref() == Some(&menu_event.id)
                         || config_tools_id.as_ref() == Some(&menu_event.id)
