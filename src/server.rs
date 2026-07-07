@@ -149,6 +149,42 @@ fn request_summary(req: &ChatRequest) -> (usize, usize) {
     (req.messages.len(), req.tools.len())
 }
 
+/// Re-ask detector tunables — named so Fase D2 can calibrate them.
+const REASK_JACCARD: f64 = 0.6;
+const REASK_WINDOW_SECS: i64 = 120;
+const REASK_BUFFER_CAP: usize = 8;
+
+/// One recent LOCAL decision's prompt fingerprint for re-ask detection.
+#[derive(Debug, Clone)]
+pub struct RecentPrompt {
+    pub rid: String,
+    pub ts: i64,
+    pub tokens: std::collections::BTreeSet<String>,
+}
+
+/// Scan newest-first for a prior prompt whose token set is Jaccard-similar
+/// (> REASK_JACCARD) within REASK_WINDOW_SECS. Returns the matched rid.
+fn detect_reask(
+    buf: &std::collections::VecDeque<RecentPrompt>,
+    tokens: &std::collections::BTreeSet<String>,
+    now: i64,
+) -> Option<String> {
+    if tokens.is_empty() {
+        return None;
+    }
+    for old in buf {
+        if now - old.ts >= REASK_WINDOW_SECS || old.tokens.is_empty() {
+            continue;
+        }
+        let inter = tokens.intersection(&old.tokens).count() as f64;
+        let union = tokens.union(&old.tokens).count() as f64;
+        if union > 0.0 && inter / union > REASK_JACCARD {
+            return Some(old.rid.clone());
+        }
+    }
+    None
+}
+
 /// Decide whether the circuit breaker forces a cloud-bound decision to local.
 /// Returns the tripping `DegradeReason` when the raw decision is cloud, budget
 /// did not already force local, and the breaker gate is closed to cloud (Open,
@@ -290,6 +326,37 @@ fn route_decision(
         prompt_snippet,
         ..Default::default()
     });
+
+    // Re-ask detection: judge the PREVIOUS local decision if this request is a
+    // near-duplicate sent shortly after it, then remember this request when it
+    // itself routes local. Uses the latest user turn only.
+    {
+        let last_user_text = internal
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::api::common::Role::User)
+            .and_then(|m| m.text.clone())
+            .unwrap_or_default();
+        let tokens: std::collections::BTreeSet<String> =
+            crate::history_select::tokenize(&last_user_text)
+                .into_iter()
+                .filter(|t| t.len() >= 2)
+                .collect();
+        let mut map = state.recent_prompts.lock().unwrap_or_else(|e| e.into_inner());
+        let buf = map.entry(surface.to_string()).or_default();
+        if let Some(prev_rid) = detect_reask(buf, &tokens, now) {
+            crate::route_log::append_feedback(&crate::route_log::FeedbackEntry {
+                rid: prev_rid,
+                ts: now,
+                signal: "reask".to_string(),
+            });
+        }
+        if !matches!(decision, crate::route::Decision::Cloud(_)) {
+            buf.push_front(RecentPrompt { rid: rid.to_string(), ts: now, tokens });
+            buf.truncate(REASK_BUFFER_CAP);
+        }
+    }
 
     (decision, prompt_tokens)
 }
@@ -639,6 +706,10 @@ pub struct AppState {
     pub budget: std::sync::Arc<crate::budget::Budget>,
     /// Global cloud circuit breaker (skip cloud during cooldown after failures).
     pub breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
+    /// Per-surface ring of recent LOCAL decisions (rid, ts, prompt token set)
+    /// for re-ask detection. In-memory; cap REASK_BUFFER_CAP per surface.
+    pub recent_prompts: std::sync::Arc<std::sync::Mutex<
+        std::collections::BTreeMap<String, std::collections::VecDeque<RecentPrompt>>>>,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -737,6 +808,9 @@ pub fn router(
             b
         },
         breaker,
+        recent_prompts: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        )),
     });
     build_router_inner(state)
 }
@@ -2104,6 +2178,9 @@ fn make_seeded_test_router(
         port: 31415,
         budget: std::sync::Arc::new(crate::budget::Budget::new()),
         breaker: std::sync::Arc::new(crate::breaker::CircuitBreaker::new()),
+        recent_prompts: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::new(),
+        )),
     }))
 }
 
@@ -2570,6 +2647,9 @@ mod tests {
             port: 31415,
             budget: std::sync::Arc::new(crate::budget::Budget::new()),
             breaker,
+            recent_prompts: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
         }
     }
 
@@ -2673,5 +2753,54 @@ mod tests {
 
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tokset(s: &str) -> std::collections::BTreeSet<String> {
+        crate::history_select::tokenize(s).into_iter().filter(|t| t.len() >= 2).collect()
+    }
+
+    #[test]
+    fn detect_reask_matches_similar_recent_prompt() {
+        use std::collections::VecDeque;
+        let mut buf: VecDeque<super::RecentPrompt> = VecDeque::new();
+        buf.push_front(super::RecentPrompt { rid: "old1".into(), ts: 1000,
+            tokens: tokset("como faço deploy do serviço no kubernetes") });
+        // Near-identical re-ask 30s later → match.
+        let t = tokset("como faço deploy do serviço no kubernetes agora");
+        assert_eq!(super::detect_reask(&buf, &t, 1030), Some("old1".to_string()));
+        // Different topic → no match.
+        let t2 = tokset("escreva um poema sobre gatos persas");
+        assert_eq!(super::detect_reask(&buf, &t2, 1030), None);
+        // Same prompt but 3 minutes later → outside window.
+        assert_eq!(super::detect_reask(&buf, &t, 1000 + 181), None);
+        // Empty token set never matches.
+        let empty = std::collections::BTreeSet::new();
+        assert_eq!(super::detect_reask(&buf, &empty, 1030), None);
+    }
+
+    #[test]
+    fn detect_reask_first_match_wins() {
+        use std::collections::VecDeque;
+        let mut buf: VecDeque<super::RecentPrompt> = VecDeque::new();
+        // Newest first: both similar; the front (newest) must win.
+        buf.push_front(super::RecentPrompt { rid: "older".into(), ts: 990,
+            tokens: tokset("erro de compilação no módulo de rede") });
+        buf.push_front(super::RecentPrompt { rid: "newer".into(), ts: 1000,
+            tokens: tokset("erro de compilação no módulo de rede") });
+        let t = tokset("erro de compilação no módulo de rede ainda");
+        assert_eq!(super::detect_reask(&buf, &t, 1010), Some("newer".to_string()));
+    }
+
+    #[test]
+    fn reask_buffer_only_keeps_local_decisions_and_caps() {
+        use std::collections::VecDeque;
+        let mut buf: VecDeque<super::RecentPrompt> = VecDeque::new();
+        for i in 0..12 {
+            buf.push_front(super::RecentPrompt { rid: format!("r{i}"), ts: 1000 + i,
+                tokens: tokset(&format!("prompt número {i} totalmente diferente dos outros assunto{i}")) });
+            buf.truncate(super::REASK_BUFFER_CAP);
+        }
+        assert_eq!(buf.len(), super::REASK_BUFFER_CAP);
+        assert_eq!(buf.front().unwrap().rid, "r11"); // newest kept
     }
 }

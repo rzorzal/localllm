@@ -20,7 +20,7 @@ const W_RECENCY: f64 = 0.3;
 const MMR_LAMBDA: f64 = 0.7;
 
 /// Lowercase alphanumeric tokenization (splits on any non-alphanumeric char).
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(|t| t.to_lowercase())
