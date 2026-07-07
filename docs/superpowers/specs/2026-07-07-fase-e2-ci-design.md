@@ -49,11 +49,26 @@ jobs:
 
 - Runner: `ubuntu-latest`.
 - Steps: checkout → install Linux system deps (see below) → `rustup` with
-  `rustfmt` + `clippy` → `Swatinem/rust-cache` → `cargo fmt --all --check` →
-  `cargo clippy --workspace --all-targets --features cpu -- -D warnings`.
+  `rustfmt` + `clippy` → `Swatinem/rust-cache` → `cargo fmt --all --check`
+  (**blocking**) → `cargo clippy --workspace --all-targets --features cpu`
+  (**non-blocking / informational — NO `-D warnings`**).
 - Backend: `cpu` (clippy must compile the crate; cpu needs no GPU/toolkit).
 - Rationale: `fmt --check` is instant and OS-agnostic; clippy needs a compile,
   so it rides the same cheap Linux/cpu runner rather than a costly macOS one.
+- **fmt is blocking, clippy is not** (user decision): the tree is brought to a
+  rustfmt baseline once (see below) so `fmt --check` stays green; clippy runs
+  without `-D warnings`, surfacing its ~12 current warnings in the log without
+  failing CI. This deliberately avoids touching `server.rs` lock scopes (the 7
+  `await_holding_lock` warnings) or refactoring `too_many_arguments` in E2 — a
+  real clippy cleanup is a separate future effort.
+
+### fmt baseline (one-time, part of E2)
+
+The codebase has never been rustfmt-formatted: `cargo fmt --all --check`
+currently fails in ~35 files. E2 applies a single `cargo fmt --all` reformat in
+a dedicated `style:` commit so the blocking fmt gate is green from the first
+push. This is a large but purely mechanical diff with no behavior change; the
+test suite is re-run after to confirm.
 
 ### Job: `build-test` (matrix, `fail-fast: false`)
 
@@ -115,22 +130,23 @@ slow; this is accepted, not solved, in E2.
 
 ## Local Deliverable (verifiable on the macOS dev box)
 
-Before the workflow can be green, the code must satisfy the lint gate. This is
-runnable locally and is part of E2:
-- `cargo fmt --all --check` → clean (apply `cargo fmt --all` if not).
-- `cargo clippy --workspace --all-targets --features metal -- -D warnings`
-  (metal locally; the gate uses cpu, but clippy findings are backend-independent
-  for this codebase's Rust) → clean. Fix every warning so the CI lint job is
-  green-ready before the first push.
-- The existing test suite stays green (E1 already verified 298/0).
+Before the workflow can be green, the code must satisfy the **blocking** part of
+the lint gate (fmt). Runnable locally and part of E2:
+- Apply `cargo fmt --all`, then confirm `cargo fmt --all --check` → clean.
+- Re-run the full test suite → still green (fmt is mechanical; E1 verified
+  298/0). This guards against fmt accidentally changing a doctest/macro layout.
+- clippy is **not** cleaned: the CI clippy step is informational (no
+  `-D warnings`), so the ~12 existing warnings are left in place and simply
+  reported. No local clippy fixing is required in E2.
 
 The YAML itself cannot be executed locally; its correctness is validated by the
 user's first push (flagged expectation, not a gap E2 can close).
 
 ## Error Handling / Failure Modes
 
-- **fmt/clippy failures:** block via `-D warnings`; fixed locally in E2's
-  cleanup step so the initial push is not red on lint.
+- **fmt failures:** the fmt gate is blocking; the one-time reformat baseline
+  makes it green from the first push. clippy is non-blocking (no `-D`), so its
+  warnings never turn CI red.
 - **A matrix cell fails to build on first push:** `fail-fast: false` keeps the
   other cells reporting; the user iterates (most likely apt package names or the
   CUDA version). Expected, not a defect in E2's deliverable.
@@ -140,7 +156,8 @@ user's first push (flagged expectation, not a gap E2 can close).
 ## Testing Strategy
 
 E2 is CI configuration; its "tests" are:
-- Local: fmt clean, clippy `-D warnings` clean, suite green (all runnable now).
+- Local: `cargo fmt --all --check` clean (after the baseline reformat), suite
+  green. clippy is informational only — not required to be clean.
 - Post-push (user): the five matrix cells go green. E2's authored deliverable is
   the workflow + a lint-clean tree; achieving all-green across runners is the
   iteration the user drives on their repo.
