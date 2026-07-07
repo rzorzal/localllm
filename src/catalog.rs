@@ -258,6 +258,23 @@ pub fn active_params_b(repo: &str, file: &str) -> f32 {
     params_b_from_name(repo, file).unwrap_or(0.0)
 }
 
+/// Nominal parameter size (billions) for a compact model key
+/// (`model_ctx_key(repo,file)` = `"{repo}/{file}"`). The key is not reliably
+/// splittable back to (repo,file) because `repo` itself contains `/`, so this
+/// resolves without splitting: a CATALOG entry whose `"{repo}/{file}"` equals
+/// the key wins; else scan the whole key for a `NNb` size token; else 0.0.
+pub fn params_b_for_key(key: &str) -> f32 {
+    if let Some(e) = CATALOG
+        .iter()
+        .find(|e| format!("{}/{}", e.repo, e.file) == key)
+    {
+        return e.params_b;
+    }
+    // Reuse the same digit+"b" scan the name parser uses by passing the whole
+    // key as the "repo" arg and an empty file.
+    params_b_from_name(key, "").unwrap_or(0.0)
+}
+
 /// Map a `KvType` to the fit-math `KvKind` and a lowercase tag.
 fn kv_to_kind(t: crate::config::KvType) -> (crate::fit::KvKind, &'static str) {
     match t {
@@ -651,5 +668,19 @@ mod tests {
         assert_eq!(m.size_mb, sel.size_mb);
         assert_eq!(m.est_ram_mb, sel.est_ram_mb);
         assert_eq!(m.fit, sel.fit);
+    }
+
+    #[test]
+    fn params_b_for_key_catalog_then_scan_then_zero() {
+        // A real CATALOG entry: key = "{repo}/{file}".
+        let key = format!(
+            "{}/{}",
+            "Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-instruct-q4_k_m.gguf"
+        );
+        assert_eq!(super::params_b_for_key(&key), 3.0);
+        // Not in catalog but the key string carries a size token.
+        assert_eq!(super::params_b_for_key("foo/bar-13b.gguf"), 13.0);
+        // Unknown → 0.0.
+        assert_eq!(super::params_b_for_key("foo/bar-model.gguf"), 0.0);
     }
 }
