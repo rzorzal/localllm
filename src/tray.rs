@@ -302,6 +302,28 @@ mod tests {
             "🔴 Switch failed"
         );
     }
+
+    use super::server_failed_label;
+
+    #[test]
+    fn server_failed_label_prefixes_first_line() {
+        assert_eq!(server_failed_label("boom"), "🔴 Server failed — boom");
+        // Only the first line survives (a multi-line error stays one menu row).
+        assert_eq!(
+            server_failed_label("line1\nline2"),
+            "🔴 Server failed — line1"
+        );
+    }
+
+    #[test]
+    fn server_failed_label_clips_long_reason() {
+        let long = "x".repeat(200);
+        let out = server_failed_label(&long);
+        assert!(out.starts_with("🔴 Server failed — "));
+        assert!(out.ends_with('…'));
+        // Clipped: prefix + 80 kept chars + ellipsis, well under the raw 200.
+        assert!(out.chars().count() < 120);
+    }
 }
 
 /// Format the tray "Model:" line from the active model spec. Mirrors the
@@ -328,6 +350,23 @@ fn status_menu_label(s: &crate::model_manager::SwitchStatus) -> String {
         "error" => "🔴 Switch failed".to_string(),
         _ => "🟢 Running".to_string(),
     }
+}
+
+/// Format the tray status line for a server-thread failure (e.g. the initial
+/// model failed to load). Collapses to the first line and clips so a long HTTP
+/// error doesn't blow up the menu width. Lets the menu-bar app stay alive with
+/// a visible reason instead of the whole process dying.
+fn server_failed_label(err: &str) -> String {
+    const MAX: usize = 80;
+    let first = err.lines().next().unwrap_or(err);
+    let short: String = if first.chars().count() > MAX {
+        let mut s: String = first.chars().take(MAX).collect();
+        s.push('…');
+        s
+    } else {
+        first.to_string()
+    };
+    format!("🔴 Server failed — {short}")
 }
 
 /// Format the tray "Wired:" sub-line from persisted integration state.
@@ -416,6 +455,13 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
         Arc::new(std::sync::OnceLock::new());
     let manager_slot_for_server = manager_slot.clone();
 
+    // Shared slot the server thread fills if it exits with an error (e.g. the
+    // initial model fails to load). The event loop reads it to surface the
+    // failure in the tray status line instead of the process dying — a bad
+    // saved model must not silently kill the whole menu-bar app.
+    let server_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let server_error_for_thread = server_error.clone();
+
     // ---- Spawn server on a background thread with its own tokio runtime ----
     std::thread::Builder::new()
         .name("localllm-server".to_string())
@@ -429,8 +475,14 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 Some(manager_slot_for_server),
                 breaker_for_server,
             )) {
-                tracing::error!("server exited with error: {e:#}");
-                hard_exit(1);
+                let msg = format!("{e:#}");
+                tracing::error!("server exited with error: {msg}");
+                // Do NOT hard_exit — that would tear down the main-thread event
+                // loop and the tray with it. Record the failure so the event
+                // loop can show it; the user can then read it and quit cleanly.
+                *server_error_for_thread
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(msg);
             }
         })
         .expect("failed to spawn server thread");
@@ -625,6 +677,21 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                             }
                             last_model = Some(st.current);
                         }
+                    }
+                } else if let Some(err) = server_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                {
+                    // Server thread errored before binding (e.g. model load
+                    // failed). Surface it so the tray shows a reason instead of
+                    // sitting on "Loading…" forever or vanishing.
+                    let label = server_failed_label(&err);
+                    if last_status.as_deref() != Some(label.as_str()) {
+                        if let Some(s) = &status_handle {
+                            s.set_text(&label);
+                        }
+                        last_status = Some(label);
                     }
                 }
 
