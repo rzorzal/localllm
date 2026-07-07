@@ -1,3 +1,13 @@
+// Backend selection guard. On Linux/Windows a build must pick an inference
+// backend explicitly; without one the native engines would fail to link with
+// an inscrutable error. macOS is exempt: its target dependency table
+// (Cargo.toml) always supplies Metal, so a plain `cargo build` needs no flag.
+#[cfg(all(not(target_os = "macos"), not(feature = "cuda"), not(feature = "cpu")))]
+compile_error!(
+    "No inference backend selected. On Linux/Windows build with \
+     `--features cuda` or `--features cpu`. macOS enables Metal automatically."
+);
+
 pub mod api;
 pub mod catalog;
 pub mod catalog_variants;
