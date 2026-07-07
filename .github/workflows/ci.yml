@@ -38,6 +38,12 @@ jobs:
   build-test:
     name: ${{ matrix.os }} / ${{ matrix.backend }}
     runs-on: ${{ matrix.os }}
+    # candle-kernels (mistralrs CUDA dep) runs nvidia-smi at build time to detect
+    # the GPU compute capability; hosted runners have no GPU, so we pin it. Only
+    # the cuda cells consume this; cpu/metal cells ignore it. 75 = Turing, a broad
+    # baseline (kernels forward-JIT to newer archs). Tune if a newer floor is wanted.
+    env:
+      CUDA_COMPUTE_CAP: '75'
     strategy:
       fail-fast: false
       matrix:

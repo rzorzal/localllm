@@ -57,6 +57,16 @@ mistralrs = { version = "0.8", default-features = false, features = ["metal"] }
 llama-cpp-2 = { version = "0.1.150", default-features = false, features = ["metal", "common", "openmp"] }
 llama-cpp-sys-2 = { version = "0.1.150", default-features = false, features = ["metal", "common", "openmp"] }
 
+# The GUI stack (tao / tray-icon / muda) is declared with default-features = false
+# in [dependencies], which is fine on macOS (its backend is not feature-gated) but
+# strips the Linux GTK/X11 backend — muda/tao then fail to compile there
+# (`unresolved import self::platform`). Restore the Linux backend features here so
+# the tray/webview build on Linux. Needs libgtk-3-dev / libayatana-appindicator3-dev
+# / libwebkit2gtk (installed in CI). macOS keeps these OFF (no GTK).
+[target.'cfg(target_os = "linux")'.dependencies]
+tao = { version = "0.35", default-features = false, features = ["rwh_06", "x11", "dbus"] }
+tray-icon = { version = "0.24", default-features = false, features = ["gtk", "libxdo"] }
+
 [dev-dependencies]
 wiremock = "0.6"
 
