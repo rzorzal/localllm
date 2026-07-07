@@ -880,6 +880,27 @@ async function renderDashboard() {
     `cloud: ${fb.cloud_trivial}/${fb.cloud_total} trivial (${pctCloud})`));
   wrap.append(acc);
 
+  // Per-model effective capability (informational)
+  const caps = d.model_capabilities || [];
+  if (caps.length) {
+    const capCard = el("div", "dash-card");
+    capCard.append(el("div", "dash-card-head", "CAPACIDADE EFETIVA POR MODELO"));
+    caps.forEach((c) => {
+      const row = el("div", "cap-row");
+      const name = el("span", "cap-model");
+      name.textContent = c.model;
+      row.append(name);
+      const stat = el("span", "cap-stat");
+      const arrow = c.effective_b < c.nominal_b ? "↓" : (c.effective_b > c.nominal_b ? "↑" : "=");
+      stat.textContent =
+        `${c.local_total} locais · ${Math.round(c.flagged_rate * 100)}% flag · `
+        + `nominal ${c.nominal_b}b ${arrow} efetivo ${c.effective_b.toFixed(1)}b`;
+      row.append(stat);
+      capCard.append(row);
+    });
+    wrap.append(capCard);
+  }
+
   // Threshold suggestion banner (if available)
   if (d.suggestion) {
     const sug = el("div", "suggestion-banner suggestion-" + d.suggestion.direction);

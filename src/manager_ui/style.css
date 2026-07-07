@@ -509,3 +509,11 @@ body {
 .suggestion-text {
   flex: 1;
 }
+
+/* Per-model effective capability card */
+.cap-row { display: flex; justify-content: space-between; gap: 12px;
+  padding: 4px 0; border-top: 1px solid var(--line); font-size: .9em; }
+.cap-row:first-of-type { border-top: none; }
+.cap-model { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; max-width: 45%; }
+.cap-stat { text-align: right; }
