@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      title:
+        description: Release title
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --locked
+      - name: Compute + apply version bump
+        id: bump
+        run: |
+          cur=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          IFS=. read -r MA MI PA <<< "$cur"
+          case "${{ inputs.bump }}" in
+            major) MA=$((MA+1)); MI=0; PA=0 ;;
+            minor) MI=$((MI+1)); PA=0 ;;
+            patch) PA=$((PA+1)) ;;
+          esac
+          NEW="$MA.$MI.$PA"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+          cargo set-version "$NEW"
+      - name: Generate CHANGELOG.md
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --tag ${{ steps.bump.outputs.tag }} --output CHANGELOG.md
+      - name: Generate release notes body
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --tag ${{ steps.bump.outputs.tag }} --unreleased --strip all --output RELEASE_NOTES.md
+      - name: Append unsigned-binary note to release body
+        run: |
+          cat >> RELEASE_NOTES.md <<'NOTE'
+
+          ---
+          **macOS:** the app is unsigned. On first launch, right-click
+          `localllm.app` → **Open** to bypass Gatekeeper.
+          **Windows:** the binary is unsigned; dismiss the SmartScreen prompt via
+          **More info → Run anyway**.
+          NOTE
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+      - name: Commit bump + tag + push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore(release): ${{ steps.bump.outputs.tag }} [skip ci]"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "${{ steps.bump.outputs.tag }}"
+          git push origin HEAD
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            backend: metal
+            asset: macos-arm64
+            kind: app
+          - os: ubuntu-latest
+            backend: cpu
+            asset: linux-x64-cpu
+            kind: tar
+          - os: ubuntu-latest
+            backend: cuda
+            asset: linux-x64-cuda
+            kind: tar
+          - os: windows-latest
+            backend: cpu
+            asset: windows-x64-cpu
+            kind: zip
+          - os: windows-latest
+            backend: cuda
+            asset: windows-x64-cuda
+            kind: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev libxdo-dev cmake libclang-dev
+      - name: Install CUDA toolkit
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.5.0'
+          method: network
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.os }}-${{ matrix.backend }}
+      # macOS: build the .app bundle (build-app.sh runs cargo build --features metal).
+      - name: Build macOS app
+        if: matrix.kind == 'app'
+        run: bash scripts/build-app.sh
+      # Linux/Windows: build the release binary.
+      - name: Build binary
+        if: matrix.kind != 'app'
+        run: cargo build --release --features ${{ matrix.backend }}
+      # Package per OS.
+      - name: Package macOS app (zip)
+        if: matrix.kind == 'app'
+        run: |
+          cd target
+          zip -r "localllm-v${{ needs.prepare.outputs.version }}-${{ matrix.asset }}.zip" localllm.app
+      - name: Package Linux binary (tar.gz)
+        if: matrix.kind == 'tar'
+        run: |
+          tar czf "localllm-v${{ needs.prepare.outputs.version }}-${{ matrix.asset }}.tar.gz" -C target/release localllm
+      - name: Package Windows binary (zip)
+        if: matrix.kind == 'zip'
+        run: |
+          Compress-Archive -Path target/release/localllm.exe -DestinationPath "localllm-v${{ needs.prepare.outputs.version }}-${{ matrix.asset }}.zip"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            target/localllm-v${{ needs.prepare.outputs.version }}-${{ matrix.asset }}.zip
+            localllm-v${{ needs.prepare.outputs.version }}-${{ matrix.asset }}.tar.gz
+            localllm-v${{ needs.prepare.outputs.version }}-${{ matrix.asset }}.zip
+          if-no-files-found: ignore
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.prepare.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.title }}" \
+            --notes-file dist/release-notes/RELEASE_NOTES.md \
+            $(find dist -type f ! -name RELEASE_NOTES.md)
