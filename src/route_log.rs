@@ -305,7 +305,9 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashbo
     };
     // Fallback windows: group contiguous same-reason local decisions.
     let mut flagged: Vec<&RouteEntry> = decisions.iter().filter(|d| {
-        d.degrade_reason.is_some() || d.reason.as_deref() == Some("BudgetExceeded")
+        d.degrade_reason.is_some()
+            || d.reason.as_deref() == Some("BudgetExceeded")
+            || d.reason.as_deref() == Some("CloudDown")
     }).copied().collect();
     flagged.sort_by_key(|d| d.ts);
     let mut windows: Vec<FallbackWindow> = Vec::new();
@@ -313,6 +315,9 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashbo
     for d in flagged {
         let (kind, reason) = if let Some(r) = &d.degrade_reason {
             ("provider", r.clone())
+        } else if d.reason.as_deref() == Some("CloudDown") {
+            // Breaker-forced local (cloud in cooldown) — a provider outage window.
+            ("provider", "CloudDown".to_string())
         } else {
             ("budget", "BudgetExceeded".to_string())
         };
@@ -448,12 +453,17 @@ mod tests {
                 dest: "local".into(), degrade_reason: Some("Quota".into()), ..Default::default() }),
             LogLine::Decision(RouteEntry { ts: now - 100, rid: "3".into(), surface: "openai".into(),
                 dest: "local".into(), reason: Some("BudgetExceeded".into()), ..Default::default() }),
+            LogLine::Decision(RouteEntry { ts: now - 50, rid: "4".into(), surface: "openai".into(),
+                dest: "local".into(), reason: Some("CloudDown".into()), ..Default::default() }),
         ];
         let d = build_dashboard(&lines, now, 10);
-        assert_eq!(d.windows.len(), 2);
-        let prov = d.windows.iter().find(|w| w.kind == "provider").unwrap();
+        assert_eq!(d.windows.len(), 3);
+        let prov = d.windows.iter().find(|w| w.reason == "Quota").unwrap();
+        assert_eq!(prov.kind, "provider");
         assert_eq!(prov.count, 2);
-        assert_eq!(prov.reason, "Quota");
+        let cd = d.windows.iter().find(|w| w.reason == "CloudDown").unwrap();
+        assert_eq!(cd.kind, "provider");
+        assert_eq!(cd.count, 1);
         let bud = d.windows.iter().find(|w| w.kind == "budget").unwrap();
         assert_eq!(bud.count, 1);
     }

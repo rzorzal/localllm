@@ -87,6 +87,11 @@ impl CircuitBreaker {
 
     /// Consult before a cloud-bound request. In Open with an elapsed cooldown,
     /// transitions to HalfOpen and returns `Allow` (this request is the probe).
+    ///
+    /// While HalfOpen every caller gets `Allow`, so under concurrency several
+    /// simultaneous probes may hit cloud within one half-open window. This is
+    /// intentional: favoring self-healing convergence over a strict single
+    /// probe means a dropped probe can never wedge the breaker (no reaper).
     pub fn gate(&self, now: u64) -> Gate {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match *st {
@@ -112,15 +117,18 @@ impl CircuitBreaker {
     }
 
     /// Record a failed cloud attempt. Closed→Open(base); HalfOpen→Open(backoff*2
-    /// capped); Open stays Open with its existing schedule.
+    /// capped); already Open → no-op (keeps its existing schedule).
     pub fn on_failure(&self, now: u64, reason: DegradeReason) {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let next_backoff = match *st {
             BreakerState::Closed => BASE_COOLDOWN_SECS,
-            // A failed probe (or a direct failure while Open): double the carried
-            // backoff, capped. HalfOpen and Open both carry the current value.
+            // A failed probe: double the carried backoff, capped.
             BreakerState::HalfOpen { backoff, .. } => (backoff * 2).min(MAX_COOLDOWN_SECS),
-            BreakerState::Open { backoff, .. } => (backoff * 2).min(MAX_COOLDOWN_SECS),
+            // Already Open: keep the existing schedule. A stray failure while
+            // Open (e.g. an ungated cascade escalation) must not push `until`
+            // out, or the breaker could starve of probes during sustained
+            // cascade traffic. The half-open probe owns backoff escalation.
+            BreakerState::Open { .. } => return,
         };
         *st = BreakerState::Open {
             until: now + next_backoff,
@@ -268,6 +276,19 @@ mod tests {
         b.reset(105);
         assert_eq!(b.gate(105), Gate::Allow);
         assert_eq!(b.snapshot(105).state, "closed");
+    }
+
+    #[test]
+    fn failure_while_open_keeps_schedule() {
+        let b = CircuitBreaker::new();
+        b.on_failure(0, DegradeReason::Quota); // Open, until=30, backoff=30
+        let before = b.snapshot(10);
+        assert_eq!(before.next_probe_secs, Some(20)); // 30 - 10
+        // A stray failure while still Open (no gate/half-open first) is a no-op.
+        b.on_failure(10, DegradeReason::ServerError);
+        let after = b.snapshot(10);
+        assert_eq!(after.next_probe_secs, Some(20)); // unchanged: until still 30
+        assert_eq!(after.reason, Some("Quota")); // original reason retained
     }
 
     #[test]
