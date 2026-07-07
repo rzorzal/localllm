@@ -83,11 +83,18 @@ pub fn difficulty_score(s: &Signals) -> f64 {
 /// cloud). Unknown capability (`0.0`) is neutral. Clamped to ±0.3.
 pub fn capability_adjustment(cap_b: f32) -> f64 {
     if cap_b > 0.0 {
-        ((cap_b - 7.0) as f64 * 0.03).clamp(-0.3, 0.3)
+        ((cap_b - CAPABILITY_PIVOT_B) as f64 * CAPABILITY_SLOPE).clamp(-0.3, 0.3)
     } else {
         0.0
     }
 }
+
+/// Neutral model size (billions) at which the capability adjustment is zero.
+pub const CAPABILITY_PIVOT_B: f32 = 7.0;
+/// Threshold shift per 1 B of capability above/below the pivot. Exported so
+/// consumers that invert this mapping (e.g. the dashboard's effective-capability
+/// estimate) reference the single source of truth instead of duplicating 0.03.
+pub const CAPABILITY_SLOPE: f64 = 0.03;
 
 /// The profile's escalation threshold after the capability adjustment, clamped
 /// to `[0, 1]`. A request whose difficulty score exceeds this goes to cloud.

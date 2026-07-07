@@ -269,8 +269,9 @@ pub struct ModelCapability {
 pub const CAP_MIN_SAMPLE: u64 = 30;
 pub const CAP_BASELINE_FLAG_RATE: f64 = 0.10;
 pub const CAP_SCALE: f64 = 0.5;
-/// Must equal the slope in `route::capability_adjustment` (0.03 threshold / 1B).
-pub const CAP_SLOPE: f64 = 0.03;
+/// The routing capability slope this estimate inverts. Referenced from
+/// `route` so the two can never drift apart.
+pub const CAP_SLOPE: f64 = crate::route::CAPABILITY_SLOPE;
 
 /// Suggestion tunables — named so Fase D2 can calibrate them.
 pub const SUGGEST_WINDOW_SECS: i64 = 7 * 86_400;
@@ -887,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn model_capability_high_flag_clamps_low_and_healthy_above_nominal() {
+    fn model_capability_healthy_model_clamps_high() {
         let now = 1_000_000i64;
         let m = "Qwen/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-instruct-q4_k_m.gguf";
         let mut lines = Vec::new();

@@ -5,8 +5,39 @@
 /// `static Mutex` is the lightest per-process lock available without extra crates.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// A throwaway `LOCALLLM_SETTINGS` path with cleanup. Handling a tool-bearing
+/// request persists tool-seen/tool-descs into the settings file as a side
+/// effect; without isolation that write lands on the process-global settings
+/// path — clobbering a concurrent test's saved state (and polluting the real
+/// user config). Hold `ENV_LOCK` while this is alive so the env var is stable.
+struct IsolatedSettings {
+    dir: std::path::PathBuf,
+}
+impl IsolatedSettings {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "localllm-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCALLLM_SETTINGS", dir.join("settings.json"));
+        Self { dir }
+    }
+}
+impl Drop for IsolatedSettings {
+    fn drop(&mut self) {
+        std::env::remove_var("LOCALLLM_SETTINGS");
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[tokio::test]
 async fn openai_endpoint_returns_tool_call() {
+    let _guard = ENV_LOCK.lock().await;
+    let _settings = IsolatedSettings::new("oai-toolcall");
     let app = localllm::router_for_test();
     let body = r#"{"model":"m","messages":[{"role":"user","content":"weather?"}],
         "tools":[{"type":"function","function":{"name":"get_weather",
@@ -24,6 +55,8 @@ async fn health_endpoint_returns_ok() {
 
 #[tokio::test]
 async fn anthropic_endpoint_returns_tool_use() {
+    let _guard = ENV_LOCK.lock().await;
+    let _settings = IsolatedSettings::new("anth-tooluse");
     let app = localllm::router_for_test();
     let body = r#"{"model":"m","max_tokens":256,"messages":[{"role":"user","content":"weather?"}],
         "tools":[{"name":"get_weather","description":"w","input_schema":{"type":"object"}}]}"#;
@@ -95,6 +128,8 @@ async fn anthropic_stream_returns_sse_events_and_message_stop() {
 /// even with a credential present.
 #[tokio::test]
 async fn small_request_with_key_stays_local() {
+    let _guard = ENV_LOCK.lock().await;
+    let _settings = IsolatedSettings::new("small-local");
     let app = localllm::router_for_test();
     let body = r#"{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"hi"}],
         "tools":[{"name":"get_weather","description":"w","input_schema":{"type":"object"}}]}"#;
@@ -527,6 +562,8 @@ async fn set_ctx_without_token_returns_401() {
 
 #[tokio::test]
 async fn responses_endpoint_returns_function_call() {
+    let _guard = ENV_LOCK.lock().await;
+    let _settings = IsolatedSettings::new("resp-funccall");
     let app = localllm::router_for_test();
     // FakeGen returns a tool call → output should carry a function_call item.
     let body = r#"{"model":"m","input":"weather?",
