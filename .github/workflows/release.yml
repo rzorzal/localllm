@@ -85,10 +85,11 @@ jobs:
   build:
     needs: prepare
     # candle-kernels (mistralrs CUDA dep) runs nvidia-smi at build time to detect
-    # the GPU compute capability; hosted runners have no GPU, so we pin it. Only
-    # the cuda cells consume this; cpu/metal cells ignore it. 75 = Turing baseline.
+    # the GPU compute capability; hosted runners have no GPU, so we pin it. 80 =
+    # Ampere: the mistralrs afq quant kernel needs sm_80+ (75/Turing won't compile).
+    # The published cuda binary targets Ampere (RTX 30xx) and newer.
     env:
-      CUDA_COMPUTE_CAP: '75'
+      CUDA_COMPUTE_CAP: '80'
     strategy:
       fail-fast: false
       matrix:
@@ -120,9 +121,13 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
       # nvcc on Windows needs MSVC's cl.exe on PATH; expose the dev environment.
+      # Pin the 14.39 toolset (VS 17.9): CUDA 12.5 rejects the runner's newer
+      # default MSVC ("unsupported Microsoft Visual Studio version").
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: '14.39'
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
