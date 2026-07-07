@@ -9,6 +9,8 @@ compile_error!(
 );
 
 pub mod api;
+pub mod breaker;
+pub mod budget;
 pub mod catalog;
 pub mod catalog_variants;
 pub mod cloud;
@@ -18,19 +20,17 @@ pub mod engine;
 pub mod engine_llama;
 pub mod fit;
 pub mod history_select;
+pub mod integrations;
 pub mod model_manager;
-pub mod profile;
-pub mod budget;
-pub mod breaker;
 pub mod pricing;
+pub mod profile;
 pub mod route;
 pub mod route_log;
-pub mod settings;
-pub mod usage;
 pub mod server;
-pub mod tscg;
+pub mod settings;
 pub mod tray;
-pub mod integrations;
+pub mod tscg;
+pub mod usage;
 
 // ---------------------------------------------------------------------------
 // Per-model profile resolution helpers
@@ -46,14 +46,19 @@ fn resolve_load_params(
 ) -> crate::profile::Resolved {
     let key = crate::settings::model_ctx_key(repo, file);
     let saved = crate::settings::load_model_profile(&key);
-    let catalog = crate::catalog::CATALOG.iter().find(|e| e.repo == repo && e.file == file);
+    let catalog = crate::catalog::CATALOG
+        .iter()
+        .find(|e| e.repo == repo && e.file == file);
     crate::profile::resolve(&saved, catalog, global_ctx, global_kv)
 }
 
 /// Resolve the GGUF file list for a model + quant: the variant's files if the
 /// quant is available, else the model's default `file`.
 fn resolve_variant_files(repo: &str, file: &str, quant: &str) -> Vec<String> {
-    if let Some(entry) = crate::catalog::CATALOG.iter().find(|e| e.repo == repo && e.file == file) {
+    if let Some(entry) = crate::catalog::CATALOG
+        .iter()
+        .find(|e| e.repo == repo && e.file == file)
+    {
         if let Some(files) = crate::catalog::files_for_quant(entry, quant) {
             return files;
         }
@@ -111,7 +116,8 @@ pub async fn run_server_with_ready_and_policy(
     ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
 ) -> anyhow::Result<()> {
-    let admin_token = std::sync::Arc::from(crate::server::resolve_admin_token(cfg.admin_token.clone()));
+    let admin_token =
+        std::sync::Arc::from(crate::server::resolve_admin_token(cfg.admin_token.clone()));
     let breaker = std::sync::Arc::new(crate::breaker::CircuitBreaker::new());
     run_server_with_ready_policy_token(cfg, ready, policy, admin_token, None, breaker).await
 }
@@ -127,16 +133,22 @@ pub async fn run_server_with_ready_policy_token(
     ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     policy: std::sync::Arc<std::sync::RwLock<crate::route::RoutingPolicy>>,
     admin_token: std::sync::Arc<str>,
-    manager_out: Option<std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::model_manager::ModelManager>>>>,
+    manager_out: Option<
+        std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::model_manager::ModelManager>>>,
+    >,
     breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
 ) -> anyhow::Result<()> {
-    use std::sync::Arc;
     use crate::config::Backend;
     use crate::engine::Engine;
     use crate::engine_llama::LlamaEngine;
     use crate::server::{router, Generator};
+    use std::sync::Arc;
 
-    tracing::info!("loading model {} (backend={:?})…", cfg.model_id, cfg.backend);
+    tracing::info!(
+        "loading model {} (backend={:?})…",
+        cfg.model_id,
+        cfg.backend
+    );
 
     let total_ram_mb = {
         use sysinfo::System;
@@ -170,7 +182,9 @@ pub async fn run_server_with_ready_policy_token(
             );
             tracing::info!(
                 "resolved load params: ctx={} kv={:?} gpu_layers={:?}",
-                r.ctx, r.kv_type, r.gpu_layers
+                r.ctx,
+                r.kv_type,
+                r.gpu_layers
             );
             // Startup: use CLI --gguf-file directly; saved-quant variant resolution applies on switch, not here.
             let llama = LlamaEngine::load(
@@ -224,30 +238,26 @@ pub async fn run_server_with_ready_policy_token(
             // The startup path keeps &cfg.gguf_files unchanged (CLI is authoritative).
             let files = resolve_variant_files(&spec.repo, &spec.file, &quant);
             let progress_target = slot.get().and_then(|w| w.upgrade());
-            crate::download::ensure_model_with_progress(
+            crate::download::ensure_model_with_progress(&spec.repo, &files, |done, total| {
+                if let Some(m) = &progress_target {
+                    let pct = match total {
+                        Some(t) if t > 0 => (done * 100 / t) as u8,
+                        _ => 0,
+                    };
+                    m.set_progress(pct);
+                }
+            })
+            .await?;
+            let engine = LlamaEngine::load(
                 &spec.repo,
                 &files,
-                |done, total| {
-                    if let Some(m) = &progress_target {
-                        let pct = match total {
-                            Some(t) if t > 0 => (done * 100 / t) as u8,
-                            _ => 0,
-                        };
-                        m.set_progress(pct);
-                    }
-                },
+                r.ctx as usize,
+                kv_type_to_llama(r.kv_type),
+                kv_dir,
+                r.gpu_layers,
+                b_total_ram_mb,
             )
             .await?;
-            let engine =
-                LlamaEngine::load(
-                    &spec.repo,
-                    &files,
-                    r.ctx as usize,
-                    kv_type_to_llama(r.kv_type),
-                    kv_dir,
-                    r.gpu_layers,
-                    b_total_ram_mb,
-                ).await?;
             Ok(Arc::new(engine) as Arc<dyn Generator>)
         })
     });
@@ -300,7 +310,10 @@ pub mod test_support {
 
     #[async_trait::async_trait]
     impl Generator for TaggedGen {
-        async fn generate(&self, _req: crate::api::common::ChatRequest) -> anyhow::Result<ChatResult> {
+        async fn generate(
+            &self,
+            _req: crate::api::common::ChatRequest,
+        ) -> anyhow::Result<ChatResult> {
             Ok(ChatResult {
                 content: vec![ContentPart::Text(self.0.to_string())],
                 finish_reason: FinishReason::Stop,
@@ -314,8 +327,16 @@ pub mod test_support {
         ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
             let tag = self.0.to_string();
             let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
-                Ok(StreamDelta { text: Some(tag), done: false, finish_reason: None }),
-                Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) }),
+                Ok(StreamDelta {
+                    text: Some(tag),
+                    done: false,
+                    finish_reason: None,
+                }),
+                Ok(StreamDelta {
+                    text: None,
+                    done: true,
+                    finish_reason: Some(FinishReason::Stop),
+                }),
             ];
             Ok(Box::pin(futures::stream::iter(deltas)))
         }
@@ -359,9 +380,21 @@ impl Generator for FakeGen {
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
         // Return a small fixed stream: two text deltas then a done delta.
         let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
-            Ok(StreamDelta { text: Some("Hello".into()), done: false, finish_reason: None }),
-            Ok(StreamDelta { text: Some(" world".into()), done: false, finish_reason: None }),
-            Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) }),
+            Ok(StreamDelta {
+                text: Some("Hello".into()),
+                done: false,
+                finish_reason: None,
+            }),
+            Ok(StreamDelta {
+                text: Some(" world".into()),
+                done: false,
+                finish_reason: None,
+            }),
+            Ok(StreamDelta {
+                text: None,
+                done: true,
+                finish_reason: Some(FinishReason::Stop),
+            }),
         ];
         Ok(Box::pin(futures::stream::iter(deltas)))
     }
@@ -387,8 +420,16 @@ impl Generator for FakeGenWeak {
         _req: crate::api::common::ChatRequest,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
         let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
-            Ok(StreamDelta { text: Some("local-weak-answer".into()), done: false, finish_reason: None }),
-            Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Length) }),
+            Ok(StreamDelta {
+                text: Some("local-weak-answer".into()),
+                done: false,
+                finish_reason: None,
+            }),
+            Ok(StreamDelta {
+                text: None,
+                done: true,
+                finish_reason: Some(FinishReason::Length),
+            }),
         ];
         Ok(Box::pin(futures::stream::iter(deltas)))
     }
@@ -415,8 +456,16 @@ impl Generator for RecordingGen {
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
         *self.0.lock().unwrap() = req.messages.clone();
         let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
-            Ok(StreamDelta { text: Some("ok".into()), done: false, finish_reason: None }),
-            Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) }),
+            Ok(StreamDelta {
+                text: Some("ok".into()),
+                done: false,
+                finish_reason: None,
+            }),
+            Ok(StreamDelta {
+                text: None,
+                done: true,
+                finish_reason: Some(FinishReason::Stop),
+            }),
         ];
         Ok(Box::pin(futures::stream::iter(deltas)))
     }
@@ -443,8 +492,16 @@ impl Generator for ToolRecordingGen {
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
         *self.0.lock().unwrap() = req.tools.iter().map(|t| t.name.clone()).collect();
         let deltas: Vec<anyhow::Result<StreamDelta>> = vec![
-            Ok(StreamDelta { text: Some("ok".into()), done: false, finish_reason: None }),
-            Ok(StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) }),
+            Ok(StreamDelta {
+                text: Some("ok".into()),
+                done: false,
+                finish_reason: None,
+            }),
+            Ok(StreamDelta {
+                text: None,
+                done: true,
+                finish_reason: Some(FinishReason::Stop),
+            }),
         ];
         Ok(Box::pin(futures::stream::iter(deltas)))
     }
@@ -468,7 +525,11 @@ pub fn router_for_test_with(
     });
     let manager = ModelManager::new(
         gen,
-        ModelSpec { repo: "test".into(), file: "test".into(), quant: None },
+        ModelSpec {
+            repo: "test".into(),
+            file: "test".into(),
+            quant: None,
+        },
         builder,
     );
     crate::server::router(
@@ -502,11 +563,19 @@ pub async fn axum_test_get_full(app: Router, path: &str) -> (u16, String, String
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    let request = axum::http::Request::builder().method("GET").uri(path).body(Body::empty()).unwrap();
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(Body::empty())
+        .unwrap();
     let response = app.oneshot(request).await.unwrap();
     let status = response.status().as_u16();
-    let ctype = response.headers().get("content-type")
-        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let ctype = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (status, ctype, String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -601,7 +670,11 @@ pub async fn axum_test_request_status(app: Router, path: &str, body: &str) -> u1
 
 /// DELETE with a JSON body + header → HTTP status code.
 pub async fn axum_test_delete_status_with_header(
-    app: Router, path: &str, body: &str, hname: &str, hval: &str,
+    app: Router,
+    path: &str,
+    body: &str,
+    hname: &str,
+    hval: &str,
 ) -> u16 {
     use axum::body::Body;
     use tower::ServiceExt;
@@ -668,7 +741,10 @@ pub async fn axum_test_request_with_header(
 mod tests {
     #[test]
     fn effective_quant_prefers_spec_over_resolved() {
-        assert_eq!(crate::effective_quant(Some("Q8_0".into()), "Q4_K_M".into()), "Q8_0");
+        assert_eq!(
+            crate::effective_quant(Some("Q8_0".into()), "Q4_K_M".into()),
+            "Q8_0"
+        );
         assert_eq!(crate::effective_quant(None, "Q4_K_M".into()), "Q4_K_M");
     }
 

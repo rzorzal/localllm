@@ -161,7 +161,13 @@ pub async fn forward(
         }
     }
 
-    let upstream = match shared_client().post(&url).headers(fwd).body(body).send().await {
+    let upstream = match shared_client()
+        .post(&url)
+        .headers(fwd)
+        .body(body)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "localllm::req", "cloud forward transport error: {e}");
@@ -199,9 +205,15 @@ pub async fn forward(
                 bytes: 0,
                 done: false,
             };
-            ForwardOutcome::Relayed(builder.body(axum::body::Body::from_stream(metered)).unwrap())
+            ForwardOutcome::Relayed(
+                builder
+                    .body(axum::body::Body::from_stream(metered))
+                    .unwrap(),
+            )
         }
-        None => ForwardOutcome::Relayed(builder.body(axum::body::Body::from_stream(stream)).unwrap()),
+        None => {
+            ForwardOutcome::Relayed(builder.body(axum::body::Body::from_stream(stream)).unwrap())
+        }
     }
 }
 
@@ -256,7 +268,14 @@ mod tests {
     async fn unreachable_upstream_degrades_offline() {
         let _guard = ENV_LOCK.lock().await;
         std::env::set_var("LOCALLLM_OPENAI_BASE", "http://127.0.0.1:1"); // nothing listening
-        let outcome = forward(Provider::OpenAI, "/v1/chat/completions", &HeaderMap::new(), Bytes::new(), None).await;
+        let outcome = forward(
+            Provider::OpenAI,
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+        )
+        .await;
         assert!(matches!(
             outcome,
             ForwardOutcome::Degrade(crate::usage::DegradeReason::Offline)
@@ -273,7 +292,14 @@ mod tests {
             .mount(&server)
             .await;
         std::env::set_var("LOCALLLM_OPENAI_BASE", server.uri());
-        let out = forward(Provider::OpenAI, "/v1/chat/completions", &HeaderMap::new(), Bytes::new(), None).await;
+        let out = forward(
+            Provider::OpenAI,
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+        )
+        .await;
         std::env::remove_var("LOCALLLM_OPENAI_BASE");
         out
     }
@@ -315,7 +341,9 @@ mod tests {
             _ => panic!("expected relay"),
         };
         // Drain the body so the metered stream completes.
-        let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
 
         let lines = crate::route_log::read_all();
         let outcome = lines.iter().find_map(|l| match l {

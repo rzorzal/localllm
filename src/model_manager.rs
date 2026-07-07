@@ -48,9 +48,8 @@ pub struct SwitchStatus {
 
 /// Builds an engine for a given spec (download + load). Boxed so production and
 /// tests can inject different implementations.
-pub type EngineBuilder = Box<
-    dyn Fn(ModelSpec) -> BoxFuture<'static, anyhow::Result<Arc<dyn Generator>>> + Send + Sync,
->;
+pub type EngineBuilder =
+    Box<dyn Fn(ModelSpec) -> BoxFuture<'static, anyhow::Result<Arc<dyn Generator>>> + Send + Sync>;
 
 /// Why a switch could not be started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +82,11 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
-    pub fn new(initial: Arc<dyn Generator>, current: ModelSpec, builder: EngineBuilder) -> Arc<Self> {
+    pub fn new(
+        initial: Arc<dyn Generator>,
+        current: ModelSpec,
+        builder: EngineBuilder,
+    ) -> Arc<Self> {
         Arc::new(Self {
             engine: ArcSwapOption::from(Some(Arc::new(initial))),
             current: Mutex::new(current),
@@ -273,7 +276,10 @@ impl Generator for ModelManager {
         let _g = DecOnDrop(self.inflight.clone());
         // load_full returns Option<Arc<Arc<dyn Generator>>>; deref the outer Arc.
         let engine: Arc<dyn Generator> = Arc::clone(
-            &*self.engine.load_full().ok_or_else(|| anyhow::anyhow!("model switching"))?,
+            &*self
+                .engine
+                .load_full()
+                .ok_or_else(|| anyhow::anyhow!("model switching"))?,
         );
         engine.generate(req).await
     }
@@ -317,7 +323,11 @@ mod tests {
     }
 
     fn spec(repo: &str, file: &str) -> ModelSpec {
-        ModelSpec { repo: repo.into(), file: file.into(), quant: None }
+        ModelSpec {
+            repo: repo.into(),
+            file: file.into(),
+            quant: None,
+        }
     }
 
     fn noop_builder() -> EngineBuilder {
@@ -345,7 +355,9 @@ mod tests {
 
     async fn wait_ready(m: &Arc<ModelManager>) {
         for _ in 0..200 {
-            if !m.is_switching() { return; }
+            if !m.is_switching() {
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("switch did not finish");
@@ -354,7 +366,11 @@ mod tests {
     #[tokio::test]
     async fn happy_switch_swaps_engine_and_updates_current() {
         let calls = Arc::new(TestAtomicUsize::new(0));
-        let m = ModelManager::new(marker_gen("orig"), spec("r", "old"), counting_builder(calls.clone(), None));
+        let m = ModelManager::new(
+            marker_gen("orig"),
+            spec("r", "old"),
+            counting_builder(calls.clone(), None),
+        );
         m.start_switch(spec("r2", "new")).unwrap();
         wait_ready(&m).await;
         // engine now serves "new"
@@ -373,7 +389,9 @@ mod tests {
         let builder: EngineBuilder = Box::new(move |_spec| {
             let rx = rx.clone();
             Box::pin(async move {
-                if let Some(rx) = rx.lock().await.take() { let _ = rx.await; }
+                if let Some(rx) = rx.lock().await.take() {
+                    let _ = rx.await;
+                }
                 Ok(marker_gen("new"))
             })
         });
@@ -381,7 +399,10 @@ mod tests {
         m.start_switch(spec("r2", "a")).unwrap();
         // give the task a moment to flip `switching`
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(matches!(m.start_switch(spec("r3", "b")), Err(SwitchError::AlreadySwitching)));
+        assert!(matches!(
+            m.start_switch(spec("r3", "b")),
+            Err(SwitchError::AlreadySwitching)
+        ));
         assert!(m.is_switching());
         let _ = tx.send(());
         wait_ready(&m).await;
@@ -391,21 +412,31 @@ mod tests {
     async fn failed_build_restores_previous_model() {
         // target repo "bad" fails; restore rebuilds "r"/"old" (succeeds).
         let calls = Arc::new(TestAtomicUsize::new(0));
-        let m = ModelManager::new(marker_gen("orig"), spec("r", "old"), counting_builder(calls.clone(), Some("bad")));
+        let m = ModelManager::new(
+            marker_gen("orig"),
+            spec("r", "old"),
+            counting_builder(calls.clone(), Some("bad")),
+        );
         m.start_switch(spec("bad", "x")).unwrap();
         wait_ready(&m).await;
         let s = m.status();
         assert_eq!(s.state, "ready"); // restored
         assert_eq!(s.current, spec("r", "old")); // back to the old model
         assert!(s.error.is_some()); // but the failure is reported
-        // and the engine still serves
+                                    // and the engine still serves
         let out = m.generate(req()).await.unwrap();
         assert!(matches!(&out.content[0], ContentPart::Text(t) if t == "new")); // restore built a fresh engine
     }
 
     fn req() -> ChatRequest {
-        ChatRequest { messages: vec![], tools: vec![], max_tokens: None,
-            temperature: None, stream: false, model: "m".into() }
+        ChatRequest {
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            model: "m".into(),
+        }
     }
 
     /// A generator whose `generate` blocks until a oneshot is fired — lets a test
@@ -441,7 +472,9 @@ mod tests {
         let builder: EngineBuilder = Box::new(move |_spec| {
             let rx = rx.clone();
             Box::pin(async move {
-                if let Some(rx) = rx.lock().await.take() { let _ = rx.await; }
+                if let Some(rx) = rx.lock().await.take() {
+                    let _ = rx.await;
+                }
                 Ok(marker_gen("new"))
             })
         });
@@ -464,7 +497,9 @@ mod tests {
         let m = ModelManager::new(blocking, spec("r", "old"), noop_builder());
         // Hold a request in-flight.
         let m2 = m.clone();
-        let handle = tokio::spawn(async move { let _ = m2.generate(req()).await; });
+        let handle = tokio::spawn(async move {
+            let _ = m2.generate(req()).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // Start a switch — it must wait (drain) while the request is in flight.
         m.start_switch(spec("r2", "new")).unwrap();
@@ -481,10 +516,17 @@ mod tests {
     #[tokio::test]
     async fn delegates_to_current_engine() {
         let m = ModelManager::new(marker_gen("orig"), spec("r", "f"), noop_builder());
-        let out = m.generate(ChatRequest {
-            messages: vec![], tools: vec![], max_tokens: None,
-            temperature: None, stream: false, model: "m".into(),
-        }).await.unwrap();
+        let out = m
+            .generate(ChatRequest {
+                messages: vec![],
+                tools: vec![],
+                max_tokens: None,
+                temperature: None,
+                stream: false,
+                model: "m".into(),
+            })
+            .await
+            .unwrap();
         // TaggedGen returns its tag as the text content.
         match &out.content[0] {
             ContentPart::Text(t) => assert_eq!(t, "orig"),
@@ -510,7 +552,11 @@ mod tests {
         let old: ModelSpec = serde_json::from_str(r#"{"repo":"r","file":"f"}"#).unwrap();
         assert_eq!(old.quant, None);
         // round-trip with quant
-        let s = ModelSpec { repo: "r".into(), file: "f".into(), quant: Some("Q6_K".into()) };
+        let s = ModelSpec {
+            repo: "r".into(),
+            file: "f".into(),
+            quant: Some("Q6_K".into()),
+        };
         let j = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<ModelSpec>(&j).unwrap(), s);
     }

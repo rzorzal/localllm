@@ -108,8 +108,7 @@ pub fn effective_threshold(p: &RoutingPolicy, cap_b: f32) -> f64 {
 /// score vs the profile threshold, (4) in-window low-score → cascade or local.
 pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
     // 1. Hard context gate: prompt too big for the local window.
-    let over_window =
-        s.prompt_tokens as f64 > s.local_ctx_window as f64 * p.ctx_gate_frac;
+    let over_window = s.prompt_tokens as f64 > s.local_ctx_window as f64 * p.ctx_gate_frac;
     if over_window {
         if p.allow_cloud && s.has_cloud_creds {
             return Decision::Cloud(RouteReason::ContextOverflow);
@@ -185,7 +184,10 @@ fn message_chars(m: &crate::api::common::ChatMessage) -> usize {
 /// full prompt made a trivial "ls" look as hard as a large refactor. The last
 /// turn reflects the actual new work.
 pub fn estimate_last_turn_tokens(req: &ChatRequest) -> usize {
-    req.messages.last().map(|m| message_chars(m) / 4).unwrap_or(0)
+    req.messages
+        .last()
+        .map(|m| message_chars(m) / 4)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -291,20 +293,36 @@ mod tests {
     #[test]
     fn difficulty_score_is_low_for_trivial_and_high_for_full() {
         let trivial = Signals {
-            prompt_tokens: 10, local_ctx_window: 1000, n_tools: 0,
-            n_messages: 1, last_turn_tokens: 10, has_cloud_creds: true, local_capability_b: 0.0,
+            prompt_tokens: 10,
+            local_ctx_window: 1000,
+            n_tools: 0,
+            n_messages: 1,
+            last_turn_tokens: 10,
+            has_cloud_creds: true,
+            local_capability_b: 0.0,
         };
         let full = Signals {
-            prompt_tokens: 2000, local_ctx_window: 32768, n_tools: 12,
-            n_messages: 20, last_turn_tokens: 2000, has_cloud_creds: true, local_capability_b: 0.0,
+            prompt_tokens: 2000,
+            local_ctx_window: 32768,
+            n_tools: 12,
+            n_messages: 20,
+            last_turn_tokens: 2000,
+            has_cloud_creds: true,
+            local_capability_b: 0.0,
         };
         assert!(difficulty_score(&trivial) < 0.1);
         assert!(difficulty_score(&full) > 0.95);
         // monotonic in the size of the latest turn
-        let bigger_turn = Signals { last_turn_tokens: 800, ..trivial };
+        let bigger_turn = Signals {
+            last_turn_tokens: 800,
+            ..trivial
+        };
         assert!(difficulty_score(&bigger_turn) > difficulty_score(&trivial));
         // NOT sensitive to available-tool count (that's client overhead)
-        let more_tools = Signals { n_tools: 30, ..trivial };
+        let more_tools = Signals {
+            n_tools: 30,
+            ..trivial
+        };
         assert_eq!(difficulty_score(&more_tools), difficulty_score(&trivial));
     }
 
@@ -319,7 +337,10 @@ mod tests {
 
     #[test]
     fn over_window_without_creds_stays_local_no_creds() {
-        assert_eq!(decide(&sig(980, false, 1000), &pol()), Decision::LocalNoCreds);
+        assert_eq!(
+            decide(&sig(980, false, 1000), &pol()),
+            Decision::LocalNoCreds
+        );
     }
 
     #[test]
@@ -349,12 +370,18 @@ mod tests {
     #[test]
     fn last_turn_tokens_counts_only_the_final_message() {
         let msg = |s: &str| ChatMessage {
-            role: Role::User, text: Some(s.to_string()), tool_calls: vec![], tool_result: None,
+            role: Role::User,
+            text: Some(s.to_string()),
+            tool_calls: vec![],
+            tool_result: None,
         };
         let req = ChatRequest {
             messages: vec![msg(&"a".repeat(40000)), msg("run ls")], // huge prefix, tiny last turn
             tools: vec![],
-            max_tokens: None, temperature: None, stream: false, model: "m".into(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            model: "m".into(),
         };
         // Only the last message ("run ls", 6 chars) counts → 1 token, not the 40k prefix.
         assert_eq!(estimate_last_turn_tokens(&req), 6 / 4);
@@ -364,19 +391,27 @@ mod tests {
     // A request scoring ~0.41: last_turn 1000/2000=0.5→0.8*0.5=0.40, 1 msg→~0.01.
     fn mid_sig(cap: f32) -> Signals {
         Signals {
-            prompt_tokens: 1000, local_ctx_window: 32768, n_tools: 6,
-            n_messages: 1, last_turn_tokens: 1000, has_cloud_creds: true, local_capability_b: cap,
+            prompt_tokens: 1000,
+            local_ctx_window: 32768,
+            n_tools: 6,
+            n_messages: 1,
+            last_turn_tokens: 1000,
+            has_cloud_creds: true,
+            local_capability_b: cap,
         }
     }
 
     #[test]
     fn weak_local_lowers_threshold_to_cloud() {
         let p = Profile::Balanced.policy(); // threshold 0.45
-        // neutral (0.0) and 7B: score ~0.41 < 0.45 → stays local (cascade).
+                                            // neutral (0.0) and 7B: score ~0.41 < 0.45 → stays local (cascade).
         assert_eq!(decide(&mid_sig(0.0), &p), Decision::LocalThenCascade);
         assert_eq!(decide(&mid_sig(7.0), &p), Decision::LocalThenCascade);
         // 3B: adj −0.12 → effective 0.33 → 0.41 > 0.33 → cloud.
-        assert_eq!(decide(&mid_sig(3.0), &p), Decision::Cloud(RouteReason::Difficulty));
+        assert_eq!(
+            decide(&mid_sig(3.0), &p),
+            Decision::Cloud(RouteReason::Difficulty)
+        );
     }
 
     // A request scoring ~0.65: last_turn 1600/2000=0.8→0.8*0.8=0.64, 1 msg→~0.01.
@@ -384,26 +419,44 @@ mod tests {
     // so a strong model is what flips it Cloud→Local.
     fn high_sig(cap: f32) -> Signals {
         Signals {
-            prompt_tokens: 1600, local_ctx_window: 32768, n_tools: 9,
-            n_messages: 1, last_turn_tokens: 1600, has_cloud_creds: true, local_capability_b: cap,
+            prompt_tokens: 1600,
+            local_ctx_window: 32768,
+            n_tools: 9,
+            n_messages: 1,
+            last_turn_tokens: 1600,
+            has_cloud_creds: true,
+            local_capability_b: cap,
         }
     }
 
     #[test]
     fn strong_local_raises_threshold_to_local() {
         let p = Profile::Balanced.policy(); // threshold 0.45
-        // Score ~0.65: at 7B (effective 0.45) → Cloud; at 14B (effective 0.66) → local.
-        // This proves the strong model RAISES the cutoff enough to flip the decision.
-        assert_eq!(decide(&high_sig(7.0), &p), Decision::Cloud(RouteReason::Difficulty));
+                                            // Score ~0.65: at 7B (effective 0.45) → Cloud; at 14B (effective 0.66) → local.
+                                            // This proves the strong model RAISES the cutoff enough to flip the decision.
+        assert_eq!(
+            decide(&high_sig(7.0), &p),
+            Decision::Cloud(RouteReason::Difficulty)
+        );
         assert_eq!(decide(&high_sig(14.0), &p), Decision::LocalThenCascade);
     }
 
     #[test]
     fn capability_never_overrides_context_gate() {
         // Over-window even with a huge model → still ContextOverflow.
-        let s = Signals { prompt_tokens: 5000, local_ctx_window: 1000, n_tools: 0,
-            n_messages: 1, last_turn_tokens: 5000, has_cloud_creds: true, local_capability_b: 32.0 };
-        assert_eq!(decide(&s, &Profile::SaveTokens.policy()), Decision::Cloud(RouteReason::ContextOverflow));
+        let s = Signals {
+            prompt_tokens: 5000,
+            local_ctx_window: 1000,
+            n_tools: 0,
+            n_messages: 1,
+            last_turn_tokens: 5000,
+            has_cloud_creds: true,
+            local_capability_b: 32.0,
+        };
+        assert_eq!(
+            decide(&s, &Profile::SaveTokens.policy()),
+            Decision::Cloud(RouteReason::ContextOverflow)
+        );
     }
 
     #[test]

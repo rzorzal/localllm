@@ -22,7 +22,9 @@ pub enum Backend {
 ///
 /// Q8 is the default: ~50% the RAM of F16 with negligible quality loss.
 /// Q4 saves ~75% RAM but may reduce output quality on some models.
-#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    clap::ValueEnum, Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum KvType {
     /// 8-bit quantized KV cache. ~50% the size of F16. Default.
@@ -125,8 +127,7 @@ impl Config {
             return Some(p.clone());
         }
         // Default: <system-cache-dir>/localllm/kvcache
-        dirs::cache_dir()
-            .map(|d| d.join("localllm").join("kvcache"))
+        dirs::cache_dir().map(|d| d.join("localllm").join("kvcache"))
     }
 
     /// Map CLI config into the `EngineConfig` expected by `Engine::load`.
@@ -175,7 +176,10 @@ mod tests {
         let c = Config::parse_from(["localllm"]);
         let ec = c.engine_config();
         // no_paged_attn defaults to false → paged_attn should be true
-        assert!(ec.paged_attn, "paged_attn should be true when no_paged_attn=false");
+        assert!(
+            ec.paged_attn,
+            "paged_attn should be true when no_paged_attn=false"
+        );
         // default is the single-file 3B gguf
         assert_eq!(ec.gguf_files.len(), 1);
         assert!(ec.gguf_files[0].contains("qwen2.5-3b-instruct-q4_k_m"));

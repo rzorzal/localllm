@@ -130,24 +130,36 @@ pub fn append_feedback(entry: &FeedbackEntry) {
 
 fn append_line(line: &LogLine) {
     let Some(path) = log_path() else { return };
-    let Ok(text) = serde_json::to_string(line) else { return };
+    let Ok(text) = serde_json::to_string(line) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{text}");
     }
 }
 
 /// Read every line: new tagged lines, or legacy untagged decision lines.
 pub fn read_all() -> Vec<LogLine> {
-    let Some(path) = log_path() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Some(path) = log_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     text.lines()
         .filter_map(|l| {
             serde_json::from_str::<LogLine>(l).ok().or_else(|| {
-                serde_json::from_str::<RouteEntry>(l).ok().map(LogLine::Decision)
+                serde_json::from_str::<RouteEntry>(l)
+                    .ok()
+                    .map(LogLine::Decision)
             })
         })
         .collect()
@@ -156,7 +168,11 @@ pub fn read_all() -> Vec<LogLine> {
 /// Pure retention filter: keep entries with `ts >= now - max_age_secs`.
 pub fn prune(entries: &[LogLine], now: i64, max_age_secs: i64) -> Vec<LogLine> {
     let cutoff = now - max_age_secs;
-    entries.iter().filter(|e| e.ts() >= cutoff).cloned().collect()
+    entries
+        .iter()
+        .filter(|e| e.ts() >= cutoff)
+        .cloned()
+        .collect()
 }
 
 /// Read, prune, and atomically rewrite the log. Best-effort.
@@ -181,7 +197,9 @@ pub fn prune_file(now: i64, max_age_secs: i64) {
 pub fn rotate_app_log(_now: i64, _max_age_secs: i64) {
     const MAX_LINES: usize = 50_000;
     let path = std::env::var("LOCALLLM_LOG").unwrap_or_else(|_| "/tmp/localllm.log".to_string());
-    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= MAX_LINES {
         return;
@@ -284,7 +302,9 @@ pub const SUGGEST_CLAMP_MAX: f64 = 0.80;
 /// p-th percentile (0.0..=1.0) of a non-empty slice; interpolation-free
 /// (nearest-rank). Returns None on empty input.
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
-    if sorted.is_empty() { return None; }
+    if sorted.is_empty() {
+        return None;
+    }
     let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
     sorted.get(idx).copied()
 }
@@ -341,7 +361,10 @@ const MONTH: i64 = 2_592_000; // 30 days
 
 fn accumulate(bucket: &mut Bucket, d: &RouteEntry, o: Option<&OutcomeEntry>) {
     // Completion tokens: outcome by rid first, then the legacy RouteEntry field.
-    let completion = o.and_then(|o| o.completion_tok).or(d.completion_tok).unwrap_or(0);
+    let completion = o
+        .and_then(|o| o.completion_tok)
+        .or(d.completion_tok)
+        .unwrap_or(0);
     let toks = d.prompt_tok + completion;
     bucket.tokens_if_all_cloud += toks;
     if d.dest == "local" {
@@ -356,7 +379,12 @@ fn accumulate(bucket: &mut Bucket, d: &RouteEntry, o: Option<&OutcomeEntry>) {
 /// Build the dashboard rollups: rolling hour/day/month buckets (with $ saved),
 /// per-route latency, contiguous fallback windows, plus the newest `recent_n`
 /// decisions joined to their outcomes. Accepts the full `Vec<LogLine>`.
-pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced: bool) -> Dashboard {
+pub fn build_dashboard(
+    entries: &[LogLine],
+    now: i64,
+    recent_n: usize,
+    balanced: bool,
+) -> Dashboard {
     use std::collections::HashMap;
     let mut decisions: Vec<&RouteEntry> = Vec::new();
     let mut outcomes: HashMap<&str, &OutcomeEntry> = HashMap::new();
@@ -364,8 +392,13 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
     for l in entries {
         match l {
             LogLine::Decision(d) => decisions.push(d),
-            LogLine::Outcome(o) => { outcomes.insert(o.rid.as_str(), o); }
-            LogLine::Feedback(f) => feedback.entry(f.rid.as_str()).or_default().push(f.signal.clone()),
+            LogLine::Outcome(o) => {
+                outcomes.insert(o.rid.as_str(), o);
+            }
+            LogLine::Feedback(f) => feedback
+                .entry(f.rid.as_str())
+                .or_default()
+                .push(f.signal.clone()),
         }
     }
     let (mut hour, mut day, mut month) = (Bucket::default(), Bucket::default(), Bucket::default());
@@ -374,20 +407,32 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
     for d in &decisions {
         let o = outcomes.get(d.rid.as_str()).copied();
         let age = now - d.ts;
-        if age <= MONTH { accumulate(&mut month, d, o); }
-        if age <= DAY { accumulate(&mut day, d, o); }
-        if age <= HOUR { accumulate(&mut hour, d, o); }
+        if age <= MONTH {
+            accumulate(&mut month, d, o);
+        }
+        if age <= DAY {
+            accumulate(&mut day, d, o);
+        }
+        if age <= HOUR {
+            accumulate(&mut hour, d, o);
+        }
         if let Some(o) = o {
             let tps = match (o.completion_tok, o.gen_ms) {
                 (Some(ct), Some(ms)) if ms > 0 => ct as f64 / (ms as f64 / 1000.0),
                 _ => 0.0,
             };
             if d.dest == "local" {
-                if let Some(t) = o.ttft_ms { l_ttft += t; }
-                l_tps += tps; l_n += 1;
+                if let Some(t) = o.ttft_ms {
+                    l_ttft += t;
+                }
+                l_tps += tps;
+                l_n += 1;
             } else {
-                if let Some(t) = o.ttft_ms { c_ttft += t; }
-                c_tps += tps; c_n += 1;
+                if let Some(t) = o.ttft_ms {
+                    c_ttft += t;
+                }
+                c_tps += tps;
+                c_n += 1;
             }
         }
     }
@@ -397,11 +442,15 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
         n,
     };
     // Fallback windows: group contiguous same-reason local decisions.
-    let mut flagged: Vec<&RouteEntry> = decisions.iter().filter(|d| {
-        d.degrade_reason.is_some()
-            || d.reason.as_deref() == Some("BudgetExceeded")
-            || d.reason.as_deref() == Some("CloudDown")
-    }).copied().collect();
+    let mut flagged: Vec<&RouteEntry> = decisions
+        .iter()
+        .filter(|d| {
+            d.degrade_reason.is_some()
+                || d.reason.as_deref() == Some("BudgetExceeded")
+                || d.reason.as_deref() == Some("CloudDown")
+        })
+        .copied()
+        .collect();
     flagged.sort_by_key(|d| d.ts);
     let mut windows: Vec<FallbackWindow> = Vec::new();
     const GAP: i64 = 120; // seconds; same-reason events within this gap merge
@@ -416,25 +465,33 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
         };
         match windows.last_mut() {
             Some(w) if w.kind == kind && w.reason == reason && d.ts - w.end_ts <= GAP => {
-                w.end_ts = d.ts; w.count += 1;
+                w.end_ts = d.ts;
+                w.count += 1;
             }
             _ => windows.push(FallbackWindow {
-                kind: kind.to_string(), reason, start_ts: d.ts, end_ts: d.ts, count: 1,
+                kind: kind.to_string(),
+                reason,
+                start_ts: d.ts,
+                end_ts: d.ts,
+                count: 1,
             }),
         }
     }
     // Recent rows: newest-first decisions joined to their outcome.
-    let mut recent: Vec<RecentRow> = decisions.iter().map(|d| {
-        let o = outcomes.get(d.rid.as_str()).copied();
-        RecentRow {
-            entry: (*d).clone(),
-            completion_tok: o.and_then(|o| o.completion_tok),
-            ttft_ms: o.and_then(|o| o.ttft_ms),
-            gen_ms: o.and_then(|o| o.gen_ms),
-            cost_saved_usd: o.map(|o| o.cost_saved_usd).unwrap_or(0.0),
-            feedback: feedback.get(d.rid.as_str()).cloned().unwrap_or_default(),
-        }
-    }).collect();
+    let mut recent: Vec<RecentRow> = decisions
+        .iter()
+        .map(|d| {
+            let o = outcomes.get(d.rid.as_str()).copied();
+            RecentRow {
+                entry: (*d).clone(),
+                completion_tok: o.and_then(|o| o.completion_tok),
+                ttft_ms: o.and_then(|o| o.ttft_ms),
+                gen_ms: o.and_then(|o| o.gen_ms),
+                cost_saved_usd: o.map(|o| o.cost_saved_usd).unwrap_or(0.0),
+                feedback: feedback.get(d.rid.as_str()).cloned().unwrap_or_default(),
+            }
+        })
+        .collect();
     recent.sort_by(|a, b| b.entry.ts.cmp(&a.entry.ts));
     recent.truncate(recent_n);
     // Quality-signal rollup (whole retained log) + threshold suggestion (7d).
@@ -452,25 +509,43 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
         let in_window = d.ts >= window_start;
         if d.dest == "local" {
             stats.local_total += 1;
-            let flagged = sigs.map(|s| s.iter().any(|x| NEG_LOCAL.contains(&x.as_str()))).unwrap_or(false);
-            if flagged { stats.local_flagged += 1; }
+            let flagged = sigs
+                .map(|s| s.iter().any(|x| NEG_LOCAL.contains(&x.as_str())))
+                .unwrap_or(false);
+            if flagged {
+                stats.local_flagged += 1;
+            }
             if in_window {
                 w_local_total += 1;
-                if flagged { w_local_flagged += 1; lower_scores.push(d.score); }
+                if flagged {
+                    w_local_flagged += 1;
+                    lower_scores.push(d.score);
+                }
             }
         } else {
             stats.cloud_total += 1;
-            let trivial = sigs.map(|s| s.iter().any(|x| x == "cloud_trivial")).unwrap_or(false);
-            if trivial { stats.cloud_trivial += 1; }
+            let trivial = sigs
+                .map(|s| s.iter().any(|x| x == "cloud_trivial"))
+                .unwrap_or(false);
+            if trivial {
+                stats.cloud_trivial += 1;
+            }
             if in_window {
                 w_cloud_total += 1;
-                if trivial { w_cloud_trivial += 1; raise_scores.push(d.score); }
+                if trivial {
+                    w_cloud_trivial += 1;
+                    raise_scores.push(d.score);
+                }
             }
         }
     }
     let suggestion = if balanced && w_local_total >= SUGGEST_MIN_LOCAL_SAMPLE {
         let flagged_rate = w_local_flagged as f64 / w_local_total as f64;
-        let trivial_rate = if w_cloud_total > 0 { w_cloud_trivial as f64 / w_cloud_total as f64 } else { 0.0 };
+        let trivial_rate = if w_cloud_total > 0 {
+            w_cloud_trivial as f64 / w_cloud_total as f64
+        } else {
+            0.0
+        };
         if flagged_rate > SUGGEST_LOWER_FLAGGED_RATE {
             lower_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
             percentile(&lower_scores, 0.25).map(|p| {
@@ -495,28 +570,40 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
                         trivial_rate * 100.0, v * 100.0),
                 }
             })
-        } else { None }
-    } else { None };
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Per-model effective-capability estimate (informational).
     use std::collections::BTreeMap;
     let mut per_model: BTreeMap<&str, (u64, u64)> = BTreeMap::new(); // model → (total, flagged)
     for d in &decisions {
-        if d.dest != "local" { continue; }
-        let Some(m) = d.local_model.as_deref() else { continue; };
+        if d.dest != "local" {
+            continue;
+        }
+        let Some(m) = d.local_model.as_deref() else {
+            continue;
+        };
         let flagged = feedback
             .get(d.rid.as_str())
             .map(|s| s.iter().any(|x| NEG_LOCAL.contains(&x.as_str())))
             .unwrap_or(false);
         let e = per_model.entry(m).or_insert((0, 0));
         e.0 += 1;
-        if flagged { e.1 += 1; }
+        if flagged {
+            e.1 += 1;
+        }
     }
     let mut model_capabilities: Vec<ModelCapability> = per_model
         .into_iter()
         .filter(|(_, (total, _))| *total >= CAP_MIN_SAMPLE)
         .filter_map(|(model, (total, flagged))| {
             let nominal_b = crate::catalog::params_b_for_key(model) as f64;
-            if nominal_b <= 0.0 { return None; }
+            if nominal_b <= 0.0 {
+                return None;
+            }
             let flagged_rate = flagged as f64 / total as f64;
             let excess = flagged_rate - CAP_BASELINE_FLAG_RATE;
             let delta_b = -(excess * CAP_SCALE) / CAP_SLOPE;
@@ -532,7 +619,9 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
         .collect();
     model_capabilities.sort_by(|a, b| b.local_total.cmp(&a.local_total));
     Dashboard {
-        hour, day, month,
+        hour,
+        day,
+        month,
         local_latency: latency(l_ttft, l_tps, l_n),
         cloud_latency: latency(c_ttft, c_tps, c_n),
         windows,
@@ -610,15 +699,39 @@ mod tests {
     fn dashboard_buckets_cost_and_join() {
         let now = 10_000_000i64;
         let mut lines = vec![
-            LogLine::Decision(RouteEntry { ts: now - 10, rid: "a".into(), surface: "openai".into(),
-                dest: "local".into(), prompt_tok: 100, ..Default::default() }),
-            LogLine::Decision(RouteEntry { ts: now - 20, rid: "b".into(), surface: "openai".into(),
-                dest: "cloud".into(), prompt_tok: 200, ..Default::default() }),
+            LogLine::Decision(RouteEntry {
+                ts: now - 10,
+                rid: "a".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                prompt_tok: 100,
+                ..Default::default()
+            }),
+            LogLine::Decision(RouteEntry {
+                ts: now - 20,
+                rid: "b".into(),
+                surface: "openai".into(),
+                dest: "cloud".into(),
+                prompt_tok: 200,
+                ..Default::default()
+            }),
         ];
-        lines.push(LogLine::Outcome(OutcomeEntry { rid: "a".into(), ts: now - 9,
-            completion_tok: Some(20), ttft_ms: Some(30), gen_ms: Some(100), cost_saved_usd: 0.42 }));
-        lines.push(LogLine::Outcome(OutcomeEntry { rid: "b".into(), ts: now - 19,
-            completion_tok: Some(50), ttft_ms: Some(80), gen_ms: Some(500), cost_saved_usd: 0.0 }));
+        lines.push(LogLine::Outcome(OutcomeEntry {
+            rid: "a".into(),
+            ts: now - 9,
+            completion_tok: Some(20),
+            ttft_ms: Some(30),
+            gen_ms: Some(100),
+            cost_saved_usd: 0.42,
+        }));
+        lines.push(LogLine::Outcome(OutcomeEntry {
+            rid: "b".into(),
+            ts: now - 19,
+            completion_tok: Some(50),
+            ttft_ms: Some(80),
+            gen_ms: Some(500),
+            cost_saved_usd: 0.0,
+        }));
         let d = build_dashboard(&lines, now, 10, true);
         // hour bucket: local 120 saved, all-cloud 120+250
         assert_eq!(d.hour.tokens_saved, 120);
@@ -638,14 +751,38 @@ mod tests {
     fn dashboard_groups_fallback_windows() {
         let now = 1_000_000i64;
         let lines = vec![
-            LogLine::Decision(RouteEntry { ts: now - 300, rid: "1".into(), surface: "openai".into(),
-                dest: "local".into(), degrade_reason: Some("Quota".into()), ..Default::default() }),
-            LogLine::Decision(RouteEntry { ts: now - 290, rid: "2".into(), surface: "openai".into(),
-                dest: "local".into(), degrade_reason: Some("Quota".into()), ..Default::default() }),
-            LogLine::Decision(RouteEntry { ts: now - 100, rid: "3".into(), surface: "openai".into(),
-                dest: "local".into(), reason: Some("BudgetExceeded".into()), ..Default::default() }),
-            LogLine::Decision(RouteEntry { ts: now - 50, rid: "4".into(), surface: "openai".into(),
-                dest: "local".into(), reason: Some("CloudDown".into()), ..Default::default() }),
+            LogLine::Decision(RouteEntry {
+                ts: now - 300,
+                rid: "1".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                degrade_reason: Some("Quota".into()),
+                ..Default::default()
+            }),
+            LogLine::Decision(RouteEntry {
+                ts: now - 290,
+                rid: "2".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                degrade_reason: Some("Quota".into()),
+                ..Default::default()
+            }),
+            LogLine::Decision(RouteEntry {
+                ts: now - 100,
+                rid: "3".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                reason: Some("BudgetExceeded".into()),
+                ..Default::default()
+            }),
+            LogLine::Decision(RouteEntry {
+                ts: now - 50,
+                rid: "4".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                reason: Some("CloudDown".into()),
+                ..Default::default()
+            }),
         ];
         let d = build_dashboard(&lines, now, 10, true);
         assert_eq!(d.windows.len(), 3);
@@ -662,7 +799,9 @@ mod tests {
     #[test]
     fn dashboard_recent_is_capped() {
         let now = 100i64;
-        let entries: Vec<LogLine> = (0..20).map(|i| LogLine::Decision(e(now - i, "local", 1, 1))).collect();
+        let entries: Vec<LogLine> = (0..20)
+            .map(|i| LogLine::Decision(e(now - i, "local", 1, 1)))
+            .collect();
         let d = build_dashboard(&entries, now, 5, true);
         assert_eq!(d.recent.len(), 5);
     }
@@ -693,10 +832,22 @@ mod tests {
         let legacy = r#"{"ts":10,"surface":"openai","dest":"local","score":0.1,"prompt_tok":5}"#;
         std::fs::write(&path, format!("{legacy}\n")).unwrap();
         // new decision + outcome via the API
-        append(&RouteEntry { ts: 20, rid: "req-1".into(), surface: "openai".into(),
-            dest: "local".into(), prompt_tok: 7, ..Default::default() });
-        append_outcome(&OutcomeEntry { rid: "req-1".into(), ts: 21, completion_tok: Some(9),
-            ttft_ms: Some(30), gen_ms: Some(100), cost_saved_usd: 0.5 });
+        append(&RouteEntry {
+            ts: 20,
+            rid: "req-1".into(),
+            surface: "openai".into(),
+            dest: "local".into(),
+            prompt_tok: 7,
+            ..Default::default()
+        });
+        append_outcome(&OutcomeEntry {
+            rid: "req-1".into(),
+            ts: 21,
+            completion_tok: Some(9),
+            ttft_ms: Some(30),
+            gen_ms: Some(100),
+            cost_saved_usd: 0.5,
+        });
         let lines = read_all();
         assert_eq!(lines.len(), 3);
         assert!(matches!(lines[0], LogLine::Decision(ref d) if d.prompt_tok == 5));
@@ -709,28 +860,56 @@ mod tests {
     fn feedback_lines_parse_and_join_into_recent_rows() {
         let now = 1_000i64;
         let lines = vec![
-            LogLine::Decision(RouteEntry { ts: now, rid: "a".into(), surface: "openai".into(),
-                dest: "local".into(), ..Default::default() }),
-            LogLine::Feedback(FeedbackEntry { rid: "a".into(), ts: now + 1, signal: "cascade".into() }),
-            LogLine::Feedback(FeedbackEntry { rid: "a".into(), ts: now + 2, signal: "reask".into() }),
-            LogLine::Decision(RouteEntry { ts: now, rid: "b".into(), surface: "openai".into(),
-                dest: "local".into(), ..Default::default() }),
+            LogLine::Decision(RouteEntry {
+                ts: now,
+                rid: "a".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                ..Default::default()
+            }),
+            LogLine::Feedback(FeedbackEntry {
+                rid: "a".into(),
+                ts: now + 1,
+                signal: "cascade".into(),
+            }),
+            LogLine::Feedback(FeedbackEntry {
+                rid: "a".into(),
+                ts: now + 2,
+                signal: "reask".into(),
+            }),
+            LogLine::Decision(RouteEntry {
+                ts: now,
+                rid: "b".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                ..Default::default()
+            }),
         ];
         let d = build_dashboard(&lines, now, 10, true);
         let row_a = d.recent.iter().find(|r| r.entry.rid == "a").unwrap();
-        assert_eq!(row_a.feedback, vec!["cascade".to_string(), "reask".to_string()]);
+        assert_eq!(
+            row_a.feedback,
+            vec!["cascade".to_string(), "reask".to_string()]
+        );
         let row_b = d.recent.iter().find(|r| r.entry.rid == "b").unwrap();
         assert!(row_b.feedback.is_empty());
     }
 
     #[test]
     fn feedback_line_round_trips_through_serde() {
-        let f = LogLine::Feedback(FeedbackEntry { rid: "x".into(), ts: 5, signal: "truncated".into() });
+        let f = LogLine::Feedback(FeedbackEntry {
+            rid: "x".into(),
+            ts: 5,
+            signal: "truncated".into(),
+        });
         let s = serde_json::to_string(&f).unwrap();
         assert!(s.contains("\"kind\":\"f\""), "got: {s}");
         let back: LogLine = serde_json::from_str(&s).unwrap();
         match back {
-            LogLine::Feedback(fe) => { assert_eq!(fe.rid, "x"); assert_eq!(fe.signal, "truncated"); }
+            LogLine::Feedback(fe) => {
+                assert_eq!(fe.rid, "x");
+                assert_eq!(fe.signal, "truncated");
+            }
             other => panic!("expected Feedback, got {other:?}"),
         }
     }
@@ -738,16 +917,32 @@ mod tests {
     #[test]
     fn feedback_stats_count_flagged_and_trivial() {
         let now = 1_000_000i64;
-        let mk = |rid: &str, dest: &str| LogLine::Decision(RouteEntry {
-            ts: now - 10, rid: rid.into(), surface: "openai".into(),
-            dest: dest.into(), score: 0.3, ..Default::default() });
-        let fb = |rid: &str, sig: &str| LogLine::Feedback(FeedbackEntry {
-            rid: rid.into(), ts: now - 9, signal: sig.into() });
+        let mk = |rid: &str, dest: &str| {
+            LogLine::Decision(RouteEntry {
+                ts: now - 10,
+                rid: rid.into(),
+                surface: "openai".into(),
+                dest: dest.into(),
+                score: 0.3,
+                ..Default::default()
+            })
+        };
+        let fb = |rid: &str, sig: &str| {
+            LogLine::Feedback(FeedbackEntry {
+                rid: rid.into(),
+                ts: now - 9,
+                signal: sig.into(),
+            })
+        };
         let lines = vec![
-            mk("l1", "local"), fb("l1", "cascade"),
-            mk("l2", "local"), fb("l2", "truncated"), fb("l2", "reask"), // flagged once, not twice
+            mk("l1", "local"),
+            fb("l1", "cascade"),
+            mk("l2", "local"),
+            fb("l2", "truncated"),
+            fb("l2", "reask"), // flagged once, not twice
             mk("l3", "local"),
-            mk("c1", "cloud"), fb("c1", "cloud_trivial"),
+            mk("c1", "cloud"),
+            fb("c1", "cloud_trivial"),
             mk("c2", "cloud"),
         ];
         let d = build_dashboard(&lines, now, 10, true);
@@ -766,17 +961,31 @@ mod tests {
             let rid = format!("l{i}");
             // Flagged locals get scores 0.30/0.32/0.34/0.36 → p25 = 0.315-ish.
             let score = if i < 4 { 0.30 + 0.02 * i as f64 } else { 0.10 };
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: rid.clone(),
-                surface: "openai".into(), dest: "local".into(), score, ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 100,
+                rid: rid.clone(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score,
+                ..Default::default()
+            }));
             if i < 4 {
-                lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 99, signal: "cascade".into() }));
+                lines.push(LogLine::Feedback(FeedbackEntry {
+                    rid,
+                    ts: now - 99,
+                    signal: "cascade".into(),
+                }));
             }
         }
         let d = build_dashboard(&lines, now, 10, true);
         let s = d.suggestion.expect("expected a suggestion");
         assert_eq!(s.direction, "lower");
         assert!(s.suggested >= 0.20 && s.suggested <= 0.80);
-        assert!(s.suggested <= 0.36, "should sit within the flagged score range, got {}", s.suggested);
+        assert!(
+            s.suggested <= 0.36,
+            "should sit within the flagged score range, got {}",
+            s.suggested
+        );
     }
 
     #[test]
@@ -785,16 +994,32 @@ mod tests {
         let mut lines = Vec::new();
         // 20 healthy locals (sample floor) + 10 clouds of which 4 trivial (40% > 30%).
         for i in 0..20 {
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: format!("l{i}"),
-                surface: "openai".into(), dest: "local".into(), score: 0.1, ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 100,
+                rid: format!("l{i}"),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.1,
+                ..Default::default()
+            }));
         }
         for i in 0..10 {
             let rid = format!("c{i}");
             let score = if i < 4 { 0.50 + 0.02 * i as f64 } else { 0.90 };
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: rid.clone(),
-                surface: "openai".into(), dest: "cloud".into(), score, ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 100,
+                rid: rid.clone(),
+                surface: "openai".into(),
+                dest: "cloud".into(),
+                score,
+                ..Default::default()
+            }));
             if i < 4 {
-                lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 99, signal: "cloud_trivial".into() }));
+                lines.push(LogLine::Feedback(FeedbackEntry {
+                    rid,
+                    ts: now - 99,
+                    signal: "cloud_trivial".into(),
+                }));
             }
         }
         let d = build_dashboard(&lines, now, 10, true);
@@ -809,32 +1034,57 @@ mod tests {
         let mut lines = Vec::new();
         for i in 0..5 {
             let rid = format!("l{i}");
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: rid.clone(),
-                surface: "openai".into(), dest: "local".into(), score: 0.3, ..Default::default() }));
-            lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 99, signal: "cascade".into() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 100,
+                rid: rid.clone(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.3,
+                ..Default::default()
+            }));
+            lines.push(LogLine::Feedback(FeedbackEntry {
+                rid,
+                ts: now - 99,
+                signal: "cascade".into(),
+            }));
         }
         assert!(build_dashboard(&lines, now, 10, true).suggestion.is_none());
         // Enough sample but balanced=false → None.
         for i in 5..25 {
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: format!("l{i}"),
-                surface: "openai".into(), dest: "local".into(), score: 0.1, ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 100,
+                rid: format!("l{i}"),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.1,
+                ..Default::default()
+            }));
         }
         assert!(build_dashboard(&lines, now, 10, false).suggestion.is_none());
     }
 
     #[test]
     fn route_entry_local_model_round_trips_and_defaults() {
-        let e = RouteEntry { ts: 1, rid: "r".into(), surface: "openai".into(),
-            dest: "local".into(), local_model: Some("Owner/Repo/file.gguf".into()),
-            ..Default::default() };
+        let e = RouteEntry {
+            ts: 1,
+            rid: "r".into(),
+            surface: "openai".into(),
+            dest: "local".into(),
+            local_model: Some("Owner/Repo/file.gguf".into()),
+            ..Default::default()
+        };
         let s = serde_json::to_string(&e).unwrap();
-        assert!(s.contains("\"local_model\":\"Owner/Repo/file.gguf\""), "got {s}");
+        assert!(
+            s.contains("\"local_model\":\"Owner/Repo/file.gguf\""),
+            "got {s}"
+        );
         let back: RouteEntry = serde_json::from_str(&s).unwrap();
         assert_eq!(back.local_model.as_deref(), Some("Owner/Repo/file.gguf"));
         // Legacy line without the field → None.
         let legacy: RouteEntry = serde_json::from_str(
-            r#"{"ts":1,"surface":"openai","dest":"local","score":0.1,"prompt_tok":5,"rid":"r"}"#
-        ).unwrap();
+            r#"{"ts":1,"surface":"openai","dest":"local","score":0.1,"prompt_tok":5,"rid":"r"}"#,
+        )
+        .unwrap();
         assert_eq!(legacy.local_model, None);
     }
 
@@ -846,9 +1096,19 @@ mod tests {
         for i in 0..20 {
             let rid = format!("l{i}");
             let ts = now - 8 * 86_400;
-            lines.push(LogLine::Decision(RouteEntry { ts, rid: rid.clone(),
-                surface: "openai".into(), dest: "local".into(), score: 0.3, ..Default::default() }));
-            lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: ts + 1, signal: "cascade".into() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts,
+                rid: rid.clone(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.3,
+                ..Default::default()
+            }));
+            lines.push(LogLine::Feedback(FeedbackEntry {
+                rid,
+                ts: ts + 1,
+                signal: "cascade".into(),
+            }));
         }
         assert!(build_dashboard(&lines, now, 10, true).suggestion.is_none());
     }
@@ -862,21 +1122,41 @@ mod tests {
         // 40 locals for model m; 12 flagged (30% flag rate).
         for i in 0..40 {
             let rid = format!("m{i}");
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: rid.clone(),
-                surface: "openai".into(), dest: "local".into(), score: 0.2,
-                local_model: Some(m.into()), ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 10,
+                rid: rid.clone(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.2,
+                local_model: Some(m.into()),
+                ..Default::default()
+            }));
             if i < 12 {
-                lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 9, signal: "cascade".into() }));
+                lines.push(LogLine::Feedback(FeedbackEntry {
+                    rid,
+                    ts: now - 9,
+                    signal: "cascade".into(),
+                }));
             }
         }
         // A second model with too few locals → omitted.
         for i in 0..5 {
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: format!("s{i}"),
-                surface: "openai".into(), dest: "local".into(), score: 0.2,
-                local_model: Some("foo/tiny-1b.gguf".into()), ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 10,
+                rid: format!("s{i}"),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.2,
+                local_model: Some("foo/tiny-1b.gguf".into()),
+                ..Default::default()
+            }));
         }
         let d = build_dashboard(&lines, now, 10, true);
-        assert_eq!(d.model_capabilities.len(), 1, "only the 40-local model qualifies");
+        assert_eq!(
+            d.model_capabilities.len(),
+            1,
+            "only the 40-local model qualifies"
+        );
         let mc = &d.model_capabilities[0];
         assert_eq!(mc.model, m);
         assert_eq!(mc.local_total, 40);
@@ -884,7 +1164,11 @@ mod tests {
         assert!((mc.nominal_b - 3.0).abs() < 1e-9);
         // effective_b: excess=0.30-0.10=0.20; delta=-(0.20*0.5)/0.03 = -3.333..;
         // 3.0 + (-3.333) = -0.333 → clamp low 0.5.
-        assert!((mc.effective_b - 0.5).abs() < 1e-9, "got {}", mc.effective_b);
+        assert!(
+            (mc.effective_b - 0.5).abs() < 1e-9,
+            "got {}",
+            mc.effective_b
+        );
     }
 
     #[test]
@@ -895,14 +1179,24 @@ mod tests {
         // 40 locals, ZERO flagged → excess = -0.10; delta = +(0.10*0.5)/0.03 = +1.667;
         // effective = 3.0 + 1.667 = 4.667 (< clamp high 3.0*1.5=4.5) → clamps to 4.5.
         for i in 0..40 {
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: format!("h{i}"),
-                surface: "openai".into(), dest: "local".into(), score: 0.2,
-                local_model: Some(m.into()), ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 10,
+                rid: format!("h{i}"),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.2,
+                local_model: Some(m.into()),
+                ..Default::default()
+            }));
         }
         let d = build_dashboard(&lines, now, 10, true);
         let mc = &d.model_capabilities[0];
         assert!((mc.flagged_rate - 0.0).abs() < 1e-9);
-        assert!((mc.effective_b - 4.5).abs() < 1e-9, "got {}", mc.effective_b);
+        assert!(
+            (mc.effective_b - 4.5).abs() < 1e-9,
+            "got {}",
+            mc.effective_b
+        );
     }
 
     #[test]
@@ -911,9 +1205,15 @@ mod tests {
         let mut lines = Vec::new();
         // 40 locals but the key has no size token and isn't in catalog → nominal 0 → skip.
         for i in 0..40 {
-            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: format!("u{i}"),
-                surface: "openai".into(), dest: "local".into(), score: 0.2,
-                local_model: Some("foo/mystery-model.gguf".into()), ..Default::default() }));
+            lines.push(LogLine::Decision(RouteEntry {
+                ts: now - 10,
+                rid: format!("u{i}"),
+                surface: "openai".into(),
+                dest: "local".into(),
+                score: 0.2,
+                local_model: Some("foo/mystery-model.gguf".into()),
+                ..Default::default()
+            }));
         }
         let d = build_dashboard(&lines, now, 10, true);
         assert!(d.model_capabilities.is_empty());

@@ -186,7 +186,11 @@ mod tests {
         assert_eq!(b.gate(100), Gate::Allow);
         assert_eq!(
             b.snapshot(100),
-            BreakerSnapshot { state: "closed", reason: None, next_probe_secs: None }
+            BreakerSnapshot {
+                state: "closed",
+                reason: None,
+                next_probe_secs: None
+            }
         );
     }
 
@@ -196,7 +200,10 @@ mod tests {
         b.on_failure(100, DegradeReason::Quota);
         assert_eq!(
             b.gate(100),
-            Gate::Block { reason: DegradeReason::Quota, next_probe_in: BASE_COOLDOWN_SECS }
+            Gate::Block {
+                reason: DegradeReason::Quota,
+                next_probe_in: BASE_COOLDOWN_SECS
+            }
         );
         let s = b.snapshot(100);
         assert_eq!(s.state, "open");
@@ -223,7 +230,10 @@ mod tests {
         b.on_failure(130, DegradeReason::Offline); // probe failed → doubled to 60
         assert_eq!(
             b.gate(130),
-            Gate::Block { reason: DegradeReason::Offline, next_probe_in: 60 }
+            Gate::Block {
+                reason: DegradeReason::Offline,
+                next_probe_in: 60
+            }
         );
     }
 
@@ -232,7 +242,7 @@ mod tests {
         let b = CircuitBreaker::new();
         let mut now = 0u64;
         b.on_failure(now, DegradeReason::ServerError); // 30
-        // Drive repeated failed probes: 30→60→120→240→300(cap)→300.
+                                                       // Drive repeated failed probes: 30→60→120→240→300(cap)→300.
         let expected = [60u64, 120, 240, 300, 300];
         for exp in expected {
             // advance to the probe window
@@ -263,7 +273,7 @@ mod tests {
         b.on_failure(30, DegradeReason::Quota); // 60
         assert_eq!(b.gate(90), Gate::Allow);
         assert!(b.on_success(90)); // recover → reset
-        // Next trip starts from base again.
+                                   // Next trip starts from base again.
         b.on_failure(200, DegradeReason::Quota);
         assert_eq!(b.snapshot(200).next_probe_secs, Some(BASE_COOLDOWN_SECS));
     }
@@ -284,7 +294,7 @@ mod tests {
         b.on_failure(0, DegradeReason::Quota); // Open, until=30, backoff=30
         let before = b.snapshot(10);
         assert_eq!(before.next_probe_secs, Some(20)); // 30 - 10
-        // A stray failure while still Open (no gate/half-open first) is a no-op.
+                                                      // A stray failure while still Open (no gate/half-open first) is a no-op.
         b.on_failure(10, DegradeReason::ServerError);
         let after = b.snapshot(10);
         assert_eq!(after.next_probe_secs, Some(20)); // unchanged: until still 30

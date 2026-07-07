@@ -27,8 +27,7 @@ pub fn hf_url(repo: &str, file: &str) -> String {
 /// Layout: `<sys_cache>/localllm/<sanitized_repo>/<file>`
 /// where `sanitized_repo` replaces `/` with `--` (mirrors the HF hub layout).
 pub fn cache_path(repo: &str, file: &str) -> PathBuf {
-    let base = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"));
+    let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
     let sanitized = repo.replace('/', "--");
     base.join("localllm").join(sanitized).join(file)
 }
@@ -44,26 +43,34 @@ async fn download_to_with_progress(
     dest: &std::path::Path,
     on_progress: impl Fn(u64, Option<u64>),
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder().use_rustls_tls().build()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .build()
         .context("building reqwest client")?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating cache dir {}", parent.display()))?;
     }
     let part_path = dest.with_extension("part");
-    let response = client.get(url).send().await
+    let response = client
+        .get(url)
+        .send()
+        .await
         .with_context(|| format!("GET {url}"))?
-        .error_for_status().with_context(|| format!("HTTP error for {url}"))?;
+        .error_for_status()
+        .with_context(|| format!("HTTP error for {url}"))?;
     let total = response.content_length();
     let mut stream = response.bytes_stream();
-    let mut part_file = tokio::fs::File::create(&part_path).await
+    let mut part_file = tokio::fs::File::create(&part_path)
+        .await
         .with_context(|| format!("creating {}", part_path.display()))?;
     let mut downloaded: u64 = 0;
     let mut last_pct: i64 = -1;
     on_progress(0, total);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("reading stream for {url}"))?;
-        tokio::io::AsyncWriteExt::write_all(&mut part_file, &chunk).await
+        tokio::io::AsyncWriteExt::write_all(&mut part_file, &chunk)
+            .await
             .with_context(|| format!("writing to {}", part_path.display()))?;
         downloaded += chunk.len() as u64;
         if let Some(t) = total {
@@ -160,10 +167,11 @@ mod tests {
     fn cache_path_contains_localllm_component() {
         let path = cache_path("SomeOrg/SomeModel-GGUF", "model.gguf");
         let components: Vec<_> = path.components().collect();
-        let has_localllm = components
-            .iter()
-            .any(|c| c.as_os_str() == "localllm");
-        assert!(has_localllm, "cache path should contain 'localllm' dir: {path:?}");
+        let has_localllm = components.iter().any(|c| c.as_os_str() == "localllm");
+        assert!(
+            has_localllm,
+            "cache path should contain 'localllm' dir: {path:?}"
+        );
     }
 
     #[test]
@@ -171,7 +179,13 @@ mod tests {
         let path = cache_path("Org/Repo", "file.gguf");
         // The directory containing the file must NOT be named "Repo" alone
         // (the slash was replaced) — it should be "Org--Repo".
-        let parent_name = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        let parent_name = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(parent_name, "Org--Repo");
     }
 

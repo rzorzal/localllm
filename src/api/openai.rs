@@ -80,7 +80,9 @@ impl OaiContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OaiContentPart {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -377,10 +379,16 @@ pub fn stream_chunk(delta: &StreamDelta, id: &str, model: &str, started: bool) -
     // On the first chunk (!started), include "role":"assistant" per spec.
     let mut delta_obj = serde_json::Map::new();
     if !started {
-        delta_obj.insert("role".to_string(), serde_json::Value::String("assistant".to_string()));
+        delta_obj.insert(
+            "role".to_string(),
+            serde_json::Value::String("assistant".to_string()),
+        );
     }
     if let Some(ref text) = delta.text {
-        delta_obj.insert("content".to_string(), serde_json::Value::String(text.clone()));
+        delta_obj.insert(
+            "content".to_string(),
+            serde_json::Value::String(text.clone()),
+        );
     }
 
     let chunk = serde_json::json!({
@@ -470,11 +478,13 @@ mod tests {
     fn buffered_stream_emits_tool_calls_then_finish() {
         let result = ChatResult {
             content: vec![ContentPart::Call(ToolCall {
-                id: "call_1".into(), name: "get_weather".into(),
+                id: "call_1".into(),
+                name: "get_weather".into(),
                 arguments: r#"{"location":"Recife"}"#.into(),
             })],
             finish_reason: FinishReason::ToolCalls,
-            prompt_tokens: 5, completion_tokens: 3,
+            prompt_tokens: 5,
+            completion_tokens: 3,
         };
         let lines = stream_chunks_from_result(&result, "chatcmpl-x", "m");
         assert_eq!(lines.len(), 2);
@@ -501,14 +511,23 @@ mod tests {
     #[test]
     fn renders_tool_call_response() {
         let res = ChatResult {
-            content: vec![ContentPart::Call(ToolCall{ id:"c1".into(),
-                name:"get_weather".into(), arguments:"{}".into()})],
+            content: vec![ContentPart::Call(ToolCall {
+                id: "c1".into(),
+                name: "get_weather".into(),
+                arguments: "{}".into(),
+            })],
             finish_reason: FinishReason::ToolCalls,
-            prompt_tokens: 5, completion_tokens: 2 };
+            prompt_tokens: 5,
+            completion_tokens: 2,
+        };
         let oai = from_internal(res, "m");
         assert_eq!(oai.choices[0].finish_reason, "tool_calls");
-        assert_eq!(oai.choices[0].message.tool_calls.as_ref().unwrap()[0].function.name,
-            "get_weather");
+        assert_eq!(
+            oai.choices[0].message.tool_calls.as_ref().unwrap()[0]
+                .function
+                .name,
+            "get_weather"
+        );
     }
 
     #[test]
@@ -541,7 +560,10 @@ mod tests {
             {"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"sunny"}]}]}"#;
         let req: OaiChatRequest = serde_json::from_str(json).unwrap();
         let internal = to_internal(req).unwrap();
-        assert_eq!(internal.messages[0].tool_result.as_ref().unwrap().content, "sunny");
+        assert_eq!(
+            internal.messages[0].tool_result.as_ref().unwrap().content,
+            "sunny"
+        );
     }
 
     #[test]
@@ -551,7 +573,10 @@ mod tests {
         let req: OaiChatRequest = serde_json::from_str(json).unwrap();
         let internal = to_internal(req).unwrap();
         assert_eq!(internal.messages[0].role, Role::Tool);
-        assert_eq!(internal.messages[0].tool_result.as_ref().unwrap().content, "sunny");
+        assert_eq!(
+            internal.messages[0].tool_result.as_ref().unwrap().content,
+            "sunny"
+        );
     }
 
     // --- Streaming renderer tests ---
@@ -559,7 +584,11 @@ mod tests {
     #[test]
     fn openai_chunk_has_delta_content() {
         // started=true: subsequent chunk — no role, has content
-        let d = StreamDelta { text: Some("hi".into()), done: false, finish_reason: None };
+        let d = StreamDelta {
+            text: Some("hi".into()),
+            done: false,
+            finish_reason: None,
+        };
         let line = stream_chunk(&d, "chatcmpl-1", "m", true);
         assert!(line.starts_with("data: "));
         assert!(line.contains("\"content\":\"hi\""));
@@ -567,7 +596,10 @@ mod tests {
         let json_str = line.strip_prefix("data: ").unwrap();
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert!(
-            !v["choices"][0]["delta"].as_object().unwrap().contains_key("role"),
+            !v["choices"][0]["delta"]
+                .as_object()
+                .unwrap()
+                .contains_key("role"),
             "subsequent chunk must not carry role"
         );
     }
@@ -575,12 +607,18 @@ mod tests {
     #[test]
     fn openai_first_chunk_includes_role_assistant() {
         // started=false: first chunk — must include "role":"assistant" in delta
-        let d = StreamDelta { text: Some("Hi".into()), done: false, finish_reason: None };
+        let d = StreamDelta {
+            text: Some("Hi".into()),
+            done: false,
+            finish_reason: None,
+        };
         let line = stream_chunk(&d, "chatcmpl-0", "m", false);
         let json_str = line.strip_prefix("data: ").unwrap();
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        assert_eq!(v["choices"][0]["delta"]["role"], "assistant",
-            "first chunk delta must carry role:assistant");
+        assert_eq!(
+            v["choices"][0]["delta"]["role"], "assistant",
+            "first chunk delta must carry role:assistant"
+        );
         assert_eq!(v["choices"][0]["delta"]["content"], "Hi");
     }
 
@@ -603,14 +641,21 @@ mod tests {
         // When text is None (terminal/done chunk), the OpenAI spec requires the
         // delta object to be {} — the "content" key must be ABSENT, not null.
         // started=true so role is also absent.
-        let d = StreamDelta { text: None, done: true, finish_reason: Some(FinishReason::Stop) };
+        let d = StreamDelta {
+            text: None,
+            done: true,
+            finish_reason: Some(FinishReason::Stop),
+        };
         let line = stream_chunk(&d, "chatcmpl-3", "m", true);
         let json_str = line.strip_prefix("data: ").unwrap();
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
         // The delta object must be empty — no "content" key at all.
         let delta = &v["choices"][0]["delta"];
         assert!(
-            delta.as_object().map(|o| !o.contains_key("content")).unwrap_or(false),
+            delta
+                .as_object()
+                .map(|o| !o.contains_key("content"))
+                .unwrap_or(false),
             "expected delta to be empty {{}}, got: {delta}"
         );
     }

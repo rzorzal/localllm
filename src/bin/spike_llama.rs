@@ -19,7 +19,7 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel, params::LlamaModelParams},
+    model::{params::LlamaModelParams, AddBos, LlamaModel},
     sampling::LlamaSampler,
     token::LlamaToken,
 };
@@ -127,7 +127,10 @@ fn main() -> anyhow::Result<()> {
     let state_file = std::env::temp_dir().join("spike_llama_prefill.bin");
     ctx1.state_save_file(&state_file, &tokens)?;
     let state_size = std::fs::metadata(&state_file)?.len();
-    println!("prefill state saved — {} bytes at {state_file:?}", state_size);
+    println!(
+        "prefill state saved — {} bytes at {state_file:?}",
+        state_size
+    );
 
     // ---------------------------------------------------------------------------
     // 5. Generate from ctx1 (round 1) — baseline
@@ -135,10 +138,17 @@ fn main() -> anyhow::Result<()> {
     let mut s1 = LlamaSampler::chain_simple([LlamaSampler::temp(0.0), LlamaSampler::greedy()]);
     let mut d1 = encoding_rs::UTF_8.new_decoder();
     print!("\n[round 1] ");
-    let (gen1, _pos1) = generate(&mut ctx1, &model, &mut s1, &mut d1,
-                                  (n_tok - 1) as i32, n_tok as i32, n_gen_tokens)?;
+    let (gen1, _pos1) = generate(
+        &mut ctx1,
+        &model,
+        &mut s1,
+        &mut d1,
+        (n_tok - 1) as i32,
+        n_tok as i32,
+        n_gen_tokens,
+    )?;
     println!("\nRound 1: {} tokens generated", gen1.len());
-    drop(ctx1);  // free GPU memory
+    drop(ctx1); // free GPU memory
 
     // ---------------------------------------------------------------------------
     // 6. Fresh context 2 — load prefill state
@@ -147,8 +157,16 @@ fn main() -> anyhow::Result<()> {
     println!("\nctx2 created (fresh)");
 
     let loaded = ctx2.state_load_file(&state_file, tokens.len() + 64)?;
-    println!("state loaded — {} tokens restored (expected {})", loaded.len(), tokens.len());
-    assert_eq!(loaded.len(), tokens.len(), "token count mismatch after state_load_file");
+    println!(
+        "state loaded — {} tokens restored (expected {})",
+        loaded.len(),
+        tokens.len()
+    );
+    assert_eq!(
+        loaded.len(),
+        tokens.len(),
+        "token count mismatch after state_load_file"
+    );
 
     // After state_load_file, KV cache is restored but logits are not.
     // Remove last cached position and re-decode to regenerate logits.
@@ -165,15 +183,25 @@ fn main() -> anyhow::Result<()> {
     let mut s2 = LlamaSampler::chain_simple([LlamaSampler::temp(0.0), LlamaSampler::greedy()]);
     let mut d2 = encoding_rs::UTF_8.new_decoder();
     print!("\n[round 2] ");
-    let (gen2, _pos2) = generate(&mut ctx2, &model, &mut s2, &mut d2,
-                                  0, n_tok as i32, n_gen_tokens)?;
+    let (gen2, _pos2) = generate(
+        &mut ctx2,
+        &model,
+        &mut s2,
+        &mut d2,
+        0,
+        n_tok as i32,
+        n_gen_tokens,
+    )?;
     println!("\nRound 2: {} tokens generated", gen2.len());
     drop(ctx2);
 
     // ---------------------------------------------------------------------------
     // 8. Verify determinism: rounds 1 and 2 must produce the same tokens
     // ---------------------------------------------------------------------------
-    assert_eq!(gen1, gen2, "Round 1 and round 2 must produce identical tokens (greedy, same KV state)");
+    assert_eq!(
+        gen1, gen2,
+        "Round 1 and round 2 must produce identical tokens (greedy, same KV state)"
+    );
     println!("\nDETERMINISM CHECK PASSED: rounds 1 and 2 produced identical output");
 
     // ---------------------------------------------------------------------------
@@ -181,10 +209,16 @@ fn main() -> anyhow::Result<()> {
     // ---------------------------------------------------------------------------
     println!("\n=== ALL CHECKS PASSED ===");
     println!("  Metal GPU offload   : OK (all layers on MTL0)");
-    println!("  Model load          : OK (Qwen2.5-3B Q4_K_M, vocab={})", model.n_vocab());
+    println!(
+        "  Model load          : OK (Qwen2.5-3B Q4_K_M, vocab={})",
+        model.n_vocab()
+    );
     println!("  Prefill + decode    : OK ({} prompt tokens)", n_tok);
     println!("  KV state save       : OK ({state_size} bytes)");
-    println!("  KV state load       : OK ({} tokens restored)", loaded.len());
+    println!(
+        "  KV state load       : OK ({} tokens restored)",
+        loaded.len()
+    );
     println!("  Warm-up re-decode   : OK (position {last_prefill_pos})");
     println!("  Round 1 generation  : OK ({} tokens)", gen1.len());
     println!("  Round 2 generation  : OK ({} tokens)", gen2.len());

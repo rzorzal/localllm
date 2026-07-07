@@ -6,8 +6,15 @@
 /// User-facing routing choice. Selected from the tray; persisted in settings.
 /// Defaults to `SaveTokens` (the token-thrift, local-first profile).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default,
-    serde::Serialize, serde::Deserialize, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Profile {
@@ -102,7 +109,12 @@ mod tests {
     fn all_lists_every_profile_in_menu_order() {
         assert_eq!(
             Profile::ALL,
-            [Profile::SaveTokens, Profile::Balanced, Profile::MaxQuality, Profile::LocalOnly]
+            [
+                Profile::SaveTokens,
+                Profile::Balanced,
+                Profile::MaxQuality,
+                Profile::LocalOnly
+            ]
         );
     }
 

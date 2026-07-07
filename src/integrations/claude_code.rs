@@ -20,7 +20,9 @@ impl ClaudeCode {
     }
     /// Construct against the real home dir.
     pub fn default_home() -> Self {
-        Self { base: dirs::home_dir().unwrap_or_default() }
+        Self {
+            base: dirs::home_dir().unwrap_or_default(),
+        }
     }
     fn path(&self) -> PathBuf {
         self.base.join(".claude").join("settings.json")
@@ -72,8 +74,14 @@ impl ClientInjector for ClaudeCode {
             .ok_or_else(|| anyhow::anyhow!("env is not an object in {}", path.display()))?;
 
         let mut prior = ClientPrior::default();
-        prior.keys.insert(BASE_URL_KEY.to_string(), env.get("ANTHROPIC_BASE_URL").cloned());
-        prior.keys.insert(TOOL_SEARCH_KEY.to_string(), env.get("ENABLE_TOOL_SEARCH").cloned());
+        prior.keys.insert(
+            BASE_URL_KEY.to_string(),
+            env.get("ANTHROPIC_BASE_URL").cloned(),
+        );
+        prior.keys.insert(
+            TOOL_SEARCH_KEY.to_string(),
+            env.get("ENABLE_TOOL_SEARCH").cloned(),
+        );
 
         env.insert(
             "ANTHROPIC_BASE_URL".to_string(),
@@ -154,10 +162,16 @@ mod tests {
         )
         .unwrap();
         let prior = cc.enable(31415).unwrap();
-        assert_eq!(prior.keys[BASE_URL_KEY], Some(json!("https://api.anthropic.com")));
+        assert_eq!(
+            prior.keys[BASE_URL_KEY],
+            Some(json!("https://api.anthropic.com"))
+        );
         assert_eq!(prior.keys[TOOL_SEARCH_KEY], None);
         // our keys are live now
-        assert_eq!(read(&cc.path())["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:31415");
+        assert_eq!(
+            read(&cc.path())["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:31415"
+        );
 
         cc.disable(&prior).unwrap();
         let v = read(&cc.path());

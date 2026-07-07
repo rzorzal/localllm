@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
-use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
+use serde_json::Value;
 use toml_edit::{value, DocumentMut, Item, Table};
 
 use super::{atomic_write, ClientInjector, ClientPrior};
@@ -20,7 +20,9 @@ impl Codex {
         Self { base }
     }
     pub fn default_home() -> Self {
-        Self { base: dirs::home_dir().unwrap_or_default() }
+        Self {
+            base: dirs::home_dir().unwrap_or_default(),
+        }
     }
     fn path(&self) -> PathBuf {
         self.base.join(".codex").join("config.toml")
@@ -81,7 +83,9 @@ impl ClientInjector for Codex {
             .entry("model_providers")
             .or_insert(Item::Table(Table::new()))
             .as_table_mut()
-            .ok_or_else(|| anyhow::anyhow!("model_providers is not a table in {}", path.display()))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("model_providers is not a table in {}", path.display())
+            })?;
         providers.insert("localllm", Item::Table(localllm));
 
         atomic_write(&path, doc.to_string().as_bytes())?;
@@ -131,7 +135,10 @@ mod tests {
         let cx = Codex::with_base(home.clone());
         let prior = cx.enable(31415).unwrap();
         let text = std::fs::read_to_string(cx.path()).unwrap();
-        assert!(text.contains("[model_providers.localllm]"), "expected standard table, got:\n{text}");
+        assert!(
+            text.contains("[model_providers.localllm]"),
+            "expected standard table, got:\n{text}"
+        );
         let doc = text.parse::<DocumentMut>().unwrap();
         assert_eq!(doc["model_provider"].as_str(), Some("localllm"));
         let p = &doc["model_providers"]["localllm"];
@@ -161,7 +168,10 @@ mod tests {
         assert!(text.contains("model_provider = \"localllm\""));
 
         cx.disable(&prior).unwrap();
-        let doc = std::fs::read_to_string(cx.path()).unwrap().parse::<DocumentMut>().unwrap();
+        let doc = std::fs::read_to_string(cx.path())
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
         // provider restored, our table gone, model still present
         assert_eq!(doc["model_provider"].as_str(), Some("openai"));
         assert!(doc.get("model_providers").is_none());
@@ -175,7 +185,10 @@ mod tests {
         let cx = Codex::with_base(home.clone());
         let prior = cx.enable(31415).unwrap(); // file had no model_provider
         cx.disable(&prior).unwrap();
-        let doc = std::fs::read_to_string(cx.path()).unwrap().parse::<DocumentMut>().unwrap();
+        let doc = std::fs::read_to_string(cx.path())
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
         assert!(doc.get("model_provider").is_none());
         assert!(doc.get("model_providers").is_none());
         std::fs::remove_dir_all(&home).ok();
@@ -213,20 +226,41 @@ mod tests {
         let prior = cx.enable(31415).unwrap();
         let text = std::fs::read_to_string(cx.path()).unwrap();
         // Our block is present as a standard table header.
-        assert!(text.contains("[model_providers.localllm]"), "localllm block missing:\n{text}");
+        assert!(
+            text.contains("[model_providers.localllm]"),
+            "localllm block missing:\n{text}"
+        );
         // The sibling openai block and its field must survive.
-        assert!(text.contains("[model_providers.openai]"), "openai block clobbered:\n{text}");
-        assert!(text.contains("base_url = \"https://api.openai.com/v1\""), "openai field clobbered:\n{text}");
-        assert_eq!(prior.keys["model_provider"], Some(serde_json::json!("openai")));
+        assert!(
+            text.contains("[model_providers.openai]"),
+            "openai block clobbered:\n{text}"
+        );
+        assert!(
+            text.contains("base_url = \"https://api.openai.com/v1\""),
+            "openai field clobbered:\n{text}"
+        );
+        assert_eq!(
+            prior.keys["model_provider"],
+            Some(serde_json::json!("openai"))
+        );
 
         cx.disable(&prior).unwrap();
-        let doc = std::fs::read_to_string(cx.path()).unwrap().parse::<DocumentMut>().unwrap();
+        let doc = std::fs::read_to_string(cx.path())
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
         // model_provider restored to "openai".
         assert_eq!(doc["model_provider"].as_str(), Some("openai"));
         // localllm entry gone.
-        assert!(doc["model_providers"].get("localllm").is_none(), "localllm not removed after disable");
+        assert!(
+            doc["model_providers"].get("localllm").is_none(),
+            "localllm not removed after disable"
+        );
         // openai sibling still present with its field.
-        assert!(doc["model_providers"].get("openai").is_some(), "openai sibling removed after disable");
+        assert!(
+            doc["model_providers"].get("openai").is_some(),
+            "openai sibling removed after disable"
+        );
         assert_eq!(
             doc["model_providers"]["openai"]["base_url"].as_str(),
             Some("https://api.openai.com/v1"),

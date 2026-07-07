@@ -1,6 +1,6 @@
 // OpenAI Responses API translation layer (stateless subset for Codex).
-use serde::Deserialize;
 use crate::api::common::{ChatMessage, ChatRequest, Role, ToolCall, ToolResult, ToolSpec};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RespRequest {
@@ -89,7 +89,11 @@ fn content_to_text(c: Option<RespContent>) -> Option<String> {
             .collect::<Vec<_>>()
             .join(""),
     };
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
@@ -129,14 +133,22 @@ pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
                             tool_result: None,
                         });
                     }
-                    RespItem::FunctionCall { call_id, name, arguments } => {
+                    RespItem::FunctionCall {
+                        call_id,
+                        name,
+                        arguments,
+                    } => {
                         // Assistant's prior tool call, replayed in a stateless multi-turn
                         // tool loop. Preserve it so its function_call_output has a matching
                         // preceding call (orphaned tool results break chat templates).
                         messages.push(ChatMessage {
                             role: Role::Assistant,
                             text: None,
-                            tool_calls: vec![ToolCall { id: call_id, name, arguments }],
+                            tool_calls: vec![ToolCall {
+                                id: call_id,
+                                name,
+                                arguments,
+                            }],
                             tool_result: None,
                         });
                     }
@@ -145,7 +157,10 @@ pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
                             role: Role::Tool,
                             text: None,
                             tool_calls: vec![],
-                            tool_result: Some(ToolResult { tool_call_id: call_id, content: output }),
+                            tool_result: Some(ToolResult {
+                                tool_call_id: call_id,
+                                content: output,
+                            }),
                         });
                     }
                     RespItem::Other => {} // reasoning/image/etc — ignored
@@ -158,7 +173,11 @@ pub fn to_internal(req: RespRequest) -> Result<ChatRequest, String> {
         .tools
         .unwrap_or_default()
         .into_iter()
-        .map(|t| ToolSpec { name: t.name, description: t.description, parameters: t.parameters })
+        .map(|t| ToolSpec {
+            name: t.name,
+            description: t.description,
+            parameters: t.parameters,
+        })
         .collect();
 
     Ok(ChatRequest {
@@ -176,7 +195,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub fn from_internal(res: ChatResult, model: &str) -> serde_json::Value {
-    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     let mut output = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
@@ -258,49 +280,79 @@ pub fn stream_events_from_result(
         match part {
             ContentPart::Text(t) => {
                 let item_id = format!("msg_{}", Uuid::new_v4());
-                push("response.output_item.added", serde_json::json!({
-                    "output_index": output_index,
-                    "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}
-                }));
-                push("response.content_part.added", serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []}
-                }));
-                push("response.output_text.delta", serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": t
-                }));
-                push("response.output_text.done", serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "content_index": 0, "text": t
-                }));
-                push("response.content_part.done", serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "content_index": 0,
-                    "part": {"type": "output_text", "text": t, "annotations": []}
-                }));
-                push("response.output_item.done", serde_json::json!({
-                    "output_index": output_index,
-                    "item": {"type": "message", "id": item_id, "role": "assistant", "status": "completed",
-                             "content": [{"type": "output_text", "text": t, "annotations": []}]}
-                }));
+                push(
+                    "response.output_item.added",
+                    serde_json::json!({
+                        "output_index": output_index,
+                        "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}
+                    }),
+                );
+                push(
+                    "response.content_part.added",
+                    serde_json::json!({
+                        "item_id": item_id, "output_index": output_index, "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []}
+                    }),
+                );
+                push(
+                    "response.output_text.delta",
+                    serde_json::json!({
+                        "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": t
+                    }),
+                );
+                push(
+                    "response.output_text.done",
+                    serde_json::json!({
+                        "item_id": item_id, "output_index": output_index, "content_index": 0, "text": t
+                    }),
+                );
+                push(
+                    "response.content_part.done",
+                    serde_json::json!({
+                        "item_id": item_id, "output_index": output_index, "content_index": 0,
+                        "part": {"type": "output_text", "text": t, "annotations": []}
+                    }),
+                );
+                push(
+                    "response.output_item.done",
+                    serde_json::json!({
+                        "output_index": output_index,
+                        "item": {"type": "message", "id": item_id, "role": "assistant", "status": "completed",
+                                 "content": [{"type": "output_text", "text": t, "annotations": []}]}
+                    }),
+                );
                 output_index += 1;
             }
             ContentPart::Call(tc) => {
                 let item_id = format!("fc_{}", Uuid::new_v4());
-                push("response.output_item.added", serde_json::json!({
-                    "output_index": output_index,
-                    "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
-                             "name": tc.name, "arguments": "", "status": "in_progress"}
-                }));
-                push("response.function_call_arguments.delta", serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "delta": tc.arguments
-                }));
-                push("response.function_call_arguments.done", serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "arguments": tc.arguments
-                }));
-                push("response.output_item.done", serde_json::json!({
-                    "output_index": output_index,
-                    "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
-                             "name": tc.name, "arguments": tc.arguments, "status": "completed"}
-                }));
+                push(
+                    "response.output_item.added",
+                    serde_json::json!({
+                        "output_index": output_index,
+                        "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
+                                 "name": tc.name, "arguments": "", "status": "in_progress"}
+                    }),
+                );
+                push(
+                    "response.function_call_arguments.delta",
+                    serde_json::json!({
+                        "item_id": item_id, "output_index": output_index, "delta": tc.arguments
+                    }),
+                );
+                push(
+                    "response.function_call_arguments.done",
+                    serde_json::json!({
+                        "item_id": item_id, "output_index": output_index, "arguments": tc.arguments
+                    }),
+                );
+                push(
+                    "response.output_item.done",
+                    serde_json::json!({
+                        "output_index": output_index,
+                        "item": {"type": "function_call", "id": item_id, "call_id": tc.id,
+                                 "name": tc.name, "arguments": tc.arguments, "status": "completed"}
+                    }),
+                );
                 output_index += 1;
             }
         }
@@ -386,7 +438,8 @@ mod tests {
 
     #[test]
     fn unknown_message_role_errors() {
-        let json = r#"{"model":"m","input":[{"type":"message","role":"frobnicate","content":"x"}]}"#;
+        let json =
+            r#"{"model":"m","input":[{"type":"message","role":"frobnicate","content":"x"}]}"#;
         let req: RespRequest = serde_json::from_str(json).unwrap();
         assert!(to_internal(req).is_err());
     }
@@ -487,7 +540,10 @@ mod tests {
             ]
         );
         // the delta carries the text
-        let delta = ev.iter().find(|(t, _)| *t == "response.output_text.delta").unwrap();
+        let delta = ev
+            .iter()
+            .find(|(t, _)| *t == "response.output_text.delta")
+            .unwrap();
         assert!(delta.1.contains("\"delta\":\"hi\""));
         // monotonic sequence_number starting at 0
         let first: serde_json::Value = serde_json::from_str(&ev[0].1).unwrap();
@@ -507,9 +563,13 @@ mod tests {
         let created: serde_json::Value =
             serde_json::from_str(&ev.iter().find(|(t, _)| *t == "response.created").unwrap().1)
                 .unwrap();
-        let completed: serde_json::Value =
-            serde_json::from_str(&ev.iter().find(|(t, _)| *t == "response.completed").unwrap().1)
-                .unwrap();
+        let completed: serde_json::Value = serde_json::from_str(
+            &ev.iter()
+                .find(|(t, _)| *t == "response.completed")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
         assert_eq!(created["response"]["id"], "resp_fixed");
         assert_eq!(completed["response"]["id"], "resp_fixed");
     }
@@ -550,7 +610,10 @@ mod tests {
         assert!(types.contains(&"response.function_call_arguments.done"));
         assert_eq!(types.last(), Some(&"response.completed"));
         // the function_call item appears via output_item.added
-        let added = ev.iter().find(|(t, _)| *t == "response.output_item.added").unwrap();
+        let added = ev
+            .iter()
+            .find(|(t, _)| *t == "response.output_item.added")
+            .unwrap();
         assert!(added.1.contains("get_weather"));
     }
 }

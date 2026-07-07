@@ -112,15 +112,19 @@ fn load_settings() -> Settings {
     };
     // Migrate any legacy model_ctx entries into model_profiles.ctx.
     for (k, ctx) in std::mem::take(&mut s.model_ctx) {
-        s.model_profiles.entry(k).or_default().ctx.get_or_insert(ctx);
+        s.model_profiles
+            .entry(k)
+            .or_default()
+            .ctx
+            .get_or_insert(ctx);
     }
     s
 }
 
 /// Persist the full settings object, creating the parent directory if needed.
 fn save_settings(s: &Settings) -> anyhow::Result<()> {
-    let path = settings_path()
-        .ok_or_else(|| anyhow::anyhow!("no settings path (no config dir)"))?;
+    let path =
+        settings_path().ok_or_else(|| anyhow::anyhow!("no settings path (no config dir)"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -152,7 +156,11 @@ pub fn save_profile(p: Profile) -> anyhow::Result<()> {
 pub fn load_balanced_threshold() -> f64 {
     load_settings()
         .balanced_threshold
-        .unwrap_or(crate::route::Profile::Balanced.policy().escalation_threshold)
+        .unwrap_or(
+            crate::route::Profile::Balanced
+                .policy()
+                .escalation_threshold,
+        )
         .clamp(0.0, 1.0)
 }
 
@@ -244,7 +252,11 @@ pub fn model_ctx_key(repo: &str, file: &str) -> String {
 
 /// Load a model's full execution profile, or defaults if unset.
 pub fn load_model_profile(key: &str) -> ExecProfile {
-    load_settings().model_profiles.get(key).cloned().unwrap_or_default()
+    load_settings()
+        .model_profiles
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Persist a model's execution profile, preserving the rest of settings.
@@ -288,7 +300,11 @@ pub fn clear_model_ctx(key: &str) -> anyhow::Result<()> {
 
 /// Load a surface's disabled-tool blocklist, or an empty list if unset.
 pub fn load_tool_filter(surface: &str) -> Vec<String> {
-    load_settings().tool_filters.get(surface).cloned().unwrap_or_default()
+    load_settings()
+        .tool_filters
+        .get(surface)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Persist a surface's blocklist (empty list clears it), preserving the rest.
@@ -297,7 +313,8 @@ pub fn save_tool_filter(surface: &str, disabled: &[String]) -> anyhow::Result<()
     if disabled.is_empty() {
         s.tool_filters.remove(surface);
     } else {
-        s.tool_filters.insert(surface.to_string(), disabled.to_vec());
+        s.tool_filters
+            .insert(surface.to_string(), disabled.to_vec());
     }
     save_settings(&s)
 }
@@ -316,7 +333,11 @@ pub fn save_smart_history(on: bool) -> anyhow::Result<()> {
 
 /// Load a surface's persisted last-seen discovered tool names.
 pub fn load_tool_seen(surface: &str) -> Vec<String> {
-    load_settings().tool_seen.get(surface).cloned().unwrap_or_default()
+    load_settings()
+        .tool_seen
+        .get(surface)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Persist a surface's last-seen tool names (empty clears it), preserving the rest.
@@ -332,7 +353,11 @@ pub fn save_tool_seen(surface: &str, seen: &[String]) -> anyhow::Result<()> {
 
 /// Load a surface's persisted tool descriptions (name -> desc).
 pub fn load_tool_descs(surface: &str) -> std::collections::BTreeMap<String, String> {
-    load_settings().tool_descs.get(surface).cloned().unwrap_or_default()
+    load_settings()
+        .tool_descs
+        .get(surface)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Persist a surface's tool descriptions (empty clears it), preserving the rest.
@@ -363,7 +388,10 @@ mod tests {
         with_temp_settings(|| {
             save_tool_filter("claude-code", &["Bash".to_string()]).unwrap();
             save_tool_seen("claude-code", &["Bash".to_string(), "Read".to_string()]).unwrap();
-            assert_eq!(load_tool_seen("claude-code"), vec!["Bash".to_string(), "Read".to_string()]);
+            assert_eq!(
+                load_tool_seen("claude-code"),
+                vec!["Bash".to_string(), "Read".to_string()]
+            );
             // seen persistence must not disturb the disabled filter
             assert_eq!(load_tool_filter("claude-code"), vec!["Bash".to_string()]);
             // empty clears
@@ -475,7 +503,10 @@ mod tests {
             save_profile(Profile::MaxQuality).unwrap();
             assert_eq!(resolve_profile(None), Profile::MaxQuality);
             // CLI overrides saved
-            assert_eq!(resolve_profile(Some(Profile::LocalOnly)), Profile::LocalOnly);
+            assert_eq!(
+                resolve_profile(Some(Profile::LocalOnly)),
+                Profile::LocalOnly
+            );
         });
     }
 
@@ -487,7 +518,10 @@ mod tests {
             let mut keys = std::collections::BTreeMap::new();
             keys.insert("env.ANTHROPIC_BASE_URL".to_string(), None);
             priors.insert("claude-code".to_string(), ClientPrior { keys });
-            let state = IntegrationState { enabled: true, priors };
+            let state = IntegrationState {
+                enabled: true,
+                priors,
+            };
             save_integrations(&state).unwrap();
             assert_eq!(load_integrations(), state);
         });
@@ -496,7 +530,10 @@ mod tests {
     #[test]
     fn saving_profile_preserves_integrations() {
         with_temp_settings(|| {
-            let state = IntegrationState { enabled: true, priors: Default::default() };
+            let state = IntegrationState {
+                enabled: true,
+                priors: Default::default(),
+            };
             save_integrations(&state).unwrap();
             save_profile(Profile::MaxQuality).unwrap();
             // profile saved, integrations untouched
@@ -509,7 +546,10 @@ mod tests {
     fn saving_integrations_preserves_profile() {
         with_temp_settings(|| {
             save_profile(Profile::LocalOnly).unwrap();
-            let state = IntegrationState { enabled: true, priors: Default::default() };
+            let state = IntegrationState {
+                enabled: true,
+                priors: Default::default(),
+            };
             save_integrations(&state).unwrap();
             assert_eq!(load_profile(), Profile::LocalOnly);
         });
@@ -537,7 +577,10 @@ mod tests {
     fn saving_model_ctx_preserves_profile_and_integrations() {
         with_temp_settings(|| {
             save_profile(Profile::MaxQuality).unwrap();
-            let state = IntegrationState { enabled: true, priors: Default::default() };
+            let state = IntegrationState {
+                enabled: true,
+                priors: Default::default(),
+            };
             save_integrations(&state).unwrap();
             save_model_ctx("r/f", 8192).unwrap();
             assert_eq!(load_profile(), Profile::MaxQuality);
@@ -602,7 +645,10 @@ mod tests {
     fn exec_profile_quant_round_trips() {
         with_temp_settings(|| {
             let k = model_ctx_key("r", "f");
-            let p = ExecProfile { quant: Some("Q5_K_M".into()), ..Default::default() };
+            let p = ExecProfile {
+                quant: Some("Q5_K_M".into()),
+                ..Default::default()
+            };
             save_model_profile(&k, &p).unwrap();
             assert_eq!(load_model_profile(&k).quant, Some("Q5_K_M".to_string()));
         });
@@ -613,7 +659,10 @@ mod tests {
         with_temp_settings(|| {
             assert!(load_tool_filter("anthropic").is_empty());
             save_tool_filter("anthropic", &["Read".to_string(), "Glob".to_string()]).unwrap();
-            assert_eq!(load_tool_filter("anthropic"), vec!["Read".to_string(), "Glob".to_string()]);
+            assert_eq!(
+                load_tool_filter("anthropic"),
+                vec!["Read".to_string(), "Glob".to_string()]
+            );
             // other surface unaffected
             assert!(load_tool_filter("openai").is_empty());
             // empty list clears
@@ -647,18 +696,36 @@ mod tests {
     #[test]
     fn resolve_active_model_prefers_explicit_cli() {
         // CLI differs from default → CLI wins even if a model is saved.
-        let saved = Some(ActiveModel { repo: "saved/repo".into(), file: "s.gguf".into(), quant: None });
+        let saved = Some(ActiveModel {
+            repo: "saved/repo".into(),
+            file: "s.gguf".into(),
+            quant: None,
+        });
         let (m, f) = resolve_active_model(
-            "cli/repo", &["c.gguf".to_string()], "default/repo", "d.gguf", saved);
+            "cli/repo",
+            &["c.gguf".to_string()],
+            "default/repo",
+            "d.gguf",
+            saved,
+        );
         assert_eq!(m, "cli/repo");
         assert_eq!(f, vec!["c.gguf".to_string()]);
     }
 
     #[test]
     fn resolve_active_model_uses_saved_when_cli_is_default() {
-        let saved = Some(ActiveModel { repo: "saved/repo".into(), file: "s.gguf".into(), quant: None });
+        let saved = Some(ActiveModel {
+            repo: "saved/repo".into(),
+            file: "s.gguf".into(),
+            quant: None,
+        });
         let (m, f) = resolve_active_model(
-            "default/repo", &["d.gguf".to_string()], "default/repo", "d.gguf", saved);
+            "default/repo",
+            &["d.gguf".to_string()],
+            "default/repo",
+            "d.gguf",
+            saved,
+        );
         assert_eq!(m, "saved/repo");
         assert_eq!(f, vec!["s.gguf".to_string()]);
     }
@@ -666,7 +733,12 @@ mod tests {
     #[test]
     fn resolve_active_model_falls_back_to_default_when_nothing_saved() {
         let (m, f) = resolve_active_model(
-            "default/repo", &["d.gguf".to_string()], "default/repo", "d.gguf", None);
+            "default/repo",
+            &["d.gguf".to_string()],
+            "default/repo",
+            "d.gguf",
+            None,
+        );
         assert_eq!(m, "default/repo");
         assert_eq!(f, vec!["d.gguf".to_string()]);
     }

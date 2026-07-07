@@ -49,7 +49,9 @@ impl Usage {
     /// `threshold` — so the caller fires the high-usage alert a single time.
     pub fn record_cloud_call(&self, prompt_tokens: usize, threshold: usize) -> bool {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let total = self.prompt_tokens.fetch_add(prompt_tokens as u64, Ordering::SeqCst)
+        let total = self
+            .prompt_tokens
+            .fetch_add(prompt_tokens as u64, Ordering::SeqCst)
             + prompt_tokens as u64;
         if total >= threshold as u64
             && self

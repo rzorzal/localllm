@@ -52,7 +52,10 @@ fn term_freq(tokens: &[String]) -> std::collections::HashMap<String, f64> {
 }
 
 /// Cosine similarity between two term-frequency vectors.
-fn cosine(a: &std::collections::HashMap<String, f64>, b: &std::collections::HashMap<String, f64>) -> f64 {
+fn cosine(
+    a: &std::collections::HashMap<String, f64>,
+    b: &std::collections::HashMap<String, f64>,
+) -> f64 {
     let mut dot = 0.0;
     for (k, va) in a {
         if let Some(vb) = b.get(k) {
@@ -61,7 +64,11 @@ fn cosine(a: &std::collections::HashMap<String, f64>, b: &std::collections::Hash
     }
     let na: f64 = a.values().map(|v| v * v).sum::<f64>().sqrt();
     let nb: f64 = b.values().map(|v| v * v).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 /// BM25 score of `doc_tf` (length `doc_len`) against `query_tokens`, given the
@@ -110,7 +117,10 @@ pub fn select_history_smart(messages: Vec<ChatMessage>, keep_turns: u32) -> Vec<
     let n = keep_turns as usize;
 
     // Leading system messages are always kept.
-    let lead_sys = messages.iter().take_while(|m| m.role == Role::System).count();
+    let lead_sys = messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count();
     if n == 0 {
         return messages.into_iter().take(lead_sys).collect();
     }
@@ -165,7 +175,11 @@ pub fn select_history_smart(messages: Vec<ChatMessage>, keep_turns: u32) -> Vec<
     let avgdl = if candidates.is_empty() {
         1.0
     } else {
-        candidates.iter().map(|c| c.tokens.len() as f64).sum::<f64>() / n_docs
+        candidates
+            .iter()
+            .map(|c| c.tokens.len() as f64)
+            .sum::<f64>()
+            / n_docs
     };
     let mut df: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for c in &candidates {
@@ -177,15 +191,32 @@ pub fn select_history_smart(messages: Vec<ChatMessage>, keep_turns: u32) -> Vec<
     // Relevance = blend of normalized BM25 and recency (newer = higher).
     let raw_bm25: Vec<f64> = candidates
         .iter()
-        .map(|c| bm25(&query_tokens, &c.tf, c.tokens.len() as f64, &df, n_docs, avgdl))
+        .map(|c| {
+            bm25(
+                &query_tokens,
+                &c.tf,
+                c.tokens.len() as f64,
+                &df,
+                n_docs,
+                avgdl,
+            )
+        })
         .collect();
     let max_bm25 = raw_bm25.iter().cloned().fold(0.0_f64, f64::max);
     let rel: Vec<f64> = candidates
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let bm = if max_bm25 > 0.0 { raw_bm25[i] / max_bm25 } else { 0.0 };
-            let recency = if last_t <= 1 { 1.0 } else { c.idx as f64 / (last_t as f64 - 1.0) };
+            let bm = if max_bm25 > 0.0 {
+                raw_bm25[i] / max_bm25
+            } else {
+                0.0
+            };
+            let recency = if last_t <= 1 {
+                1.0
+            } else {
+                c.idx as f64 / (last_t as f64 - 1.0)
+            };
             W_BM25 * bm + W_RECENCY * recency
         })
         .collect();
@@ -203,8 +234,7 @@ pub fn select_history_smart(messages: Vec<ChatMessage>, keep_turns: u32) -> Vec<
                 .fold(0.0_f64, f64::max);
             let mmr = MMR_LAMBDA * rel[ci] - (1.0 - MMR_LAMBDA) * novelty;
             // Deterministic tie-break: prefer more recent (higher idx).
-            if mmr > best_score
-                || (mmr == best_score && candidates[ci].idx > candidates[best].idx)
+            if mmr > best_score || (mmr == best_score && candidates[ci].idx > candidates[best].idx)
             {
                 best_score = mmr;
                 best = ci;
@@ -234,7 +264,12 @@ mod tests {
     use crate::api::common::{ChatMessage, Role};
 
     fn msg(role: Role, text: &str) -> ChatMessage {
-        ChatMessage { role, text: Some(text.into()), tool_calls: vec![], tool_result: None }
+        ChatMessage {
+            role,
+            text: Some(text.into()),
+            tool_calls: vec![],
+            tool_result: None,
+        }
     }
 
     // Build a conversation: system + a series of (user, assistant) turns.
@@ -249,7 +284,10 @@ mod tests {
 
     #[test]
     fn tokenize_splits_and_lowercases() {
-        assert_eq!(tokenize("Read file.rs, now!"), vec!["read", "file", "rs", "now"]);
+        assert_eq!(
+            tokenize("Read file.rs, now!"),
+            vec!["read", "file", "rs", "now"]
+        );
     }
 
     #[test]
@@ -262,17 +300,23 @@ mod tests {
     #[test]
     fn keeps_system_and_latest_turn_and_trims_to_n() {
         // 4 turns, keep 2 → system + 1 selected + last turn = 1 sys + 2 turns.
-        let c = convo("sys", &[
-            ("alpha widget", "x"),
-            ("beta gadget", "y"),
-            ("gamma sprocket", "z"),
-            ("about the alpha widget again", "w"),
-        ]);
+        let c = convo(
+            "sys",
+            &[
+                ("alpha widget", "x"),
+                ("beta gadget", "y"),
+                ("gamma sprocket", "z"),
+                ("about the alpha widget again", "w"),
+            ],
+        );
         let out = select_history_smart(c, 2);
         // 1 system + 2 turns * 2 msgs = 5
         assert_eq!(out.iter().filter(|m| m.role == Role::System).count(), 1);
-        let users: Vec<&str> = out.iter().filter(|m| m.role == Role::User)
-            .map(|m| m.text.as_deref().unwrap()).collect();
+        let users: Vec<&str> = out
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text.as_deref().unwrap())
+            .collect();
         assert_eq!(users.len(), 2);
         // last turn always kept
         assert_eq!(users[1], "about the alpha widget again");
@@ -282,15 +326,21 @@ mod tests {
 
     #[test]
     fn keeps_chronological_order() {
-        let c = convo("s", &[
-            ("shared token apple", "a"),
-            ("shared token apple banana", "b"),
-            ("unrelated zzz", "c"),
-            ("apple please", "d"),
-        ]);
+        let c = convo(
+            "s",
+            &[
+                ("shared token apple", "a"),
+                ("shared token apple banana", "b"),
+                ("unrelated zzz", "c"),
+                ("apple please", "d"),
+            ],
+        );
         let out = select_history_smart(c, 3); // sys + 2 selected + last
-        let idxs: Vec<&str> = out.iter().filter(|m| m.role == Role::User)
-            .map(|m| m.text.as_deref().unwrap()).collect();
+        let idxs: Vec<&str> = out
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text.as_deref().unwrap())
+            .collect();
         // selected earlier turns must appear before the last, in original order
         assert_eq!(idxs.last().unwrap(), &"apple please");
         // first two are in chronological order (apple, apple banana)
@@ -299,7 +349,15 @@ mod tests {
 
     #[test]
     fn deterministic() {
-        let c = convo("s", &[("a b c", "1"), ("d e f", "2"), ("g h i", "3"), ("a d g", "4")]);
+        let c = convo(
+            "s",
+            &[
+                ("a b c", "1"),
+                ("d e f", "2"),
+                ("g h i", "3"),
+                ("a d g", "4"),
+            ],
+        );
         let a = select_history_smart(c.clone(), 2);
         let b = select_history_smart(c, 2);
         let ta: Vec<_> = a.iter().map(|m| m.text.clone()).collect();
@@ -311,8 +369,11 @@ mod tests {
     fn n_one_keeps_only_last_turn() {
         let c = convo("s", &[("a", "1"), ("b", "2"), ("c", "3")]);
         let out = select_history_smart(c, 1);
-        let users: Vec<&str> = out.iter().filter(|m| m.role == Role::User)
-            .map(|m| m.text.as_deref().unwrap()).collect();
+        let users: Vec<&str> = out
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text.as_deref().unwrap())
+            .collect();
         assert_eq!(users, vec!["c"]);
     }
 }

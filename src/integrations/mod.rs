@@ -49,7 +49,10 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         #[cfg(unix)]
         if let Ok(meta) = std::fs::metadata(path) {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(meta.permissions().mode()))?;
+            std::fs::set_permissions(
+                &tmp,
+                std::fs::Permissions::from_mode(meta.permissions().mode()),
+            )?;
         }
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -96,7 +99,10 @@ pub fn enable_all(port: u16, injectors: &[Box<dyn ClientInjector>]) -> EnableOut
                 out.priors.insert(inj.id().to_string(), prior);
                 out.summary.wired.push(inj.display_name().to_string());
             }
-            Err(e) => out.summary.failed.push((inj.id().to_string(), e.to_string())),
+            Err(e) => out
+                .summary
+                .failed
+                .push((inj.id().to_string(), e.to_string())),
         }
     }
     out
@@ -176,11 +182,19 @@ mod tests {
         log: std::rc::Rc<RefCell<Vec<String>>>,
     }
     impl ClientInjector for Fake {
-        fn id(&self) -> &'static str { self.id }
-        fn display_name(&self) -> &'static str { self.id }
-        fn detect(&self) -> bool { self.detected }
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            self.id
+        }
+        fn detect(&self) -> bool {
+            self.detected
+        }
         fn enable(&self, port: u16) -> anyhow::Result<ClientPrior> {
-            self.log.borrow_mut().push(format!("enable:{}:{port}", self.id));
+            self.log
+                .borrow_mut()
+                .push(format!("enable:{}:{port}", self.id));
             if self.fail_enable {
                 anyhow::bail!("boom");
             }
@@ -198,9 +212,24 @@ mod tests {
     fn enable_all_skips_undetected_and_collects_failures() {
         let log = std::rc::Rc::new(RefCell::new(vec![]));
         let injectors: Vec<Box<dyn ClientInjector>> = vec![
-            Box::new(Fake { id: "a", detected: true, fail_enable: false, log: log.clone() }),
-            Box::new(Fake { id: "b", detected: false, fail_enable: false, log: log.clone() }),
-            Box::new(Fake { id: "c", detected: true, fail_enable: true, log: log.clone() }),
+            Box::new(Fake {
+                id: "a",
+                detected: true,
+                fail_enable: false,
+                log: log.clone(),
+            }),
+            Box::new(Fake {
+                id: "b",
+                detected: false,
+                fail_enable: false,
+                log: log.clone(),
+            }),
+            Box::new(Fake {
+                id: "c",
+                detected: true,
+                fail_enable: true,
+                log: log.clone(),
+            }),
         ];
         let outcome = enable_all(31415, &injectors);
         // a wired with a prior; b skipped; c detected-but-failed
@@ -216,8 +245,18 @@ mod tests {
     fn disable_all_calls_disable_for_recorded_priors_only() {
         let log = std::rc::Rc::new(RefCell::new(vec![]));
         let injectors: Vec<Box<dyn ClientInjector>> = vec![
-            Box::new(Fake { id: "a", detected: true, fail_enable: false, log: log.clone() }),
-            Box::new(Fake { id: "b", detected: true, fail_enable: false, log: log.clone() }),
+            Box::new(Fake {
+                id: "a",
+                detected: true,
+                fail_enable: false,
+                log: log.clone(),
+            }),
+            Box::new(Fake {
+                id: "b",
+                detected: true,
+                fail_enable: false,
+                log: log.clone(),
+            }),
         ];
         let mut priors = BTreeMap::new();
         priors.insert("a".to_string(), ClientPrior::default());

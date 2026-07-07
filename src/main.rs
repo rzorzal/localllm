@@ -42,17 +42,14 @@ fn main() -> anyhow::Result<()> {
     // send_logs_to_tracing), so the file log captures the real backend
     // diagnostics — buffer sizes, KV allocation, and errors like Metal
     // "Insufficient Memory" — not just our generic wrapper messages.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            tracing_subscriber::EnvFilter::new(
-                "localllm=info,mistralrs_core=info,llama-cpp-2=info",
-            )
-        });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("localllm=info,mistralrs_core=info,llama-cpp-2=info")
+    });
 
     // Always mirror logs to a file so the tray app (which has no terminal) can
     // be inspected. Path overridable via LOCALLLM_LOG; default /tmp/localllm.log.
-    let log_path = std::env::var("LOCALLLM_LOG")
-        .unwrap_or_else(|_| "/tmp/localllm.log".to_string());
+    let log_path =
+        std::env::var("LOCALLLM_LOG").unwrap_or_else(|_| "/tmp/localllm.log".to_string());
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -100,7 +97,11 @@ fn main() -> anyhow::Result<()> {
         let prompt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(localllm::engine_llama::dump_prompt(&cfg.model_id, &cfg.gguf_files, path))?;
+            .block_on(localllm::engine_llama::dump_prompt(
+                &cfg.model_id,
+                &cfg.gguf_files,
+                path,
+            ))?;
         println!("{prompt}");
         return Ok(());
     }
@@ -137,12 +138,18 @@ fn main() -> anyhow::Result<()> {
     // NSStatusItem to register with the WindowServer.
     let want_tray = args.tray || {
         #[cfg(target_os = "macos")]
-        { std::env::var_os("__CFBundleIdentifier").is_some() }
+        {
+            std::env::var_os("__CFBundleIdentifier").is_some()
+        }
         #[cfg(not(target_os = "macos"))]
-        { false }
+        {
+            false
+        }
     };
     if want_tray {
-        let token = std::sync::Arc::from(localllm::server::resolve_admin_token(cfg.admin_token.clone()));
+        let token = std::sync::Arc::from(localllm::server::resolve_admin_token(
+            cfg.admin_token.clone(),
+        ));
         // run_tray() is `-> !` (exits via process::exit on Quit).
         localllm::tray::run_tray(cfg, token);
     }

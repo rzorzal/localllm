@@ -353,11 +353,15 @@ pub fn stream_events(delta: &StreamDelta, started: bool) -> Vec<String> {
             serde_json::to_string(&block_stop).unwrap()
         ));
 
-        let stop_reason = delta.finish_reason.as_ref().map(|r| match r {
-            FinishReason::Stop => "end_turn",
-            FinishReason::Length => "max_tokens",
-            FinishReason::ToolCalls => "tool_use",
-        }).unwrap_or("end_turn");
+        let stop_reason = delta
+            .finish_reason
+            .as_ref()
+            .map(|r| match r {
+                FinishReason::Stop => "end_turn",
+                FinishReason::Length => "max_tokens",
+                FinishReason::ToolCalls => "tool_use",
+            })
+            .unwrap_or("end_turn");
 
         let msg_delta = serde_json::json!({
             "type": "message_delta",
@@ -399,7 +403,10 @@ pub fn stream_events_from_result(result: &ChatResult, model: &str) -> Vec<String
             "usage": {"input_tokens": result.prompt_tokens, "output_tokens": 0}
         }
     });
-    events.push(format!("event: message_start\ndata: {}", serde_json::to_string(&msg_start).unwrap()));
+    events.push(format!(
+        "event: message_start\ndata: {}",
+        serde_json::to_string(&msg_start).unwrap()
+    ));
 
     for (index, part) in result.content.iter().enumerate() {
         match part {
@@ -408,29 +415,44 @@ pub fn stream_events_from_result(result: &ChatResult, model: &str) -> Vec<String
                     "type": "content_block_start", "index": index,
                     "content_block": {"type": "text", "text": ""}
                 });
-                events.push(format!("event: content_block_start\ndata: {}", serde_json::to_string(&start).unwrap()));
+                events.push(format!(
+                    "event: content_block_start\ndata: {}",
+                    serde_json::to_string(&start).unwrap()
+                ));
                 let d = serde_json::json!({
                     "type": "content_block_delta", "index": index,
                     "delta": {"type": "text_delta", "text": text}
                 });
-                events.push(format!("event: content_block_delta\ndata: {}", serde_json::to_string(&d).unwrap()));
+                events.push(format!(
+                    "event: content_block_delta\ndata: {}",
+                    serde_json::to_string(&d).unwrap()
+                ));
             }
             ContentPart::Call(tc) => {
                 let start = serde_json::json!({
                     "type": "content_block_start", "index": index,
                     "content_block": {"type": "tool_use", "id": tc.id, "name": tc.name, "input": {}}
                 });
-                events.push(format!("event: content_block_start\ndata: {}", serde_json::to_string(&start).unwrap()));
+                events.push(format!(
+                    "event: content_block_start\ndata: {}",
+                    serde_json::to_string(&start).unwrap()
+                ));
                 // Stream the arguments JSON string as one input_json_delta.
                 let d = serde_json::json!({
                     "type": "content_block_delta", "index": index,
                     "delta": {"type": "input_json_delta", "partial_json": tc.arguments}
                 });
-                events.push(format!("event: content_block_delta\ndata: {}", serde_json::to_string(&d).unwrap()));
+                events.push(format!(
+                    "event: content_block_delta\ndata: {}",
+                    serde_json::to_string(&d).unwrap()
+                ));
             }
         }
         let stop = serde_json::json!({"type": "content_block_stop", "index": index});
-        events.push(format!("event: content_block_stop\ndata: {}", serde_json::to_string(&stop).unwrap()));
+        events.push(format!(
+            "event: content_block_stop\ndata: {}",
+            serde_json::to_string(&stop).unwrap()
+        ));
     }
 
     let stop_reason = match result.finish_reason {
@@ -443,8 +465,14 @@ pub fn stream_events_from_result(result: &ChatResult, model: &str) -> Vec<String
         "delta": {"stop_reason": stop_reason, "stop_sequence": null},
         "usage": {"output_tokens": result.completion_tokens}
     });
-    events.push(format!("event: message_delta\ndata: {}", serde_json::to_string(&msg_delta).unwrap()));
-    events.push(format!("event: message_stop\ndata: {}", serde_json::to_string(&serde_json::json!({"type": "message_stop"})).unwrap()));
+    events.push(format!(
+        "event: message_delta\ndata: {}",
+        serde_json::to_string(&msg_delta).unwrap()
+    ));
+    events.push(format!(
+        "event: message_stop\ndata: {}",
+        serde_json::to_string(&serde_json::json!({"type": "message_stop"})).unwrap()
+    ));
 
     events
 }
@@ -480,8 +508,7 @@ pub fn from_internal(res: ChatResult, model: &str) -> AnthResponse {
         .map(|part| match part {
             ContentPart::Text(text) => AnthContentBlock::Text { text },
             ContentPart::Call(tc) => {
-                let input = serde_json::from_str(&tc.arguments)
-                    .unwrap_or(serde_json::Value::Null);
+                let input = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
                 AnthContentBlock::ToolUse {
                     id: tc.id,
                     name: tc.name,
@@ -545,11 +572,13 @@ mod tests {
                 ]}
             ]}
         ]}"#;
-        let req: AnthRequest =
-            serde_json::from_str(body).expect("Claude Code payload must parse");
+        let req: AnthRequest = serde_json::from_str(body).expect("Claude Code payload must parse");
         let internal = to_internal(req).expect("to_internal");
         // tool_use captured on the assistant turn
-        assert!(internal.messages.iter().any(|m| m.tool_calls.iter().any(|c| c.name == "read")));
+        assert!(internal
+            .messages
+            .iter()
+            .any(|m| m.tool_calls.iter().any(|c| c.name == "read")));
         // tool_result text flattened out of the array (image dropped)
         assert!(internal.messages.iter().any(|m| m
             .tool_result
@@ -578,11 +607,13 @@ mod tests {
     fn buffered_stream_emits_tool_use_sequence() {
         let result = ChatResult {
             content: vec![ContentPart::Call(ToolCall {
-                id: "toolu_1".into(), name: "get_weather".into(),
+                id: "toolu_1".into(),
+                name: "get_weather".into(),
                 arguments: r#"{"location":"Recife"}"#.into(),
             })],
             finish_reason: FinishReason::ToolCalls,
-            prompt_tokens: 5, completion_tokens: 3,
+            prompt_tokens: 5,
+            completion_tokens: 3,
         };
         let evs = stream_events_from_result(&result, "m");
         let joined = evs.join("\n");
@@ -604,16 +635,24 @@ mod tests {
         let req: AnthRequest = serde_json::from_str(json).unwrap();
         let internal = to_internal(req).unwrap();
         assert_eq!(internal.messages[0].role, Role::System);
-        assert_eq!(internal.messages[0].text.as_deref(), Some("be terse\nand kind"));
+        assert_eq!(
+            internal.messages[0].text.as_deref(),
+            Some("be terse\nand kind")
+        );
     }
 
     #[test]
     fn renders_tool_use_block() {
         let res = ChatResult {
-            content: vec![ContentPart::Call(ToolCall{ id:"tu1".into(),
-                name:"get_weather".into(), arguments:r#"{"location":"X"}"#.into()})],
+            content: vec![ContentPart::Call(ToolCall {
+                id: "tu1".into(),
+                name: "get_weather".into(),
+                arguments: r#"{"location":"X"}"#.into(),
+            })],
             finish_reason: FinishReason::ToolCalls,
-            prompt_tokens: 4, completion_tokens: 3 };
+            prompt_tokens: 4,
+            completion_tokens: 3,
+        };
         let a = from_internal(res, "m");
         assert_eq!(a.stop_reason, "tool_use");
         match &a.content[0] {
@@ -633,15 +672,22 @@ mod tests {
         let req: AnthRequest = serde_json::from_str(json).unwrap();
         let internal = to_internal(req).unwrap();
         assert_eq!(internal.messages[0].role, Role::Tool);
-        assert_eq!(internal.messages[0].tool_result.as_ref().unwrap().content, "sunny");
+        assert_eq!(
+            internal.messages[0].tool_result.as_ref().unwrap().content,
+            "sunny"
+        );
     }
 
     // --- Streaming renderer tests ---
 
     #[test]
     fn anthropic_emits_content_block_delta() {
-        let d = StreamDelta { text: Some("hi".into()), done: false, finish_reason: None };
-        let evs = stream_events(&d, /*started=*/true);
+        let d = StreamDelta {
+            text: Some("hi".into()),
+            done: false,
+            finish_reason: None,
+        };
+        let evs = stream_events(&d, /*started=*/ true);
         assert!(evs.iter().any(|e| e.contains("content_block_delta")));
     }
 
@@ -652,15 +698,19 @@ mod tests {
             done: true,
             finish_reason: Some(FinishReason::Stop),
         };
-        let evs = stream_events(&d, /*started=*/true);
+        let evs = stream_events(&d, /*started=*/ true);
         assert!(evs.iter().any(|e| e.contains("message_stop")));
         assert!(evs.iter().any(|e| e.contains("content_block_stop")));
     }
 
     #[test]
     fn anthropic_first_chunk_includes_message_start() {
-        let d = StreamDelta { text: Some("hello".into()), done: false, finish_reason: None };
-        let evs = stream_events(&d, /*started=*/false);
+        let d = StreamDelta {
+            text: Some("hello".into()),
+            done: false,
+            finish_reason: None,
+        };
+        let evs = stream_events(&d, /*started=*/ false);
         assert!(evs.iter().any(|e| e.contains("message_start")));
         assert!(evs.iter().any(|e| e.contains("content_block_start")));
         assert!(evs.iter().any(|e| e.contains("content_block_delta")));

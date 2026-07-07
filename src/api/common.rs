@@ -84,7 +84,10 @@ pub fn filter_tools(tools: Vec<ToolSpec>, disabled: &[String]) -> Vec<ToolSpec> 
     if disabled.is_empty() {
         return tools;
     }
-    tools.into_iter().filter(|t| !disabled.iter().any(|d| d == &t.name)).collect()
+    tools
+        .into_iter()
+        .filter(|t| !disabled.iter().any(|d| d == &t.name))
+        .collect()
 }
 
 /// Keep only the last `keep_turns` conversation turns, plus all leading system
@@ -96,7 +99,10 @@ pub fn truncate_history(messages: Vec<ChatMessage>, keep_turns: Option<u32>) -> 
     let n = n as usize;
 
     // Leading system messages are always kept.
-    let lead_sys = messages.iter().take_while(|m| m.role == Role::System).count();
+    let lead_sys = messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count();
 
     if n == 0 {
         // Keep only leading system messages.
@@ -129,7 +135,12 @@ mod tests {
     use super::*;
 
     fn m(role: Role, text: &str) -> ChatMessage {
-        ChatMessage { role, text: Some(text.into()), tool_calls: vec![], tool_result: None }
+        ChatMessage {
+            role,
+            text: Some(text.into()),
+            tool_calls: vec![],
+            tool_result: None,
+        }
     }
 
     #[test]
@@ -152,8 +163,10 @@ mod tests {
     fn truncate_keeps_system_and_last_n_turns() {
         let msgs = vec![
             m(Role::System, "sys"),
-            m(Role::User, "u1"), m(Role::Assistant, "a1"),
-            m(Role::User, "u2"), m(Role::Assistant, "a2"),
+            m(Role::User, "u1"),
+            m(Role::Assistant, "a1"),
+            m(Role::User, "u2"),
+            m(Role::Assistant, "a2"),
         ];
         let out = truncate_history(msgs, Some(1));
         let texts: Vec<_> = out.iter().map(|x| x.text.clone().unwrap()).collect();
@@ -166,13 +179,28 @@ mod tests {
         let msgs = vec![
             m(Role::System, "sys"),
             m(Role::User, "u1"),
-            ChatMessage { role: Role::Assistant, text: None,
-                tool_calls: vec![ToolCall { id: "c1".into(), name: "t".into(), arguments: "{}".into() }],
-                tool_result: None },
-            ChatMessage { role: Role::Tool, text: None, tool_calls: vec![],
-                tool_result: Some(ToolResult { tool_call_id: "c1".into(), content: "ok".into() }) },
+            ChatMessage {
+                role: Role::Assistant,
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "t".into(),
+                    arguments: "{}".into(),
+                }],
+                tool_result: None,
+            },
+            ChatMessage {
+                role: Role::Tool,
+                text: None,
+                tool_calls: vec![],
+                tool_result: Some(ToolResult {
+                    tool_call_id: "c1".into(),
+                    content: "ok".into(),
+                }),
+            },
             m(Role::Assistant, "a1"),
-            m(Role::User, "u2"), m(Role::Assistant, "a2"),
+            m(Role::User, "u2"),
+            m(Role::Assistant, "a2"),
         ];
         let out = truncate_history(msgs.clone(), Some(1));
         let roles: Vec<_> = out.iter().map(|x| x.role.clone()).collect();
@@ -191,8 +219,10 @@ mod tests {
     fn truncate_zero_turns_keeps_only_leading_system() {
         let msgs = vec![
             m(Role::System, "sys"),
-            m(Role::User, "u1"), m(Role::Assistant, "a1"),
-            m(Role::User, "u2"), m(Role::Assistant, "a2"),
+            m(Role::User, "u1"),
+            m(Role::Assistant, "a1"),
+            m(Role::User, "u2"),
+            m(Role::Assistant, "a2"),
         ];
         let out = truncate_history(msgs, Some(0));
         let texts: Vec<_> = out.iter().map(|x| x.text.clone().unwrap()).collect();
@@ -206,7 +236,11 @@ mod tests {
     }
 
     fn tool(name: &str) -> ToolSpec {
-        ToolSpec { name: name.into(), description: "d".into(), parameters: serde_json::json!({}) }
+        ToolSpec {
+            name: name.into(),
+            description: "d".into(),
+            parameters: serde_json::json!({}),
+        }
     }
 
     #[test]

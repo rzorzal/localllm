@@ -14,7 +14,10 @@ impl Price {
 }
 
 /// Estimated price for an unrecognized model (mid-tier). Documented estimate.
-pub const FALLBACK: Price = Price { in_per_1m: 3.0, out_per_1m: 15.0 };
+pub const FALLBACK: Price = Price {
+    in_per_1m: 3.0,
+    out_per_1m: 15.0,
+};
 
 /// (substring of the model id, $/1M input, $/1M output). First match wins, so
 /// order more-specific patterns before broader ones. Estimates as of 2026-07;
@@ -39,7 +42,10 @@ pub fn price_for(model_id: &str) -> Price {
     let m = model_id.to_lowercase();
     for (pat, in_p, out_p) in MODEL_PRICES {
         if m.contains(pat) {
-            return Price { in_per_1m: *in_p, out_per_1m: *out_p };
+            return Price {
+                in_per_1m: *in_p,
+                out_per_1m: *out_p,
+            };
         }
     }
     FALLBACK
@@ -51,16 +57,37 @@ mod tests {
 
     #[test]
     fn known_models_match_and_unknown_falls_back() {
-        assert_eq!(price_for("claude-opus-4-8"), Price { in_per_1m: 15.0, out_per_1m: 75.0 });
-        assert_eq!(price_for("claude-sonnet-4-6"), Price { in_per_1m: 3.0, out_per_1m: 15.0 });
-        assert_eq!(price_for("gpt-5"), Price { in_per_1m: 1.25, out_per_1m: 10.0 });
+        assert_eq!(
+            price_for("claude-opus-4-8"),
+            Price {
+                in_per_1m: 15.0,
+                out_per_1m: 75.0
+            }
+        );
+        assert_eq!(
+            price_for("claude-sonnet-4-6"),
+            Price {
+                in_per_1m: 3.0,
+                out_per_1m: 15.0
+            }
+        );
+        assert_eq!(
+            price_for("gpt-5"),
+            Price {
+                in_per_1m: 1.25,
+                out_per_1m: 10.0
+            }
+        );
         // unknown → fallback
         assert_eq!(price_for("some-random-model"), FALLBACK);
     }
 
     #[test]
     fn cost_arithmetic() {
-        let p = Price { in_per_1m: 3.0, out_per_1m: 15.0 };
+        let p = Price {
+            in_per_1m: 3.0,
+            out_per_1m: 15.0,
+        };
         // 1M prompt @3 + 1M completion @15 = 18
         assert!((p.cost(1_000_000, 1_000_000) - 18.0).abs() < 1e-9);
     }

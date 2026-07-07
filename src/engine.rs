@@ -24,9 +24,9 @@
 
 use anyhow::{Context, Result};
 use mistralrs::{
-    AutoDeviceMapParams, DeviceMapSetting, Function, GgufModelBuilder, MemoryGpuConfig,
-    PagedAttentionMetaBuilder, RequestBuilder, Response,
-    TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType, paged_attn_supported,
+    paged_attn_supported, AutoDeviceMapParams, DeviceMapSetting, Function, GgufModelBuilder,
+    MemoryGpuConfig, PagedAttentionMetaBuilder, RequestBuilder, Response, TextMessageRole, Tool,
+    ToolCallResponse, ToolChoice, ToolType,
 };
 
 use crate::api::common::{
@@ -76,13 +76,10 @@ impl Engine {
             .unwrap_or(&cfg.model_id)
             .to_string();
 
-        let mut builder = GgufModelBuilder::new(
-            cfg.model_id.clone(),
-            cfg.gguf_files.clone(),
-        )
-        .with_tok_model_id(tok_repo)
-        // Logging (NOTES §10).
-        .with_logging();
+        let mut builder = GgufModelBuilder::new(cfg.model_id.clone(), cfg.gguf_files.clone())
+            .with_tok_model_id(tok_repo)
+            // Logging (NOTES §10).
+            .with_logging();
 
         // Force CPU when requested (e.g. smoke test on this machine).
         if cfg.force_cpu {
@@ -113,15 +110,15 @@ impl Engine {
         // unified memory alongside the ~4.5 GB model. On force_cpu, PagedAttention
         // is off and this only feeds the (inert, single-device) placement estimate.
         // Verified against mistralrs-core 0.8.1 src/pipeline/loaders/auto_device_map.rs.
-        builder = builder.with_device_mapping(DeviceMapSetting::Auto(
-            AutoDeviceMapParams::Text {
-                max_seq_len: cfg.ctx_len,
-                max_batch_size: 1,
-            },
-        ));
+        builder = builder.with_device_mapping(DeviceMapSetting::Auto(AutoDeviceMapParams::Text {
+            max_seq_len: cfg.ctx_len,
+            max_batch_size: 1,
+        }));
 
         let model = builder.build().await.context("Failed to load GGUF model")?;
-        Ok(Engine { model: std::sync::Arc::new(model) })
+        Ok(Engine {
+            model: std::sync::Arc::new(model),
+        })
     }
 
     /// Build a `RequestBuilder` from a `ChatRequest`.
@@ -177,10 +174,8 @@ impl Engine {
                     // Matches the round-trip pattern from the tools example
                     // (examples/advanced/tools/main.rs:76-78).
                     if let Some(result) = &msg.tool_result {
-                        builder = builder.add_tool_message(
-                            result.content.clone(),
-                            result.tool_call_id.clone(),
-                        );
+                        builder = builder
+                            .add_tool_message(result.content.clone(), result.tool_call_id.clone());
                     } else if let Some(text) = &msg.text {
                         // Fallback: no structured tool_result, use text as content.
                         builder = builder.add_message(TextMessageRole::Tool, text.clone());
@@ -208,9 +203,7 @@ impl Engine {
                     })
                 })
                 .collect();
-            builder = builder
-                .set_tools(tools?)
-                .set_tool_choice(ToolChoice::Auto);
+            builder = builder.set_tools(tools?).set_tool_choice(ToolChoice::Auto);
         }
 
         // Apply sampling parameters.
@@ -275,10 +268,7 @@ impl Engine {
         };
 
         // Determine finish_reason from content if model said "stop" but we have tool calls.
-        let finish_reason = if content
-            .iter()
-            .any(|p| matches!(p, ContentPart::Call(_)))
-        {
+        let finish_reason = if content.iter().any(|p| matches!(p, ContentPart::Call(_))) {
             FinishReason::ToolCalls
         } else {
             finish_reason
@@ -323,14 +313,14 @@ impl Engine {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamDelta>>(32);
 
         tokio::spawn(async move {
-            let raw_stream_result = model
-                .stream_chat_request(builder)
-                .await;
+            let raw_stream_result = model.stream_chat_request(builder).await;
 
             let mut raw_stream = match raw_stream_result {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("Failed to start streaming: {e}"))).await;
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!("Failed to start streaming: {e}")))
+                        .await;
                     return;
                 }
             };
@@ -339,12 +329,8 @@ impl Engine {
                 let delta = match resp {
                     Response::Chunk(chunk) => {
                         let choice = chunk.choices.into_iter().next();
-                        let delta_text = choice
-                            .as_ref()
-                            .and_then(|ch| ch.delta.content.clone());
-                        let finish_str = choice
-                            .as_ref()
-                            .and_then(|ch| ch.finish_reason.clone());
+                        let delta_text = choice.as_ref().and_then(|ch| ch.delta.content.clone());
+                        let finish_str = choice.as_ref().and_then(|ch| ch.finish_reason.clone());
 
                         // Check finish_reason BEFORE constructing the delta.
                         // "tool_calls" is not supported in the streaming path;
@@ -364,7 +350,11 @@ impl Engine {
                             } else {
                                 (false, None)
                             };
-                            Ok(StreamDelta { text: delta_text, done, finish_reason })
+                            Ok(StreamDelta {
+                                text: delta_text,
+                                done,
+                                finish_reason,
+                            })
                         }
                     }
                     Response::Done(_) => {
@@ -373,11 +363,13 @@ impl Engine {
                         // This arm is a defensive guard: if mistralrs ever emits Done on
                         // a streaming request, we emit a clean done sentinel rather than
                         // silently dropping the stream.
-                        let _ = tx.send(Ok(StreamDelta {
-                            text: None,
-                            done: true,
-                            finish_reason: Some(FinishReason::Stop),
-                        })).await;
+                        let _ = tx
+                            .send(Ok(StreamDelta {
+                                text: None,
+                                done: true,
+                                finish_reason: Some(FinishReason::Stop),
+                            }))
+                            .await;
                         break;
                     }
                     Response::ModelError(msg, _) => {
@@ -404,5 +396,3 @@ impl Engine {
         Ok(Box::pin(stream))
     }
 }
-
-

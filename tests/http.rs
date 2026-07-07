@@ -72,7 +72,10 @@ async fn openai_unknown_role_returns_400() {
     // "invalid_role" is not handled by to_internal and must produce a 400 response.
     let body = r#"{"model":"m","messages":[{"role":"invalid_role","content":"hi"}]}"#;
     let status = localllm::axum_test_request_status(app, "/v1/chat/completions", body).await;
-    assert_eq!(status, 400, "expected HTTP 400 for unknown role, got {status}");
+    assert_eq!(
+        status, 400,
+        "expected HTTP 400 for unknown role, got {status}"
+    );
 }
 
 /// SSE streaming tests — use FakeGen which emits two text deltas + done.
@@ -218,7 +221,8 @@ async fn overflow_request_without_key_stays_local() {
     let body = format!(
         r#"{{"model":"claude","max_tokens":256,"messages":[{{"role":"user","content":"{big}"}}]}}"#
     );
-    let resp = localllm::axum_test_request(localllm::router_for_test(), "/v1/messages", &body).await;
+    let resp =
+        localllm::axum_test_request(localllm::router_for_test(), "/v1/messages", &body).await;
     assert_eq!(resp["stop_reason"], "tool_use");
 }
 
@@ -298,7 +302,9 @@ async fn cloud_quota_degrades_to_local() {
         localllm::route::Profile::MaxQuality.policy(),
         1000,
     );
-    let resp = localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test").await;
+    let resp =
+        localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test")
+            .await;
     assert_eq!(resp["stop_reason"], "tool_use"); // FakeGen → local served
 
     std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
@@ -342,13 +348,14 @@ async fn admin_models_requires_token() {
 #[tokio::test]
 async fn admin_models_returns_catalog_with_recommendation() {
     let app = localllm::router_for_test();
-    let resp = localllm::axum_test_get_with_header(
-        app, "/admin/models", "x-admin-token", "test-token",
-    ).await;
+    let resp =
+        localllm::axum_test_get_with_header(app, "/admin/models", "x-admin-token", "test-token")
+            .await;
     // grouped families, non-empty, with exactly one recommended across all
     let families = resp.as_array().expect("array of families");
     assert!(!families.is_empty());
-    let rec_count: usize = families.iter()
+    let rec_count: usize = families
+        .iter()
         .flat_map(|f| f["models"].as_array().unwrap())
         .filter(|m| m["recommended"] == true)
         .count();
@@ -359,8 +366,13 @@ async fn admin_models_returns_catalog_with_recommendation() {
 async fn admin_delete_rejects_bad_token() {
     let app = localllm::router_for_test();
     let status = localllm::axum_test_delete_status_with_header(
-        app, "/admin/models", r#"{"repo":"r","file":"f"}"#, "x-admin-token", "wrong",
-    ).await;
+        app,
+        "/admin/models",
+        r#"{"repo":"r","file":"f"}"#,
+        "x-admin-token",
+        "wrong",
+    )
+    .await;
     assert_eq!(status, 401);
 }
 
@@ -369,8 +381,13 @@ async fn admin_delete_in_use_model_is_409() {
     // router_for_test's ModelManager current spec is {repo:"test", file:"test"}.
     let app = localllm::router_for_test();
     let status = localllm::axum_test_delete_status_with_header(
-        app, "/admin/models", r#"{"repo":"test","file":"test"}"#, "x-admin-token", "test-token",
-    ).await;
+        app,
+        "/admin/models",
+        r#"{"repo":"test","file":"test"}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert_eq!(status, 409);
 }
 
@@ -386,7 +403,9 @@ async fn cascade_cloud_offline_keeps_local_answer() {
         localllm::route::Profile::SaveTokens.policy(),
         1000,
     );
-    let resp = localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test").await;
+    let resp =
+        localllm::axum_test_request_with_header(app, "/v1/messages", body, "x-api-key", "sk-test")
+            .await;
     assert_eq!(resp["content"][0]["text"], "local-weak-answer"); // local kept
     std::env::remove_var("LOCALLLM_ANTHROPIC_BASE");
 }
@@ -404,8 +423,12 @@ async fn admin_status_requires_token() {
 async fn admin_status_ok_with_token() {
     let app = localllm::router_for_test();
     let resp = localllm::axum_test_get_with_header(
-        app, "/admin/model/status", "x-admin-token", "test-token",
-    ).await;
+        app,
+        "/admin/model/status",
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert_eq!(resp["state"], "ready");
 }
 
@@ -413,9 +436,13 @@ async fn admin_status_ok_with_token() {
 async fn admin_switch_accepts_with_token() {
     let app = localllm::router_for_test();
     let status = localllm::axum_test_request_status_with_header(
-        app, "/admin/model",
-        r#"{"repo":"r2","file":"f2"}"#, "x-admin-token", "test-token",
-    ).await;
+        app,
+        "/admin/model",
+        r#"{"repo":"r2","file":"f2"}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert_eq!(status, 202);
 }
 
@@ -423,9 +450,13 @@ async fn admin_switch_accepts_with_token() {
 async fn admin_switch_rejects_bad_token() {
     let app = localllm::router_for_test();
     let status = localllm::axum_test_request_status_with_header(
-        app, "/admin/model",
-        r#"{"repo":"r","file":"f"}"#, "x-admin-token", "wrong",
-    ).await;
+        app,
+        "/admin/model",
+        r#"{"repo":"r","file":"f"}"#,
+        "x-admin-token",
+        "wrong",
+    )
+    .await;
     assert_eq!(status, 401);
 }
 
@@ -433,9 +464,13 @@ async fn admin_switch_rejects_bad_token() {
 async fn admin_switch_bad_body_is_400() {
     let app = localllm::router_for_test();
     let status = localllm::axum_test_request_status_with_header(
-        app, "/admin/model",
-        r#"{"repo":"r"}"#, "x-admin-token", "test-token",
-    ).await;
+        app,
+        "/admin/model",
+        r#"{"repo":"r"}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert_eq!(status, 400);
 }
 
@@ -443,8 +478,13 @@ async fn admin_switch_bad_body_is_400() {
 async fn admin_delete_bad_body_is_400() {
     let app = localllm::router_for_test();
     let status = localllm::axum_test_delete_status_with_header(
-        app, "/admin/models", r#"{"not":"valid"}"#, "x-admin-token", "test-token",
-    ).await;
+        app,
+        "/admin/models",
+        r#"{"not":"valid"}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert_eq!(status, 400);
 }
 
@@ -453,9 +493,13 @@ async fn admin_delete_path_traversal_file_is_400() {
     // A crafted file with path components must be rejected before touching the FS.
     let app = localllm::router_for_test();
     let status = localllm::axum_test_delete_status_with_header(
-        app, "/admin/models",
-        r#"{"repo":"x","file":"../../etc/passwd"}"#, "x-admin-token", "test-token",
-    ).await;
+        app,
+        "/admin/models",
+        r#"{"repo":"x","file":"../../etc/passwd"}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert_eq!(status, 400);
 }
 
@@ -514,8 +558,10 @@ async fn set_ctx_out_of_range_returns_400() {
         "test-token",
     )
     .await;
-    assert!(resp["error"].as_str().unwrap().contains("range")
-        || resp["error"].as_str().unwrap().contains("between"));
+    assert!(
+        resp["error"].as_str().unwrap().contains("range")
+            || resp["error"].as_str().unwrap().contains("between")
+    );
     let status = localllm::axum_test_request_status_with_header(
         localllm::router_for_test(),
         "/admin/model/ctx",
@@ -588,9 +634,15 @@ async fn responses_stream_returns_event_sequence() {
     let body = r#"{"model":"m","stream":true,"input":"hi"}"#;
     let raw = localllm::axum_test_request_raw(app, "/v1/responses", body).await;
     assert!(raw.contains("response.created"), "missing created: {raw}");
-    assert!(raw.contains("response.completed"), "missing completed: {raw}");
+    assert!(
+        raw.contains("response.completed"),
+        "missing completed: {raw}"
+    );
     // no Chat-style DONE sentinel for Responses
-    assert!(!raw.contains("[DONE]"), "responses stream must not emit [DONE]: {raw}");
+    assert!(
+        !raw.contains("[DONE]"),
+        "responses stream must not emit [DONE]: {raw}"
+    );
 }
 
 #[tokio::test]
@@ -650,11 +702,8 @@ async fn anthropic_request_drops_blocklisted_tool() {
     // Build router wired to a ToolRecordingGen so we can inspect what reaches generate().
     let recorded = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
     let gen = std::sync::Arc::new(localllm::ToolRecordingGen(recorded.clone()));
-    let app = localllm::router_for_test_with(
-        gen,
-        localllm::route::Profile::SaveTokens.policy(),
-        128_000,
-    );
+    let app =
+        localllm::router_for_test_with(gen, localllm::route::Profile::SaveTokens.policy(), 128_000);
 
     // POST /v1/messages with tools Bash + Read.
     // Clone the router so we can reuse `app` for the GET below (Router::clone
@@ -673,13 +722,9 @@ async fn anthropic_request_drops_blocklisted_tool() {
     let tool_names = recorded.lock().unwrap().clone();
 
     // GET /admin/tools on the same app instance to verify the pre-filter recording.
-    let tools_resp = localllm::axum_test_get_with_header(
-        app,
-        "/admin/tools",
-        "x-admin-token",
-        "test-token",
-    )
-    .await;
+    let tools_resp =
+        localllm::axum_test_get_with_header(app, "/admin/tools", "x-admin-token", "test-token")
+            .await;
 
     std::env::remove_var("LOCALLLM_SETTINGS");
     let _ = std::fs::remove_dir_all(&dir);
@@ -741,11 +786,8 @@ async fn active_model_history_turns_truncates_request() {
     // Build router wired to a RecordingGen so we can inspect what reaches generate().
     let recorded = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
     let gen = std::sync::Arc::new(localllm::RecordingGen(recorded.clone()));
-    let app = localllm::router_for_test_with(
-        gen,
-        localllm::route::Profile::SaveTokens.policy(),
-        128_000,
-    );
+    let app =
+        localllm::router_for_test_with(gen, localllm::route::Profile::SaveTokens.policy(), 128_000);
 
     // POST [system, u1, a1, u2, a2] — 2 full turns plus leading system.
     let body = r#"{
@@ -772,7 +814,9 @@ async fn active_model_history_turns_truncates_request() {
         3,
         "expected [system, u2, a2] (len 3) after truncation, got {} messages: {:?}",
         msgs.len(),
-        msgs.iter().map(|m| format!("{:?}", m.role)).collect::<Vec<_>>()
+        msgs.iter()
+            .map(|m| format!("{:?}", m.role))
+            .collect::<Vec<_>>()
     );
     assert!(
         matches!(msgs[0].role, localllm::api::common::Role::System),
@@ -801,7 +845,12 @@ async fn admin_integrations_get_requires_token() {
 async fn admin_integrations_get_reports_state_shape() {
     let app = localllm::router_for_test();
     let body = localllm::axum_test_get_with_header(
-        app, "/admin/integrations", "x-admin-token", "test-token").await;
+        app,
+        "/admin/integrations",
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert!(body.get("enabled").and_then(|v| v.as_bool()).is_some());
     assert!(body.get("wired").map(|v| v.is_array()).unwrap_or(false));
 }
@@ -818,8 +867,9 @@ async fn admin_dashboard_requires_token() {
 #[tokio::test]
 async fn admin_dashboard_returns_shape() {
     let app = localllm::router_for_test();
-    let body = localllm::axum_test_get_with_header(
-        app, "/admin/dashboard", "x-admin-token", "test-token").await;
+    let body =
+        localllm::axum_test_get_with_header(app, "/admin/dashboard", "x-admin-token", "test-token")
+            .await;
     for k in ["hour", "day", "month", "recent"] {
         assert!(body.get(k).is_some(), "missing {k}");
     }
@@ -832,7 +882,13 @@ async fn admin_dashboard_returns_shape() {
 async fn admin_dashboard_clear_requires_token() {
     let app = localllm::router_for_test();
     let status = localllm::axum_test_delete_status_with_header(
-        app, "/admin/dashboard", "", "x-admin-token", "wrong").await;
+        app,
+        "/admin/dashboard",
+        "",
+        "x-admin-token",
+        "wrong",
+    )
+    .await;
     assert_eq!(status, 401);
 }
 
@@ -846,8 +902,9 @@ async fn admin_routing_get_requires_token() {
 #[tokio::test]
 async fn admin_routing_get_returns_current_and_options() {
     let app = localllm::router_for_test();
-    let body = localllm::axum_test_get_with_header(
-        app, "/admin/routing", "x-admin-token", "test-token").await;
+    let body =
+        localllm::axum_test_get_with_header(app, "/admin/routing", "x-admin-token", "test-token")
+            .await;
     assert!(body.get("current").is_some());
     let opts = body["options"].as_array().expect("options array");
     assert_eq!(opts.len(), 4);
@@ -867,6 +924,11 @@ async fn admin_history_filter_get_requires_token() {
 async fn admin_history_filter_get_returns_enabled_bool() {
     let app = localllm::router_for_test();
     let body = localllm::axum_test_get_with_header(
-        app, "/admin/history-filter", "x-admin-token", "test-token").await;
+        app,
+        "/admin/history-filter",
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
     assert!(body.get("enabled").and_then(|v| v.as_bool()).is_some());
 }

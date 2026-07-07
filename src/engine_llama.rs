@@ -61,11 +61,11 @@ use std::sync::mpsc as std_mpsc;
 use anyhow::{Context, Result};
 use futures::stream::BoxStream;
 use llama_cpp_2::{
+    context::params::{KvCacheType, LlamaContextParams},
+    context::LlamaContext,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
-    context::LlamaContext,
-    context::params::{KvCacheType, LlamaContextParams},
+    model::{params::LlamaModelParams, AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel},
     sampling::LlamaSampler,
     token::LlamaToken,
 };
@@ -156,10 +156,9 @@ impl LlamaEngine {
         total_ram_mb: u64,
     ) -> Result<Self> {
         // Download (or skip if cached) and get local paths.
-        let paths: Vec<PathBuf> =
-            crate::download::ensure_model(model_id, gguf_files)
-                .await
-                .context("ensure_model failed")?;
+        let paths: Vec<PathBuf> = crate::download::ensure_model(model_id, gguf_files)
+            .await
+            .context("ensure_model failed")?;
 
         let path = paths
             .into_iter()
@@ -181,13 +180,19 @@ impl LlamaEngine {
         let kv_tag = match kv_cache_type {
             KvCacheType::Q8_0 => "q8",
             KvCacheType::Q4_0 => "q4",
-            KvCacheType::F16  => "f16",
-            _                 => "other",
+            KvCacheType::F16 => "f16",
+            _ => "other",
         };
         // Sanitize model_id: keep alphanumeric + dash/dot, collapse rest to '_'.
         let model_tag: String = model_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         // PROMPT_FORMAT_VERSION: bump whenever build_prompt's structure changes
         // (tool serialization, message ordering, stripped blocks). It is part of
@@ -199,7 +204,17 @@ impl LlamaEngine {
 
         // Spawn the persistent worker thread. It owns backend + model + context.
         std::thread::spawn(move || {
-            worker_thread(path, ctx_len_u32, kv_cache_type, gpu_layers, provenance_base, kv_cache_dir, total_ram_mb, rx, load_tx);
+            worker_thread(
+                path,
+                ctx_len_u32,
+                kv_cache_type,
+                gpu_layers,
+                provenance_base,
+                kv_cache_dir,
+                total_ram_mb,
+                rx,
+                load_tx,
+            );
         });
 
         // Wait for the worker to signal successful model load (or an error).
@@ -208,7 +223,10 @@ impl LlamaEngine {
             .await
             .context("worker thread dropped load channel without signalling")??;
 
-        Ok(LlamaEngine { tx, ctx_window: effective_ctx as usize })
+        Ok(LlamaEngine {
+            tx,
+            ctx_window: effective_ctx as usize,
+        })
     }
 }
 
@@ -246,9 +264,7 @@ fn init_llama_logging() {
 fn shared_backend() -> &'static LlamaBackend {
     use std::sync::OnceLock;
     static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
-    BACKEND.get_or_init(|| {
-        LlamaBackend::init().expect("llama backend init (once, process-global)")
-    })
+    BACKEND.get_or_init(|| LlamaBackend::init().expect("llama backend init (once, process-global)"))
 }
 
 /// GPU-layer count for `with_n_gpu_layers`: `None` means "all layers on GPU".
@@ -335,30 +351,34 @@ fn worker_thread(
     let backend = shared_backend();
 
     // --- Load model ---
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(resolve_n_gpu_layers(gpu_layers));
+    let model_params =
+        LlamaModelParams::default().with_n_gpu_layers(resolve_n_gpu_layers(gpu_layers));
     let model = match LlamaModel::load_from_file(backend, &model_path, &model_params)
         .context("LlamaModel::load_from_file failed")
     {
         Ok(m) => m,
-        Err(e) => { let _ = load_tx.send(Err(e)); return; }
+        Err(e) => {
+            let _ = load_tx.send(Err(e));
+            return;
+        }
     };
 
     // --- Fit the requested context to the device memory budget ---
     // Compute the largest context that fits (weights + KV + compute headroom)
     // and clamp the request down to it, instead of OOMing at decode time.
     let n_head = model.n_head();
-    let head_dim = if n_head > 0 { model.n_embd() as u32 / n_head } else { 0 };
+    let head_dim = if n_head > 0 {
+        model.n_embd() as u32 / n_head
+    } else {
+        0
+    };
     let kv_kind = match kv_cache_type {
         KvCacheType::Q8_0 => crate::fit::KvKind::Q8,
         KvCacheType::Q4_0 => crate::fit::KvKind::Q4,
         _ => crate::fit::KvKind::F16,
     };
-    let kv_per_token = crate::fit::kv_bytes_per_token(
-        model.n_layer(),
-        model.n_head_kv(),
-        head_dim,
-        kv_kind,
-    );
+    let kv_per_token =
+        crate::fit::kv_bytes_per_token(model.n_layer(), model.n_head_kv(), head_dim, kv_kind);
     let weights_mb = std::fs::metadata(&model_path)
         .map(|m| (m.len() / (1024 * 1024)) as u32)
         .unwrap_or(0);
@@ -406,11 +426,15 @@ fn worker_thread(
         ctx_len,
     );
     let ctx_params = make_ctx_params(ctx_len, kv_cache_type);
-    let mut ctx = match model.new_context(backend, ctx_params)
+    let mut ctx = match model
+        .new_context(backend, ctx_params)
         .context("new_context failed")
     {
         Ok(c) => c,
-        Err(e) => { let _ = load_tx.send(Err(e)); return; }
+        Err(e) => {
+            let _ = load_tx.send(Err(e));
+            return;
+        }
     };
 
     // Signal successful load, sending back the effective context length.
@@ -485,7 +509,10 @@ fn worker_thread(
                         &req,
                         kv_cache_dir.as_deref(),
                         &provenance_prefix,
-                        |piece| { output.push_str(&piece); true },
+                        |piece| {
+                            output.push_str(&piece);
+                            true
+                        },
                     )
                 }));
                 let result: Result<(usize, usize, bool)> = match panic_result {
@@ -495,7 +522,14 @@ fn worker_thread(
                             target: "localllm::llama",
                             "inference panicked — rebuilding context, continuing worker",
                         );
-                        recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                        recover_context(
+                            &model,
+                            backend,
+                            &mut ctx,
+                            &mut cached_tokens,
+                            ctx_len,
+                            kv_cache_type,
+                        );
                         Err(anyhow::anyhow!("inference panicked"))
                     }
                 };
@@ -516,7 +550,14 @@ fn worker_thread(
                 // On error, rebuild the context so the next request starts on a
                 // fresh backend (a Metal OOM leaves it unrecoverable otherwise).
                 if chat_result.is_err() {
-                    recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                    recover_context(
+                        &model,
+                        backend,
+                        &mut ctx,
+                        &mut cached_tokens,
+                        ctx_len,
+                        kv_cache_type,
+                    );
                 }
                 let _ = reply.send(chat_result);
             }
@@ -551,19 +592,37 @@ fn worker_thread(
                             target: "localllm::llama",
                             "inference panicked (stream) — rebuilding context, continuing worker",
                         );
-                        recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                        recover_context(
+                            &model,
+                            backend,
+                            &mut ctx,
+                            &mut cached_tokens,
+                            ctx_len,
+                            kv_cache_type,
+                        );
                         Err(anyhow::anyhow!("inference panicked"))
                     }
                 };
                 // On error, rebuild the context so the next request starts on a
                 // fresh backend (a Metal OOM leaves it unrecoverable otherwise).
                 if result.is_err() {
-                    recover_context(&model, backend, &mut ctx, &mut cached_tokens, ctx_len, kv_cache_type);
+                    recover_context(
+                        &model,
+                        backend,
+                        &mut ctx,
+                        &mut cached_tokens,
+                        ctx_len,
+                        kv_cache_type,
+                    );
                 }
                 // Terminal delta.
                 match result {
                     Ok((_, _, hit_max)) => {
-                        let finish_reason = if hit_max { FinishReason::Length } else { FinishReason::Stop };
+                        let finish_reason = if hit_max {
+                            FinishReason::Length
+                        } else {
+                            FinishReason::Stop
+                        };
                         let _ = reply_err.blocking_send(Ok(StreamDelta {
                             text: None,
                             done: true,
@@ -623,7 +682,11 @@ fn run_decode_loop(
     kv_cache_dir: Option<&std::path::Path>,
     provenance_prefix: &str,
     mut on_piece: impl FnMut(String) -> bool,
-) -> Result<(usize /*prompt_tokens*/, usize /*generated*/, bool /*hit_max*/)> {
+) -> Result<(
+    usize, /*prompt_tokens*/
+    usize, /*generated*/
+    bool,  /*hit_max*/
+)> {
     // --- Build prompt string ---
     let prompt = build_prompt(model, req)?;
     tracing::debug!(target: "localllm::llama", "prompt ({} chars):\n{}", prompt.len(), truncate_chars(&prompt, 400));
@@ -675,7 +738,8 @@ fn run_decode_loop(
         0
     } else {
         // Remove KV entries from position `common` to end of sequence 0.
-        match ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None)
+        match ctx
+            .clear_kv_cache_seq(Some(0), Some(common as u32), None)
             .context("clear_kv_cache_seq failed")?
         {
             true => common, // partial removal succeeded — reuse the prefix
@@ -705,7 +769,8 @@ fn run_decode_loop(
             .add(tok, pos, &[0_i32], is_last)
             .context("batch.add (prefill) failed")?;
     }
-    ctx.decode(&mut batch).context("ctx.decode (prefill) failed")?;
+    ctx.decode(&mut batch)
+        .context("ctx.decode (prefill) failed")?;
     batch.clear();
 
     // --- Save prefix KV state to disk (if persistence is enabled) ---
@@ -919,8 +984,7 @@ Here are the available tools (compact schema — name(param:type! (desc)) — de
                 } else {
                     msg.text.clone().unwrap_or_default()
                 };
-                let content =
-                    format!("<tool_response>\n{result_content}\n</tool_response>");
+                let content = format!("<tool_response>\n{result_content}\n</tool_response>");
                 // Qwen2.5 expects tool results under the "tool" role.
                 other_messages.push(
                     LlamaChatMessage::new("tool".to_string(), content)
@@ -938,18 +1002,17 @@ Here are the available tools (compact schema — name(param:type! (desc)) — de
     // doesn't produce an empty / broken prompt.
     if chat_messages.is_empty() {
         chat_messages.push(
-            LlamaChatMessage::new("user".to_string(), "Hello".to_string())
-                .expect("static content"),
+            LlamaChatMessage::new("user".to_string(), "Hello".to_string()).expect("static content"),
         );
     }
 
     // If there are tools and no system message, prepend one.
-    if !req.tools.is_empty()
-        && !req.messages.iter().any(|m| m.role == Role::System)
-    {
-        let system_msg =
-            LlamaChatMessage::new("system".to_string(), format!("You are a helpful assistant.{tool_section}"))
-                .context("invalid synthetic system message")?;
+    if !req.tools.is_empty() && !req.messages.iter().any(|m| m.role == Role::System) {
+        let system_msg = LlamaChatMessage::new(
+            "system".to_string(),
+            format!("You are a helpful assistant.{tool_section}"),
+        )
+        .context("invalid synthetic system message")?;
         chat_messages.insert(0, system_msg);
     }
 
@@ -1054,8 +1117,7 @@ fn save_prefix_kv(
     provenance_prefix: &str,
 ) -> Result<()> {
     // Ensure the directory exists.
-    std::fs::create_dir_all(kv_dir)
-        .with_context(|| format!("create_dir_all({kv_dir:?})"))?;
+    std::fs::create_dir_all(kv_dir).with_context(|| format!("create_dir_all({kv_dir:?})"))?;
 
     let hash = hash_tokens(tokens);
     let file_path = kv_dir.join(format!("{provenance_prefix}-{hash:016x}.kvstate"));
@@ -1095,7 +1157,9 @@ fn save_prefix_kv(
 /// Errors are logged but not propagated.
 fn prune_kvstate_files(kv_dir: &std::path::Path, provenance_prefix: &str) {
     let prefix_dash = format!("{provenance_prefix}-");
-    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = match std::fs::read_dir(kv_dir) {
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = match std::fs::read_dir(
+        kv_dir,
+    ) {
         Ok(rd) => rd
             .flatten()
             .filter(|e| {
@@ -1219,7 +1283,10 @@ impl Generator for LlamaEngine {
     async fn generate(&self, req: ChatRequest) -> Result<ChatResult> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Job::Generate { req, reply: reply_tx })
+            .send(Job::Generate {
+                req,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("worker thread has stopped"))?;
         reply_rx
             .await
@@ -1284,9 +1351,7 @@ pub async fn run_smoke_test() -> Result<()> {
     let req = ChatRequest {
         messages: vec![ChatMessage {
             role: Role::User,
-            text: Some(
-                "What's the weather in Recife? Use the get_weather tool.".to_string(),
-            ),
+            text: Some("What's the weather in Recife? Use the get_weather tool.".to_string()),
             tool_calls: vec![],
             tool_result: None,
         }],
@@ -1320,7 +1385,10 @@ pub async fn run_smoke_test() -> Result<()> {
         match part {
             ContentPart::Text(t) => println!("  content[{i}] = Text({t:?})"),
             ContentPart::Call(tc) => {
-                println!("  content[{i}] = Call(name={}, args={})", tc.name, tc.arguments)
+                println!(
+                    "  content[{i}] = Call(name={}, args={})",
+                    tc.name, tc.arguments
+                )
             }
         }
     }

@@ -60,7 +60,11 @@ pub fn compact_tool(tool: &ToolSpec) -> String {
 
 /// Compact a slice of [`ToolSpec`]s, one tool per line.
 pub fn compact_tools_block(tools: &[ToolSpec]) -> String {
-    tools.iter().map(compact_tool).collect::<Vec<_>>().join("\n")
+    tools
+        .iter()
+        .map(compact_tool)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -203,8 +207,14 @@ mod tests {
         assert!(compact.contains("location"), "missing location param");
         assert!(compact.contains("unit"), "missing unit param");
         assert!(compact.contains("celsius"), "missing enum value celsius");
-        assert!(compact.contains("fahrenheit"), "missing enum value fahrenheit");
-        assert!(compact.contains("location:string!"), "missing required marker on location");
+        assert!(
+            compact.contains("fahrenheit"),
+            "missing enum value fahrenheit"
+        );
+        assert!(
+            compact.contains("location:string!"),
+            "missing required marker on location"
+        );
         assert!(
             compact.len() < pretty.len(),
             "compact ({} chars) not shorter than pretty ({} chars)\ncompact: {}\npretty: {}",
@@ -221,15 +231,31 @@ mod tests {
     #[test]
     fn compact_tools_block_one_per_line() {
         let tools = vec![
-            make_tool("tool_a", "First tool", json!({"type":"object","properties":{"x":{"type":"string"}},"required":[]})),
-            make_tool("tool_b", "Second tool", json!({"type":"object","properties":{"y":{"type":"integer"}},"required":[]})),
-            make_tool("tool_c", "Third tool", json!({"type":"object","properties":{}})),
+            make_tool(
+                "tool_a",
+                "First tool",
+                json!({"type":"object","properties":{"x":{"type":"string"}},"required":[]}),
+            ),
+            make_tool(
+                "tool_b",
+                "Second tool",
+                json!({"type":"object","properties":{"y":{"type":"integer"}},"required":[]}),
+            ),
+            make_tool(
+                "tool_c",
+                "Third tool",
+                json!({"type":"object","properties":{}}),
+            ),
         ];
 
         let block = compact_tools_block(&tools);
         let line_count = block.lines().count();
 
-        assert_eq!(line_count, 3, "expected 3 lines, got {}: {:?}", line_count, block);
+        assert_eq!(
+            line_count, 3,
+            "expected 3 lines, got {}: {:?}",
+            line_count, block
+        );
         assert!(block.contains("tool_a"), "missing tool_a");
         assert!(block.contains("tool_b"), "missing tool_b");
         assert!(block.contains("tool_c"), "missing tool_c");

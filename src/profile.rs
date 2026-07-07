@@ -34,7 +34,9 @@ pub fn resolve(
         gpu_layers: saved.gpu_layers.or(rec_gpu),
         history_turns: saved.history_turns.or(rec_hist),
         quant: saved.quant.clone().unwrap_or_else(|| {
-            catalog.map(|c| c.quant.to_string()).unwrap_or_else(|| "Q4_K_M".to_string())
+            catalog
+                .map(|c| c.quant.to_string())
+                .unwrap_or_else(|| "Q4_K_M".to_string())
         }),
     }
 }
@@ -45,22 +47,42 @@ mod tests {
 
     fn cat(rec_kv: Option<KvType>, rec_gpu: Option<u32>, rec_hist: Option<u32>) -> CatalogEntry {
         CatalogEntry {
-            family: "F", display_name: "M", params: "7B", params_b: 7.0, quant: "Q4_K_M",
-            repo: "r", file: "f", size_mb: 4700, ctx_train: 32768,
-            rec_kv, rec_gpu_layers: rec_gpu, rec_history_turns: rec_hist,
+            family: "F",
+            display_name: "M",
+            params: "7B",
+            params_b: 7.0,
+            quant: "Q4_K_M",
+            repo: "r",
+            file: "f",
+            size_mb: 4700,
+            ctx_train: 32768,
+            rec_kv,
+            rec_gpu_layers: rec_gpu,
+            rec_history_turns: rec_hist,
         }
     }
 
     #[test]
     fn saved_wins_over_catalog_and_global() {
         let saved = ExecProfile {
-            ctx: Some(8192), kv_type: Some(KvType::Q4),
-            gpu_layers: Some(10), history_turns: Some(2),
+            ctx: Some(8192),
+            kv_type: Some(KvType::Q4),
+            gpu_layers: Some(10),
+            history_turns: Some(2),
             quant: None,
         };
         let c = cat(Some(KvType::F16), Some(99), Some(9));
         let r = resolve(&saved, Some(&c), 32768, KvType::Q8);
-        assert_eq!(r, Resolved { ctx: 8192, kv_type: KvType::Q4, gpu_layers: Some(10), history_turns: Some(2), quant: "Q4_K_M".to_string() });
+        assert_eq!(
+            r,
+            Resolved {
+                ctx: 8192,
+                kv_type: KvType::Q4,
+                gpu_layers: Some(10),
+                history_turns: Some(2),
+                quant: "Q4_K_M".to_string()
+            }
+        );
     }
 
     #[test]
@@ -68,24 +90,51 @@ mod tests {
         let saved = ExecProfile::default();
         let c = cat(Some(KvType::F16), Some(20), Some(4));
         let r = resolve(&saved, Some(&c), 32768, KvType::Q8);
-        assert_eq!(r, Resolved { ctx: 32768, kv_type: KvType::F16, gpu_layers: Some(20), history_turns: Some(4), quant: "Q4_K_M".to_string() });
+        assert_eq!(
+            r,
+            Resolved {
+                ctx: 32768,
+                kv_type: KvType::F16,
+                gpu_layers: Some(20),
+                history_turns: Some(4),
+                quant: "Q4_K_M".to_string()
+            }
+        );
     }
 
     #[test]
     fn global_fallback_when_nothing_set() {
         let r = resolve(&ExecProfile::default(), None, 32768, KvType::Q8);
-        assert_eq!(r, Resolved { ctx: 32768, kv_type: KvType::Q8, gpu_layers: None, history_turns: None, quant: "Q4_K_M".to_string() });
+        assert_eq!(
+            r,
+            Resolved {
+                ctx: 32768,
+                kv_type: KvType::Q8,
+                gpu_layers: None,
+                history_turns: None,
+                quant: "Q4_K_M".to_string()
+            }
+        );
     }
 
     #[test]
     fn resolve_quant_saved_then_entry_default() {
         // saved wins
-        let saved = ExecProfile { quant: Some("Q8_0".into()), ..Default::default() };
+        let saved = ExecProfile {
+            quant: Some("Q8_0".into()),
+            ..Default::default()
+        };
         let c = cat(None, None, None); // cat's entry has quant "Q4_K_M"
         assert_eq!(resolve(&saved, Some(&c), 32768, KvType::Q8).quant, "Q8_0");
         // empty → entry default
-        assert_eq!(resolve(&ExecProfile::default(), Some(&c), 32768, KvType::Q8).quant, "Q4_K_M");
+        assert_eq!(
+            resolve(&ExecProfile::default(), Some(&c), 32768, KvType::Q8).quant,
+            "Q4_K_M"
+        );
         // no catalog → hard default
-        assert_eq!(resolve(&ExecProfile::default(), None, 32768, KvType::Q8).quant, "Q4_K_M");
+        assert_eq!(
+            resolve(&ExecProfile::default(), None, 32768, KvType::Q8).quant,
+            "Q4_K_M"
+        );
     }
 }

@@ -47,7 +47,12 @@ pub fn est_kv_bytes_per_token(params_b: f32, kv: KvKind) -> u64 {
 /// Largest context (multiple of 256, capped at `n_ctx_train` and `GLOBAL_MAX_CTX`)
 /// whose `weights + KV(ctx) + COMPUTE_HEADROOM` fits in `budget_mb`. Returns 0 if
 /// even `MIN_CTX` does not fit.
-pub fn max_ctx_fit(weights_mb: u32, kv_per_token_bytes: u64, budget_mb: u32, n_ctx_train: u32) -> u32 {
+pub fn max_ctx_fit(
+    weights_mb: u32,
+    kv_per_token_bytes: u64,
+    budget_mb: u32,
+    n_ctx_train: u32,
+) -> u32 {
     let overhead = weights_mb.saturating_add(COMPUTE_HEADROOM_MB);
     let avail_mb = budget_mb.saturating_sub(overhead);
     if avail_mb == 0 || kv_per_token_bytes == 0 {
@@ -75,18 +80,35 @@ pub struct CtxBounds {
 
 /// `max = max_ctx_fit(...)`; `min = MIN_CTX`; `default = min(DEFAULT_SMALL_CTX, max)`.
 /// When the model won't fit, `default` and `max` are both 0.
-pub fn ctx_bounds(weights_mb: u32, kv_per_token_bytes: u64, budget_mb: u32, n_ctx_train: u32) -> CtxBounds {
+pub fn ctx_bounds(
+    weights_mb: u32,
+    kv_per_token_bytes: u64,
+    budget_mb: u32,
+    n_ctx_train: u32,
+) -> CtxBounds {
     let max = max_ctx_fit(weights_mb, kv_per_token_bytes, budget_mb, n_ctx_train);
     if max == 0 {
-        return CtxBounds { min: MIN_CTX, default: 0, max: 0 };
+        return CtxBounds {
+            min: MIN_CTX,
+            default: 0,
+            max: 0,
+        };
     }
-    CtxBounds { min: MIN_CTX, default: DEFAULT_SMALL_CTX.min(max), max }
+    CtxBounds {
+        min: MIN_CTX,
+        default: DEFAULT_SMALL_CTX.min(max),
+        max,
+    }
 }
 
 /// Usable memory budget in MB: `METAL_BUDGET_PCT` of RAM when a GPU is present
 /// (Apple unified memory ≈ the Metal working-set cap), else `CPU_BUDGET_PCT`.
 pub fn device_budget_mb(total_ram_mb: u64, gpu_present: bool) -> u32 {
-    let pct = if gpu_present { METAL_BUDGET_PCT } else { CPU_BUDGET_PCT };
+    let pct = if gpu_present {
+        METAL_BUDGET_PCT
+    } else {
+        CPU_BUDGET_PCT
+    };
     (total_ram_mb * pct / 100) as u32
 }
 
@@ -115,7 +137,10 @@ mod tests {
         // Phi-4 exact 108800; heuristic from 14B should be within 2x.
         let est = est_kv_bytes_per_token(14.0, KvKind::Q8) as f64;
         let exact = 108800.0;
-        assert!(est > exact / 2.0 && est < exact * 2.0, "est={est} exact={exact}");
+        assert!(
+            est > exact / 2.0 && est < exact * 2.0,
+            "est={est} exact={exact}"
+        );
     }
 
     #[test]
@@ -171,7 +196,7 @@ mod tests {
 
     #[test]
     fn device_budget_gpu_vs_cpu() {
-        assert_eq!(device_budget_mb(16384, true), 12779);  // 78%
+        assert_eq!(device_budget_mb(16384, true), 12779); // 78%
         assert_eq!(device_budget_mb(16384, false), 10649); // 65%
     }
 }

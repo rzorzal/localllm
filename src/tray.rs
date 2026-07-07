@@ -32,15 +32,14 @@
 
 use std::time::{Duration, Instant};
 
-use tray_icon::{
-    TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
-    Icon,
-};
-use std::sync::{Arc, RwLock};
 use crate::route::{Profile, RoutingPolicy};
+use std::sync::{Arc, RwLock};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    Icon, TrayIconBuilder,
+};
 
 use crate::config::Config;
 
@@ -131,8 +130,7 @@ pub fn render_icon_rgba(size: u32) -> Vec<u8> {
         let _ = dx;
         let ddx = px - cx;
         let ddy = py - cy;
-        px >= x && px <= x + w && py >= y && py <= y + h
-            && ddx * ddx + ddy * ddy <= rad * rad + 0.5
+        px >= x && px <= x + w && py >= y && py <= y + h && ddx * ddx + ddy * ddy <= rad * rad + 0.5
     };
 
     for y in 0..size {
@@ -162,7 +160,9 @@ pub fn render_icon_rgba(size: u32) -> Vec<u8> {
                 && px >= tail_x
                 && (px - tail_x) <= (tail_y + s * 0.12 - py);
             if in_bubble || in_tail {
-                cr = 255.0; cg = 255.0; cb = 255.0;
+                cr = 255.0;
+                cg = 255.0;
+                cb = 255.0;
             }
             // spark: three dots inside the bubble (suggesting chat/AI)
             let dot_y = by + bh * 0.5;
@@ -253,7 +253,11 @@ mod tests {
 
     #[test]
     fn label_handles_repo_without_owner() {
-        let spec = ModelSpec { repo: "local".into(), file: "m.gguf".into(), quant: None };
+        let spec = ModelSpec {
+            repo: "local".into(),
+            file: "m.gguf".into(),
+            quant: None,
+        };
         assert_eq!(model_menu_label(&spec), "Model:  local / m.gguf");
     }
 
@@ -263,7 +267,11 @@ mod tests {
     fn status(state: &str, phase: SwitchPhase, progress: u8) -> SwitchStatus {
         SwitchStatus {
             state: state.into(),
-            current: ModelSpec { repo: "r".into(), file: "f".into(), quant: None },
+            current: ModelSpec {
+                repo: "r".into(),
+                file: "f".into(),
+                quant: None,
+            },
             target: None,
             phase,
             progress,
@@ -273,7 +281,10 @@ mod tests {
 
     #[test]
     fn status_ready_is_running() {
-        assert_eq!(status_menu_label(&status("ready", SwitchPhase::Idle, 0)), "🟢 Running");
+        assert_eq!(
+            status_menu_label(&status("ready", SwitchPhase::Idle, 0)),
+            "🟢 Running"
+        );
     }
 
     #[test]
@@ -286,7 +297,10 @@ mod tests {
 
     #[test]
     fn status_error_is_failed() {
-        assert_eq!(status_menu_label(&status("error", SwitchPhase::Idle, 0)), "🔴 Switch failed");
+        assert_eq!(
+            status_menu_label(&status("error", SwitchPhase::Idle, 0)),
+            "🔴 Switch failed"
+        );
     }
 }
 
@@ -381,8 +395,9 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // Resolve the startup profile (CLI > saved > default) and build the
     // policy the menu and server share. The menu mutates it live.
     let initial_profile = crate::settings::resolve_profile(cfg.profile);
-    let policy: Arc<RwLock<RoutingPolicy>> =
-        Arc::new(RwLock::new(crate::settings::resolve_policy(initial_profile)));
+    let policy: Arc<RwLock<RoutingPolicy>> = Arc::new(RwLock::new(
+        crate::settings::resolve_policy(initial_profile),
+    ));
     let policy_for_server = policy.clone();
 
     // Shared circuit breaker: the server reads/trips it per request; the tray
@@ -405,8 +420,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     std::thread::Builder::new()
         .name("localllm-server".to_string())
         .spawn(move || {
-            let rt = tokio::runtime::Runtime::new()
-                .expect("failed to build server tokio runtime");
+            let rt = tokio::runtime::Runtime::new().expect("failed to build server tokio runtime");
             if let Err(e) = rt.block_on(crate::run_server_with_ready_policy_token(
                 cfg,
                 Some(ready_for_server),
@@ -438,7 +452,11 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     let mut _tray_keeper: Vec<tray_icon::TrayIcon> = Vec::new();
     let url_for_tray = url.clone();
     // Short model name (drop the "Owner/" prefix) for a tidy menu line.
-    let model_short = info_model.rsplit('/').next().unwrap_or(&info_model).to_string();
+    let model_short = info_model
+        .rsplit('/')
+        .next()
+        .unwrap_or(&info_model)
+        .to_string();
     // Set in Init; compared against menu events to dispatch clicks.
     let mut quit_id: Option<tray_icon::menu::MenuId> = None;
     let mut logs_id: Option<tray_icon::menu::MenuId> = None;
@@ -456,8 +474,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // Config page. last_routing avoids redundant set_text on every poll tick.
     let mut routing_status: Option<MenuItem> = None;
     let mut last_routing: Option<Profile> = None;
-    let log_path = std::env::var("LOCALLLM_LOG")
-        .unwrap_or_else(|_| "/tmp/localllm.log".to_string());
+    let log_path =
+        std::env::var("LOCALLLM_LOG").unwrap_or_else(|_| "/tmp/localllm.log".to_string());
 
     // Config window state: None until first open, then single-instance. The
     // Config submenu items each open/show it and navigate to their SPA route.
@@ -496,7 +514,11 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let status = MenuItem::new("🟡 Loading model…", false, None);
                 status_handle = Some(status.clone());
                 // URL is clickable → copies to clipboard.
-                let url_line = MenuItem::new(format!("URL:    {url_for_tray}  (click to copy)"), true, None);
+                let url_line = MenuItem::new(
+                    format!("URL:    {url_for_tray}  (click to copy)"),
+                    true,
+                    None,
+                );
                 url_id = Some(url_line.id().clone());
                 let model_line = MenuItem::new(format!("Model:  {model_short}"), false, None);
                 model_handle = Some(model_line.clone());
@@ -514,11 +536,21 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 config_models_id = Some(cfg_models.id().clone());
                 config_tools_id = Some(cfg_tools.id().clone());
                 config_dash_id = Some(cfg_dash.id().clone());
-                config_submenu.append(&cfg_home).expect("append config home");
-                config_submenu.append(&PredefinedMenuItem::separator()).expect("config sep");
-                config_submenu.append(&cfg_models).expect("append config models");
-                config_submenu.append(&cfg_tools).expect("append config tools");
-                config_submenu.append(&cfg_dash).expect("append config dashboard");
+                config_submenu
+                    .append(&cfg_home)
+                    .expect("append config home");
+                config_submenu
+                    .append(&PredefinedMenuItem::separator())
+                    .expect("config sep");
+                config_submenu
+                    .append(&cfg_models)
+                    .expect("append config models");
+                config_submenu
+                    .append(&cfg_tools)
+                    .expect("append config tools");
+                config_submenu
+                    .append(&cfg_dash)
+                    .expect("append config dashboard");
                 let quit_item = MenuItem::new("⏻  Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
@@ -527,19 +559,12 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
 
                 // Routing is now chosen from the Config page; the tray shows the
                 // current profile as a read-only line, refreshed each poll tick.
-                let routing_line = MenuItem::new(
-                    format!("Routing: {}", initial_profile.label()),
-                    false,
-                    None,
-                );
+                let routing_line =
+                    MenuItem::new(format!("Routing: {}", initial_profile.label()), false, None);
                 routing_status = Some(routing_line.clone());
 
                 let init_state = crate::settings::load_integrations();
-                let wired_line = MenuItem::new(
-                    wired_label(&init_state),
-                    false,
-                    None,
-                );
+                let wired_line = MenuItem::new(wired_label(&init_state), false, None);
                 wired_handle = Some(wired_line.clone());
 
                 menu.append(&title).expect("append title");
@@ -552,10 +577,13 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&backend_line).expect("append backend");
                 menu.append(&PredefinedMenuItem::separator()).expect("sep2");
                 menu.append(&routing_line).expect("append routing line");
-                menu.append(&retry_cloud_item).expect("append retry cloud item");
-                menu.append(&PredefinedMenuItem::separator()).expect("append separator");
+                menu.append(&retry_cloud_item)
+                    .expect("append retry cloud item");
+                menu.append(&PredefinedMenuItem::separator())
+                    .expect("append separator");
                 menu.append(&wired_line).expect("append wired line");
-                menu.append(&PredefinedMenuItem::separator()).expect("append separator2");
+                menu.append(&PredefinedMenuItem::separator())
+                    .expect("append separator2");
                 menu.append(&logs_item).expect("append logs item");
                 menu.append(&config_submenu).expect("append config submenu");
                 menu.append(&quit_item).expect("append quit item");
@@ -575,8 +603,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
             // Poll the tray-icon menu-event channel on every wake-up.
             // On macOS tray-icon fires events through crossbeam, not via
             // tao Event enum variants, so we must poll explicitly.
-            Event::MainEventsCleared
-            | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+            Event::MainEventsCleared | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 // Flip status to green once the server is actually serving.
                 // Until the server is bound, keep the launch-time "Loading model…"
                 // line. Once ready, drive both the status and the model line from
@@ -668,15 +695,17 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                                 w.window.set_focus();
                                 w.navigate(route);
                             }
-                            None => match window::ModelManagerWindow::open(target, port, &admin_token) {
-                                Ok(w) => {
-                                    w.navigate(route);
-                                    manager_window = Some(w);
+                            None => {
+                                match window::ModelManagerWindow::open(target, port, &admin_token) {
+                                    Ok(w) => {
+                                        w.navigate(route);
+                                        manager_window = Some(w);
+                                    }
+                                    Err(e) => tracing::error!(
+                                        "Config window failed: {e} (needs WebView2/WebKitGTK)"
+                                    ),
                                 }
-                                Err(e) => tracing::error!(
-                                    "Config window failed: {e} (needs WebView2/WebKitGTK)"
-                                ),
-                            },
+                            }
                         }
                     }
                 }

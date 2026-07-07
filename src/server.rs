@@ -14,11 +14,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    Json, Router,
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::sse::{Event, Sse},
     routing::{get, post},
+    Json, Router,
 };
 use futures::stream::BoxStream;
 use serde_json::json;
@@ -26,9 +26,9 @@ use serde_json::json;
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 
+use crate::api::anthropic::AnthRequest;
 use crate::api::common::{ChatRequest, ChatResult, StreamDelta};
 use crate::api::openai::{OaiChatRequest, OaiModelInfo, OaiModelList};
-use crate::api::anthropic::AnthRequest;
 
 /// Constant-time byte comparison: false on length mismatch, otherwise XOR-
 /// accumulate so the timing does not depend on where the first difference is.
@@ -56,7 +56,9 @@ pub fn resolve_admin_token(cli: Option<String>) -> String {
 /// with 0600 perms so the tray/window/CLI can read it. Logs only that it wrote
 /// the file, never the value.
 pub fn write_admin_token_file(token: &str) {
-    let Some(dir) = dirs::config_dir() else { return };
+    let Some(dir) = dirs::config_dir() else {
+        return;
+    };
     let path = dir.join("localllm").join("admin-token");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -250,12 +252,7 @@ fn route_decision(
     // Circuit breaker: if cloud recently failed, skip it during the cooldown and
     // serve local. Budget takes precedence (already forced above). A half-open
     // probe is consumed here only when the decision is cloud-bound.
-    let breaker_block = breaker_gate_block(
-        &state.breaker,
-        &decision,
-        budget_forced,
-        now as u64,
-    );
+    let breaker_block = breaker_gate_block(&state.breaker, &decision, budget_forced, now as u64);
     let decision = if breaker_block.is_some() {
         crate::route::Decision::Local
     } else {
@@ -304,7 +301,10 @@ fn route_decision(
         .map(|t| {
             let t = t.trim();
             if t.chars().count() > PROMPT_SNIPPET_MAX {
-                format!("{}…", t.chars().take(PROMPT_SNIPPET_MAX).collect::<String>())
+                format!(
+                    "{}…",
+                    t.chars().take(PROMPT_SNIPPET_MAX).collect::<String>()
+                )
             } else {
                 t.to_string()
             }
@@ -344,7 +344,10 @@ fn route_decision(
                 .into_iter()
                 .filter(|t| t.len() >= 2)
                 .collect();
-        let mut map = state.recent_prompts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = state
+            .recent_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let buf = map.entry(surface.to_string()).or_default();
         if let Some(prev_rid) = detect_reask(buf, &tokens, now) {
             crate::route_log::append_feedback(&crate::route_log::FeedbackEntry {
@@ -354,7 +357,11 @@ fn route_decision(
             });
         }
         if !matches!(decision, crate::route::Decision::Cloud(_)) {
-            buf.push_front(RecentPrompt { rid: rid.to_string(), ts: now, tokens });
+            buf.push_front(RecentPrompt {
+                rid: rid.to_string(),
+                ts: now,
+                tokens,
+            });
             buf.truncate(REASK_BUFFER_CAP);
         }
     }
@@ -436,7 +443,10 @@ fn log_degrade_fallback(
 /// failure notifies again.
 fn record_cloud_success(state: &AppState, est_prompt_tokens: usize) {
     state.usage.note_success();
-    if state.breaker.on_success(crate::route_log::now_secs() as u64) {
+    if state
+        .breaker
+        .on_success(crate::route_log::now_secs() as u64)
+    {
         crate::usage::notify("localllm — cloud recovered", "Cloud back — resuming.");
     }
     // Charge the budget with a prompt-only estimate. The model id is not known
@@ -512,7 +522,11 @@ fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
                     entry.insert(t.name.clone(), t.description.clone());
                 }
             }
-            if entry.len() != before { Some(entry.clone()) } else { None }
+            if entry.len() != before {
+                Some(entry.clone())
+            } else {
+                None
+            }
         };
         if let Some(descs) = descs_grown {
             if let Err(e) = crate::settings::save_tool_descs(surface, &descs) {
@@ -522,7 +536,10 @@ fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
         // Union the request's tool names into the seen set (seeded from the
         // persisted set the first time this surface is touched this session).
         let grown: Option<Vec<String>> = {
-            let mut reg = state.tool_registry.lock().unwrap_or_else(|e| e.into_inner());
+            let mut reg = state
+                .tool_registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let entry = reg
                 .entry(surface.to_string())
                 .or_insert_with(|| crate::settings::load_tool_seen(surface));
@@ -534,7 +551,11 @@ fn shape_tools(state: &AppState, surface: &str, req: &mut ChatRequest) {
             }
             entry.sort();
             entry.dedup();
-            if entry.len() != before { Some(entry.clone()) } else { None }
+            if entry.len() != before {
+                Some(entry.clone())
+            } else {
+                None
+            }
         };
         if let Some(seen) = grown {
             if let Err(e) = crate::settings::save_tool_seen(surface, &seen) {
@@ -601,7 +622,17 @@ async fn cascade_or_result(
                     ts: crate::route_log::now_secs(),
                     signal: "cascade".to_string(),
                 });
-                match crate::cloud::forward(provider, upstream_path, headers, raw, Some(crate::cloud::RelayMeter { rid: rid.to_string() })).await {
+                match crate::cloud::forward(
+                    provider,
+                    upstream_path,
+                    headers,
+                    raw,
+                    Some(crate::cloud::RelayMeter {
+                        rid: rid.to_string(),
+                    }),
+                )
+                .await
+                {
                     crate::cloud::ForwardOutcome::Relayed(resp) => {
                         record_cloud_success(state, est_prompt_tokens);
                         Err(resp)
@@ -610,7 +641,9 @@ async fn cascade_or_result(
                         if state.usage.note_degrade() {
                             crate::usage::notify("localllm — cloud degraded", d.message());
                         }
-                        state.breaker.on_failure(crate::route_log::now_secs() as u64, d);
+                        state
+                            .breaker
+                            .on_failure(crate::route_log::now_secs() as u64, d);
                         tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade cloud degraded ({d:?}) → keeping local result");
                         Ok(result) // serve the (truncated) local answer we already have
                     }
@@ -627,7 +660,17 @@ async fn cascade_or_result(
                     ts: crate::route_log::now_secs(),
                     signal: "cascade".to_string(),
                 });
-                match crate::cloud::forward(provider, upstream_path, headers, raw, Some(crate::cloud::RelayMeter { rid: rid.to_string() })).await {
+                match crate::cloud::forward(
+                    provider,
+                    upstream_path,
+                    headers,
+                    raw,
+                    Some(crate::cloud::RelayMeter {
+                        rid: rid.to_string(),
+                    }),
+                )
+                .await
+                {
                     crate::cloud::ForwardOutcome::Relayed(resp) => {
                         record_cloud_success(state, est_prompt_tokens);
                         Err(resp)
@@ -636,13 +679,19 @@ async fn cascade_or_result(
                         if state.usage.note_degrade() {
                             crate::usage::notify("localllm — cloud degraded", d.message());
                         }
-                        state.breaker.on_failure(crate::route_log::now_secs() as u64, d);
+                        state
+                            .breaker
+                            .on_failure(crate::route_log::now_secs() as u64, d);
                         Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("local generation failed and cloud degraded ({d:?})")}))).into_response())
                     }
                 }
             } else {
                 tracing::error!(target: "localllm::req", "{rid} [{api}] 500 generate: {e}");
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response())
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response())
             }
         }
     }
@@ -695,11 +744,16 @@ pub struct AppState {
     pub kv_kind: crate::fit::KvKind,
     /// Per-surface discovery of the tool names seen on recent requests
     /// (surface -> latest sorted-unique names). In-memory; re-discovered on restart.
-    pub tool_registry: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
+    pub tool_registry:
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
     /// Per-surface tool descriptions seen this session (surface -> name -> desc).
     /// In-memory only; re-captured as requests carry them. Rendered in the Tools
     /// view when available.
-    pub tool_descs: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>>,
+    pub tool_descs: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+        >,
+    >,
     /// TCP port this server listens on — needed to (re)wire agent client configs
     /// via `POST /admin/integrations`.
     pub port: u16,
@@ -709,8 +763,11 @@ pub struct AppState {
     pub breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
     /// Per-surface ring of recent LOCAL decisions (rid, ts, prompt token set)
     /// for re-ask detection. In-memory; cap REASK_BUFFER_CAP per surface.
-    pub recent_prompts: std::sync::Arc<std::sync::Mutex<
-        std::collections::BTreeMap<String, std::collections::VecDeque<RecentPrompt>>>>,
+    pub recent_prompts: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<String, std::collections::VecDeque<RecentPrompt>>,
+        >,
+    >,
 }
 
 // Implement Generator for Engine by delegating to its inherent methods.
@@ -748,16 +805,37 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route("/admin/model/status", get(handle_admin_status))
         .route("/admin/model/ctx", post(handle_model_set_ctx))
         .route("/admin/model/profile", post(handle_model_set_profile))
-        .route("/admin/models", get(handle_models_catalog).delete(handle_model_delete))
+        .route(
+            "/admin/models",
+            get(handle_models_catalog).delete(handle_model_delete),
+        )
         .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
-        .route("/admin/integrations", get(handle_integrations_get).post(handle_integrations_set))
-        .route("/admin/routing", get(handle_routing_get).post(handle_routing_set))
-        .route("/admin/threshold", get(handle_threshold_get).post(handle_threshold_set))
-        .route("/admin/budget", get(handle_budget_get).post(handle_budget_set))
+        .route(
+            "/admin/integrations",
+            get(handle_integrations_get).post(handle_integrations_set),
+        )
+        .route(
+            "/admin/routing",
+            get(handle_routing_get).post(handle_routing_set),
+        )
+        .route(
+            "/admin/threshold",
+            get(handle_threshold_get).post(handle_threshold_set),
+        )
+        .route(
+            "/admin/budget",
+            get(handle_budget_get).post(handle_budget_set),
+        )
         .route("/admin/breaker", get(handle_breaker_get))
         .route("/admin/breaker/reset", post(handle_breaker_reset))
-        .route("/admin/history-filter", get(handle_history_filter_get).post(handle_history_filter_set))
-        .route("/admin/dashboard", get(handle_dashboard).delete(handle_dashboard_clear))
+        .route(
+            "/admin/history-filter",
+            get(handle_history_filter_get).post(handle_history_filter_set),
+        )
+        .route(
+            "/admin/dashboard",
+            get(handle_dashboard).delete(handle_dashboard_clear),
+        )
         .route("/admin/export", get(handle_export))
         .route("/metrics", get(handle_metrics))
         .route("/manager", get(handle_manager_page))
@@ -796,12 +874,10 @@ pub fn router(
         total_ram_mb,
         requested_ctx_ceiling,
         kv_kind,
-        tool_registry: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::BTreeMap::new(),
-        )),
-        tool_descs: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::BTreeMap::new(),
-        )),
+        tool_registry: std::sync::Arc::new(
+            std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ),
+        tool_descs: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         port,
         budget: {
             let b = std::sync::Arc::new(crate::budget::Budget::new());
@@ -846,7 +922,11 @@ async fn handle_history_filter_set(
     let body: HistoryFilterSetBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     if let Err(e) = crate::settings::save_smart_history(body.enabled) {
@@ -890,7 +970,11 @@ async fn handle_routing_set(
     let body: RoutingSetBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     // Resolve applies the user's Balanced threshold override, if any.
@@ -934,7 +1018,11 @@ async fn handle_threshold_set(
     let body: ThresholdSetBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     let t = (body.percent / 100.0).clamp(0.0, 1.0);
@@ -943,7 +1031,11 @@ async fn handle_threshold_set(
     }
     // Live-apply only when Balanced is active; other profiles keep their knobs.
     if crate::settings::load_profile() == crate::route::Profile::Balanced {
-        state.policy.write().unwrap_or_else(|e| e.into_inner()).escalation_threshold = t;
+        state
+            .policy
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .escalation_threshold = t;
     }
     Json(json!({ "percent": (t * 100.0).round() as i64, "value": t })).into_response()
 }
@@ -962,7 +1054,8 @@ async fn handle_budget_get(
     let remaining = (daily_usd - spent).max(0.0);
     let over = enabled && daily_usd > 0.0 && spent >= daily_usd;
     Json(json!({ "enabled": enabled, "daily_usd": daily_usd,
-        "spent_today": spent, "remaining": remaining, "over": over })).into_response()
+        "spent_today": spent, "remaining": remaining, "over": over }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -984,7 +1077,11 @@ async fn handle_budget_set(
     let body: BudgetSetBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     let (cur_en, cur_usd) = crate::settings::load_budget();
@@ -1059,7 +1156,11 @@ async fn handle_integrations_set(
     let body: IntegrationsSetBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     let injectors = crate::integrations::injectors_default();
@@ -1094,7 +1195,8 @@ async fn handle_dashboard(
     }
     let entries = crate::route_log::read_all();
     let balanced = crate::settings::load_profile() == crate::route::Profile::Balanced;
-    let dash = crate::route_log::build_dashboard(&entries, crate::route_log::now_secs(), 50, balanced);
+    let dash =
+        crate::route_log::build_dashboard(&entries, crate::route_log::now_secs(), 50, balanced);
     Json(dash).into_response()
 }
 
@@ -1116,29 +1218,41 @@ fn export_csv(lines: &[crate::route_log::LogLine]) -> String {
     use crate::route_log::LogLine;
     let mut out = String::from(
         "kind,rid,ts,surface,dest,reason,degrade_reason,model,prompt_tok,completion_tok,ttft_ms,gen_ms,cost_saved_usd\n");
-    let esc = |s: &str| if s.contains(',') || s.contains('"') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
+    let esc = |s: &str| {
+        if s.contains(',') || s.contains('"') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
     };
     for l in lines {
         match l {
             LogLine::Decision(d) => out.push_str(&format!(
                 "d,{},{},{},{},{},{},{},{},,,,\n",
-                esc(&d.rid), d.ts, esc(&d.surface), esc(&d.dest),
+                esc(&d.rid),
+                d.ts,
+                esc(&d.surface),
+                esc(&d.dest),
                 esc(d.reason.as_deref().unwrap_or("")),
                 esc(d.degrade_reason.as_deref().unwrap_or("")),
-                esc(d.model.as_deref().unwrap_or("")), d.prompt_tok)),
+                esc(d.model.as_deref().unwrap_or("")),
+                d.prompt_tok
+            )),
             LogLine::Outcome(o) => out.push_str(&format!(
                 "o,{},{},,,,,,,{},{},{},{}\n",
-                esc(&o.rid), o.ts,
+                esc(&o.rid),
+                o.ts,
                 o.completion_tok.map(|v| v.to_string()).unwrap_or_default(),
                 o.ttft_ms.map(|v| v.to_string()).unwrap_or_default(),
                 o.gen_ms.map(|v| v.to_string()).unwrap_or_default(),
-                o.cost_saved_usd)),
+                o.cost_saved_usd
+            )),
             LogLine::Feedback(f) => out.push_str(&format!(
                 "f,{},{},,,{},,,,,,,\n",
-                esc(&f.rid), f.ts, esc(&f.signal))),
+                esc(&f.rid),
+                f.ts,
+                esc(&f.signal)
+            )),
         }
     }
     out
@@ -1157,16 +1271,30 @@ async fn handle_export(
     axum::extract::Query(q): axum::extract::Query<ExportQuery>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !constant_time_eq(q.token.as_deref().unwrap_or("").as_bytes(), state.admin_token.as_bytes()) {
+    if !constant_time_eq(
+        q.token.as_deref().unwrap_or("").as_bytes(),
+        state.admin_token.as_bytes(),
+    ) {
         return (StatusCode::UNAUTHORIZED, "invalid admin token").into_response();
     }
     let lines = crate::route_log::read_all();
     let (body, ct, disp) = if q.format.as_deref() == Some("csv") {
-        (export_csv(&lines), "text/csv", "attachment; filename=\"routing-log.csv\"")
+        (
+            export_csv(&lines),
+            "text/csv",
+            "attachment; filename=\"routing-log.csv\"",
+        )
     } else {
-        let jsonl = lines.iter().filter_map(|l| serde_json::to_string(l).ok())
-            .collect::<Vec<_>>().join("\n");
-        (jsonl, "application/x-ndjson", "attachment; filename=\"routing-log.jsonl\"")
+        let jsonl = lines
+            .iter()
+            .filter_map(|l| serde_json::to_string(l).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            jsonl,
+            "application/x-ndjson",
+            "attachment; filename=\"routing-log.jsonl\"",
+        )
     };
     (
         [
@@ -1174,7 +1302,8 @@ async fn handle_export(
             (axum::http::header::CONTENT_DISPOSITION, disp),
         ],
         body,
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Render 30-day routing counters in Prometheus text format.
@@ -1192,8 +1321,12 @@ fn metrics_text(lines: &[crate::route_log::LogLine], now: i64) -> String {
          # TYPE localllm_ttft_ms gauge\n\
          localllm_ttft_ms{{dest=\"local\"}} {}\n\
          localllm_ttft_ms{{dest=\"cloud\"}} {}\n",
-        d.month.local_count, d.month.cloud_count, d.month.cost_saved_usd,
-        d.local_latency.avg_ttft_ms, d.cloud_latency.avg_ttft_ms)
+        d.month.local_count,
+        d.month.cloud_count,
+        d.month.cost_saved_usd,
+        d.local_latency.avg_ttft_ms,
+        d.cloud_latency.avg_ttft_ms
+    )
 }
 
 /// GET /metrics — Prometheus text (token-guarded via header; scrapers set it).
@@ -1206,7 +1339,14 @@ async fn handle_metrics(
         return resp;
     }
     let text = metrics_text(&crate::route_log::read_all(), crate::route_log::now_secs());
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        text,
+    )
+        .into_response()
 }
 
 /// Verify the `X-Admin-Token` header against the configured token (constant-time).
@@ -1272,8 +1412,7 @@ struct SetToolsBody {
 /// escape the cache directory when joined into `download::cache_path`. Rejects
 /// `""`, `..`, and anything containing `/` or `\`.
 fn is_safe_model_file(file: &str) -> bool {
-    !file.is_empty()
-        && std::path::Path::new(file).file_name() == Some(std::ffi::OsStr::new(file))
+    !file.is_empty() && std::path::Path::new(file).file_name() == Some(std::ffi::OsStr::new(file))
 }
 
 /// POST /admin/model — start a model switch (token-guarded).
@@ -1289,7 +1428,11 @@ async fn handle_admin_switch(
     let body: AdminSwitchBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     if body.repo.is_empty() || !is_safe_model_file(&body.file) {
@@ -1299,11 +1442,18 @@ async fn handle_admin_switch(
         )
             .into_response();
     }
-    let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: body.quant };
-    let (save_repo, save_file, save_quant) = (spec.repo.clone(), spec.file.clone(), spec.quant.clone());
+    let spec = crate::model_manager::ModelSpec {
+        repo: body.repo,
+        file: body.file,
+        quant: body.quant,
+    };
+    let (save_repo, save_file, save_quant) =
+        (spec.repo.clone(), spec.file.clone(), spec.quant.clone());
     match state.manager.start_switch(spec) {
         Ok(()) => {
-            if let Err(e) = crate::settings::save_active_model(&save_repo, &save_file, save_quant.as_deref()) {
+            if let Err(e) =
+                crate::settings::save_active_model(&save_repo, &save_file, save_quant.as_deref())
+            {
                 tracing::warn!("failed to persist active model: {e}");
             }
             (StatusCode::ACCEPTED, Json(json!({"state": "switching"}))).into_response()
@@ -1365,11 +1515,18 @@ async fn handle_model_delete(
     let body: AdminSwitchBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     if body.repo.is_empty() || !is_safe_model_file(&body.file) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and a valid (non-path) file are required"})))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "repo and a valid (non-path) file are required"})),
+        )
             .into_response();
     }
     let active = state.manager.status().current;
@@ -1380,9 +1537,13 @@ async fn handle_model_delete(
         )
             .into_response();
     }
-    let entry = crate::catalog::CATALOG.iter().find(|e| e.repo == body.repo && e.file == body.file);
+    let entry = crate::catalog::CATALOG
+        .iter()
+        .find(|e| e.repo == body.repo && e.file == body.file);
     let files: Vec<String> = match (&body.quant, entry) {
-        (Some(q), Some(e)) => crate::catalog::files_for_quant(e, q).unwrap_or_else(|| vec![body.file.clone()]),
+        (Some(q), Some(e)) => {
+            crate::catalog::files_for_quant(e, q).unwrap_or_else(|| vec![body.file.clone()])
+        }
         _ => vec![body.file.clone()],
     };
     let mut any = false;
@@ -1406,45 +1567,79 @@ async fn handle_model_set_ctx(
     let body: AdminCtxBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     if body.repo.is_empty() || !is_safe_model_file(&body.file) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and a valid (non-path) file are required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "repo and a valid (non-path) file are required"})),
+        )
+            .into_response();
     }
-    let Some(entry) = crate::catalog::CATALOG.iter().find(|e| e.repo == body.repo && e.file == body.file) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown model"}))).into_response();
+    let Some(entry) = crate::catalog::CATALOG
+        .iter()
+        .find(|e| e.repo == body.repo && e.file == body.file)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unknown model"})),
+        )
+            .into_response();
     };
 
     let key = crate::settings::model_ctx_key(&body.repo, &body.file);
     let cleared = body.ctx == 0;
     if cleared {
         if let Err(e) = crate::settings::clear_model_ctx(&key) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     } else {
         let budget_mb = crate::fit::device_budget_mb(state.total_ram_mb, true);
         let kv_per_token = crate::fit::est_kv_bytes_per_token(entry.params_b, state.kv_kind);
-        let bounds = crate::fit::ctx_bounds(entry.size_mb, kv_per_token, budget_mb, entry.ctx_train);
+        let bounds =
+            crate::fit::ctx_bounds(entry.size_mb, kv_per_token, budget_mb, entry.ctx_train);
         if bounds.max == 0 || body.ctx < bounds.min || body.ctx > bounds.max {
-            return (StatusCode::BAD_REQUEST, Json(json!({
-                "error": format!("ctx must be in the range {}..{}", bounds.min, bounds.max)
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("ctx must be in the range {}..{}", bounds.min, bounds.max)
+                })),
+            )
+                .into_response();
         }
         if let Err(e) = crate::settings::save_model_ctx(&key, body.ctx) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     }
 
     // Reload if this is the active model so the new ctx takes effect now.
     let active = state.manager.status().current;
     if active.repo == body.repo && active.file == body.file {
-        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: None };
+        let spec = crate::model_manager::ModelSpec {
+            repo: body.repo,
+            file: body.file,
+            quant: None,
+        };
         match state.manager.start_switch(spec) {
             Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
-            Err(crate::model_manager::SwitchError::AlreadySwitching) => {
-                (StatusCode::CONFLICT, Json(json!({"error": "a switch is already in progress"}))).into_response()
-            }
+            Err(crate::model_manager::SwitchError::AlreadySwitching) => (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "a switch is already in progress"})),
+            )
+                .into_response(),
         }
     } else if cleared {
         (StatusCode::OK, Json(json!({"cleared": true}))).into_response()
@@ -1468,14 +1663,29 @@ async fn handle_model_set_profile(
     let body: SetProfileBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     };
     if body.repo.is_empty() || !is_safe_model_file(&body.file) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "repo and a valid (non-path) file are required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "repo and a valid (non-path) file are required"})),
+        )
+            .into_response();
     }
-    let Some(entry) = crate::catalog::CATALOG.iter().find(|e| e.repo == body.repo && e.file == body.file) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown model"}))).into_response();
+    let Some(entry) = crate::catalog::CATALOG
+        .iter()
+        .find(|e| e.repo == body.repo && e.file == body.file)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unknown model"})),
+        )
+            .into_response();
     };
 
     let key = crate::settings::model_ctx_key(&body.repo, &body.file);
@@ -1486,48 +1696,80 @@ async fn handle_model_set_profile(
             prof.ctx = None;
         } else {
             // Effective KV kind: incoming body > existing profile > entry rec > global default.
-            let eff_kv_kind = match body.kv_type.as_ref().or(prof.kv_type.as_ref()).or(entry.rec_kv.as_ref()) {
+            let eff_kv_kind = match body
+                .kv_type
+                .as_ref()
+                .or(prof.kv_type.as_ref())
+                .or(entry.rec_kv.as_ref())
+            {
                 Some(crate::config::KvType::Q4) => crate::fit::KvKind::Q4,
                 Some(crate::config::KvType::F16) => crate::fit::KvKind::F16,
                 Some(crate::config::KvType::Q8) | None => state.kv_kind,
             };
             let budget_mb = crate::fit::device_budget_mb(state.total_ram_mb, true);
             let kv_per_token = crate::fit::est_kv_bytes_per_token(entry.params_b, eff_kv_kind);
-            let bounds = crate::fit::ctx_bounds(entry.size_mb, kv_per_token, budget_mb, entry.ctx_train);
+            let bounds =
+                crate::fit::ctx_bounds(entry.size_mb, kv_per_token, budget_mb, entry.ctx_train);
             if bounds.max == 0 || ctx < bounds.min || ctx > bounds.max {
-                return (StatusCode::BAD_REQUEST, Json(json!({
-                    "error": format!("ctx must be in the range {}..{}", bounds.min, bounds.max)
-                }))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("ctx must be in the range {}..{}", bounds.min, bounds.max)
+                    })),
+                )
+                    .into_response();
             }
             prof.ctx = Some(ctx);
         }
     }
 
-    if let Some(k) = body.kv_type { prof.kv_type = Some(k); }
-    if let Some(g) = body.gpu_layers { prof.gpu_layers = if g == u32::MAX { None } else { Some(g) }; }
-    if let Some(h) = body.history_turns { prof.history_turns = if h == 0 { None } else { Some(h) }; }
+    if let Some(k) = body.kv_type {
+        prof.kv_type = Some(k);
+    }
+    if let Some(g) = body.gpu_layers {
+        prof.gpu_layers = if g == u32::MAX { None } else { Some(g) };
+    }
+    if let Some(h) = body.history_turns {
+        prof.history_turns = if h == 0 { None } else { Some(h) };
+    }
 
     if let Some(q) = body.quant {
-        let ok = crate::catalog::variants_for(entry).iter().any(|v| v.quant.eq_ignore_ascii_case(&q));
+        let ok = crate::catalog::variants_for(entry)
+            .iter()
+            .any(|v| v.quant.eq_ignore_ascii_case(&q));
         if !ok {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("unknown quant '{q}' for this model")}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown quant '{q}' for this model")})),
+            )
+                .into_response();
         }
         prof.quant = Some(q);
     }
 
     if let Err(e) = crate::settings::save_model_profile(&key, &prof) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
 
     // Reload if this is the active model so the new profile takes effect now.
     let active = state.manager.status().current;
     if active.repo == body.repo && active.file == body.file {
-        let spec = crate::model_manager::ModelSpec { repo: body.repo, file: body.file, quant: prof.quant.clone() };
+        let spec = crate::model_manager::ModelSpec {
+            repo: body.repo,
+            file: body.file,
+            quant: prof.quant.clone(),
+        };
         match state.manager.start_switch(spec) {
             Ok(()) => (StatusCode::ACCEPTED, Json(json!({"reloading": true}))).into_response(),
-            Err(crate::model_manager::SwitchError::AlreadySwitching) => {
-                (StatusCode::CONFLICT, Json(json!({"error": "a switch is already in progress"}))).into_response()
-            }
+            Err(crate::model_manager::SwitchError::AlreadySwitching) => (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "a switch is already in progress"})),
+            )
+                .into_response(),
         }
     } else {
         (StatusCode::OK, Json(json!({"saved": true}))).into_response()
@@ -1595,7 +1837,10 @@ async fn handle_tools_set(
     let body: SetToolsBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
                 .into_response()
         }
     };
@@ -1636,7 +1881,11 @@ async fn handle_oai_chat(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "localllm::req", "{rid} [openai] 400 bad json: {e}");
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
     let model = req.model.clone();
@@ -1675,7 +1924,17 @@ async fn handle_oai_chat(
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
-            match crate::cloud::forward(crate::cloud::Provider::OpenAI, "/v1/chat/completions", &headers, raw.clone(), Some(crate::cloud::RelayMeter { rid: rid.to_string() })).await {
+            match crate::cloud::forward(
+                crate::cloud::Provider::OpenAI,
+                "/v1/chat/completions",
+                &headers,
+                raw.clone(),
+                Some(crate::cloud::RelayMeter {
+                    rid: rid.to_string(),
+                }),
+            )
+            .await
+            {
                 crate::cloud::ForwardOutcome::Relayed(resp) => {
                     record_cloud_success(&state, est_prompt_tokens);
                     return resp;
@@ -1718,22 +1977,35 @@ async fn handle_oai_chat(
             est_prompt_tokens,
             &rid,
             "openai",
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
-        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        let tps = if secs > 0.0 {
+            result.completion_tokens as f64 / secs
+        } else {
+            0.0
+        };
         tracing::info!(target: "localllm::req", "{rid} [openai] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
+        record_outcome(
+            &rid,
+            "local",
+            Some(&model),
+            est_prompt_tokens as u64,
+            Some(result.completion_tokens as u64),
+            None,
+            Some(started_at.elapsed().as_millis() as u64),
+            Some(result.finish_reason.clone()),
+        );
         let mut lines = crate::api::openai::stream_chunks_from_result(&result, &id, &model);
         lines.push("[DONE]".to_string());
-        let sse_stream = futures::stream::iter(
-            lines.into_iter().map(|l| {
-                let data = l.strip_prefix("data: ").unwrap_or(&l).to_string();
-                Ok::<Event, Infallible>(Event::default().data(data))
-            }),
-        );
+        let sse_stream = futures::stream::iter(lines.into_iter().map(|l| {
+            let data = l.strip_prefix("data: ").unwrap_or(&l).to_string();
+            Ok::<Event, Infallible>(Event::default().data(data))
+        }));
         return Sse::new(sse_stream).into_response();
     }
 
@@ -1751,7 +2023,8 @@ async fn handle_oai_chat(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
-                ).into_response();
+                )
+                    .into_response();
             }
         };
 
@@ -1812,14 +2085,29 @@ async fn handle_oai_chat(
             est_prompt_tokens,
             &rid,
             "openai",
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
-        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        let tps = if secs > 0.0 {
+            result.completion_tokens as f64 / secs
+        } else {
+            0.0
+        };
         tracing::info!(target: "localllm::req", "{rid} [openai] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
+        record_outcome(
+            &rid,
+            "local",
+            Some(&model),
+            est_prompt_tokens as u64,
+            Some(result.completion_tokens as u64),
+            None,
+            Some(started_at.elapsed().as_millis() as u64),
+            Some(result.finish_reason.clone()),
+        );
         let resp = crate::api::openai::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }
@@ -1840,7 +2128,11 @@ async fn handle_oai_responses(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "localllm::req", "{rid} [responses] 400 bad json: {e}");
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
     let model = req.model.clone();
@@ -1858,27 +2150,53 @@ async fn handle_oai_responses(
     shape_tools(&state, "openai-responses", &mut internal);
 
     if state.manager.is_errored() {
-        return (StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "model in error state — restart required"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "model in error state — restart required"})),
+        )
+            .into_response();
     }
     if state.manager.is_switching() {
-        return (StatusCode::SERVICE_UNAVAILABLE, [("Retry-After", "5")],
-            Json(json!({"error": "model switching, retry shortly"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Retry-After", "5")],
+            Json(json!({"error": "model switching, retry shortly"})),
+        )
+            .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "openai-responses");
+    let (decision, est_prompt_tokens) =
+        route_decision(&state, &internal, &headers, &rid, "openai-responses");
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [responses] route=cloud reason={reason:?}");
-            match crate::cloud::forward(crate::cloud::Provider::OpenAI, "/v1/responses", &headers, raw.clone(), Some(crate::cloud::RelayMeter { rid: rid.to_string() })).await {
+            match crate::cloud::forward(
+                crate::cloud::Provider::OpenAI,
+                "/v1/responses",
+                &headers,
+                raw.clone(),
+                Some(crate::cloud::RelayMeter {
+                    rid: rid.to_string(),
+                }),
+            )
+            .await
+            {
                 crate::cloud::ForwardOutcome::Relayed(resp) => {
                     record_cloud_success(&state, est_prompt_tokens);
                     return resp;
                 }
                 crate::cloud::ForwardOutcome::Degrade(d) => {
-                    if let Some(resp) = handle_degrade(&state, d, reason) { return resp; }
+                    if let Some(resp) = handle_degrade(&state, d, reason) {
+                        return resp;
+                    }
                     tracing::warn!(target: "localllm::req", "{rid} [responses] cloud degraded ({d:?}) → serving local");
-                    log_degrade_fallback(&rid, "openai-responses", Some(&model), est_prompt_tokens as u64, d);
+                    log_degrade_fallback(
+                        &rid,
+                        "openai-responses",
+                        Some(&model),
+                        est_prompt_tokens as u64,
+                        d,
+                    );
                     false
                 }
             }
@@ -1904,21 +2222,39 @@ async fn handle_oai_responses(
         est_prompt_tokens,
         &rid,
         "responses",
-    ).await {
+    )
+    .await
+    {
         Ok(r) => r,
         Err(resp) => return resp,
     };
     let secs = started_at.elapsed().as_secs_f64();
-    let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+    let tps = if secs > 0.0 {
+        result.completion_tokens as f64 / secs
+    } else {
+        0.0
+    };
     tracing::info!(target: "localllm::req", "{rid} [responses] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s",
         result.finish_reason, result.prompt_tokens, result.completion_tokens);
-    record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
+    record_outcome(
+        &rid,
+        "local",
+        Some(&model),
+        est_prompt_tokens as u64,
+        Some(result.completion_tokens as u64),
+        None,
+        Some(started_at.elapsed().as_millis() as u64),
+        Some(result.finish_reason.clone()),
+    );
 
     if stream_flag {
-        let events = crate::api::openai_responses::stream_events_from_result(&result, &resp_id, &model);
-        let sse_stream = futures::stream::iter(events.into_iter().map(|(ty, data)| {
-            Ok::<Event, Infallible>(Event::default().event(ty).data(data))
-        }));
+        let events =
+            crate::api::openai_responses::stream_events_from_result(&result, &resp_id, &model);
+        let sse_stream = futures::stream::iter(
+            events
+                .into_iter()
+                .map(|(ty, data)| Ok::<Event, Infallible>(Event::default().event(ty).data(data))),
+        );
         Sse::new(sse_stream).into_response()
     } else {
         let v = crate::api::openai_responses::from_internal(result, &model);
@@ -1941,7 +2277,11 @@ async fn handle_anth_messages(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "localllm::req", "{rid} [anthropic] 400 bad json: {e}");
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
     let model = req.model.clone();
@@ -1976,11 +2316,22 @@ async fn handle_anth_messages(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "anthropic");
+    let (decision, est_prompt_tokens) =
+        route_decision(&state, &internal, &headers, &rid, "anthropic");
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
-            match crate::cloud::forward(crate::cloud::Provider::Anthropic, "/v1/messages", &headers, raw.clone(), Some(crate::cloud::RelayMeter { rid: rid.to_string() })).await {
+            match crate::cloud::forward(
+                crate::cloud::Provider::Anthropic,
+                "/v1/messages",
+                &headers,
+                raw.clone(),
+                Some(crate::cloud::RelayMeter {
+                    rid: rid.to_string(),
+                }),
+            )
+            .await
+            {
                 crate::cloud::ForwardOutcome::Relayed(resp) => {
                     record_cloud_success(&state, est_prompt_tokens);
                     return resp;
@@ -1990,7 +2341,13 @@ async fn handle_anth_messages(
                         return resp;
                     }
                     tracing::warn!(target: "localllm::req", "{rid} [anthropic] cloud degraded ({d:?}) → serving local");
-                    log_degrade_fallback(&rid, "anthropic", Some(&model), est_prompt_tokens as u64, d);
+                    log_degrade_fallback(
+                        &rid,
+                        "anthropic",
+                        Some(&model),
+                        est_prompt_tokens as u64,
+                        d,
+                    );
                     false
                 }
             }
@@ -2022,19 +2379,44 @@ async fn handle_anth_messages(
             est_prompt_tokens,
             &rid,
             "anthropic",
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
-        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        let tps = if secs > 0.0 {
+            result.completion_tokens as f64 / secs
+        } else {
+            0.0
+        };
         tracing::info!(target: "localllm::req", "{rid} [anthropic] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
+        record_outcome(
+            &rid,
+            "local",
+            Some(&model),
+            est_prompt_tokens as u64,
+            Some(result.completion_tokens as u64),
+            None,
+            Some(started_at.elapsed().as_millis() as u64),
+            Some(result.finish_reason.clone()),
+        );
         let events = crate::api::anthropic::stream_events_from_result(&result, &model);
         let sse_stream = futures::stream::iter(events.into_iter().map(|e_str| {
             let mut lines = e_str.splitn(2, '\n');
-            let event_type = lines.next().unwrap_or("").strip_prefix("event: ").unwrap_or("").to_string();
-            let data = lines.next().unwrap_or("").strip_prefix("data: ").unwrap_or("").to_string();
+            let event_type = lines
+                .next()
+                .unwrap_or("")
+                .strip_prefix("event: ")
+                .unwrap_or("")
+                .to_string();
+            let data = lines
+                .next()
+                .unwrap_or("")
+                .strip_prefix("data: ")
+                .unwrap_or("")
+                .to_string();
             Ok::<Event, Infallible>(Event::default().event(event_type).data(data))
         }));
         return Sse::new(sse_stream).into_response();
@@ -2050,7 +2432,8 @@ async fn handle_anth_messages(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
-                ).into_response();
+                )
+                    .into_response();
             }
         };
 
@@ -2104,14 +2487,29 @@ async fn handle_anth_messages(
             est_prompt_tokens,
             &rid,
             "anthropic",
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(resp) => return resp,
         };
         let secs = started_at.elapsed().as_secs_f64();
-        let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
+        let tps = if secs > 0.0 {
+            result.completion_tokens as f64 / secs
+        } else {
+            0.0
+        };
         tracing::info!(target: "localllm::req", "{rid} [anthropic] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
+        record_outcome(
+            &rid,
+            "local",
+            Some(&model),
+            est_prompt_tokens as u64,
+            Some(result.completion_tokens as u64),
+            None,
+            Some(started_at.elapsed().as_millis() as u64),
+            Some(result.finish_reason.clone()),
+        );
         let resp = crate::api::anthropic::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }
@@ -2173,9 +2571,7 @@ fn make_seeded_test_router(
         requested_ctx_ceiling: 32768,
         kv_kind: crate::fit::KvKind::Q8,
         tool_registry,
-        tool_descs: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::BTreeMap::new(),
-        )),
+        tool_descs: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         port: 31415,
         budget: std::sync::Arc::new(crate::budget::Budget::new()),
         breaker: std::sync::Arc::new(crate::breaker::CircuitBreaker::new()),
@@ -2204,7 +2600,10 @@ mod tests {
             Some(crate::usage::DegradeReason::Quota)
         );
         // Open but the decision is Local → nothing to block.
-        assert_eq!(super::breaker_gate_block(&b, &Decision::Local, false, 5), None);
+        assert_eq!(
+            super::breaker_gate_block(&b, &Decision::Local, false, 5),
+            None
+        );
         // Budget already forced local → breaker defers (budget precedence).
         assert_eq!(
             super::breaker_gate_block(&b, &Decision::Cloud(RouteReason::Difficulty), true, 5),
@@ -2221,13 +2620,36 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing-log.jsonl");
         std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
-        super::record_outcome("r1", "local", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000), None);
-        super::record_outcome("r2", "cloud", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000), None);
+        super::record_outcome(
+            "r1",
+            "local",
+            Some("claude-sonnet-4-6"),
+            1_000_000,
+            Some(1_000_000),
+            Some(10),
+            Some(1000),
+            None,
+        );
+        super::record_outcome(
+            "r2",
+            "cloud",
+            Some("claude-sonnet-4-6"),
+            1_000_000,
+            Some(1_000_000),
+            Some(10),
+            Some(1000),
+            None,
+        );
         let lines = crate::route_log::read_all();
-        let cost = |rid: &str| lines.iter().find_map(|l| match l {
-            crate::route_log::LogLine::Outcome(o) if o.rid == rid => Some(o.cost_saved_usd),
-            _ => None,
-        }).unwrap();
+        let cost = |rid: &str| {
+            lines
+                .iter()
+                .find_map(|l| match l {
+                    crate::route_log::LogLine::Outcome(o) if o.rid == rid => Some(o.cost_saved_usd),
+                    _ => None,
+                })
+                .unwrap()
+        };
         assert!((cost("r1") - 18.0).abs() < 1e-6); // sonnet: 1M*3 + 1M*15 = 18
         assert_eq!(cost("r2"), 0.0); // cloud saves nothing
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
@@ -2239,9 +2661,18 @@ mod tests {
         let now = 1_000i64;
         let lines = vec![
             crate::route_log::LogLine::Decision(crate::route_log::RouteEntry {
-                ts: now, rid: "r".into(), dest: "local".into(), prompt_tok: 10, ..Default::default() }),
+                ts: now,
+                rid: "r".into(),
+                dest: "local".into(),
+                prompt_tok: 10,
+                ..Default::default()
+            }),
             crate::route_log::LogLine::Outcome(crate::route_log::OutcomeEntry {
-                rid: "r".into(), ts: now, cost_saved_usd: 1.5, ..Default::default() }),
+                rid: "r".into(),
+                ts: now,
+                cost_saved_usd: 1.5,
+                ..Default::default()
+            }),
         ];
         let text = super::metrics_text(&lines, now);
         assert!(text.contains("localllm_requests_total{dest=\"local\"} 1"));
@@ -2250,11 +2681,16 @@ mod tests {
 
     #[test]
     fn export_csv_has_header_and_rows() {
-        let lines = vec![
-            crate::route_log::LogLine::Decision(crate::route_log::RouteEntry {
-                ts: 10, rid: "r1".into(), surface: "openai".into(), dest: "local".into(),
-                prompt_tok: 5, ..Default::default() }),
-        ];
+        let lines = vec![crate::route_log::LogLine::Decision(
+            crate::route_log::RouteEntry {
+                ts: 10,
+                rid: "r1".into(),
+                surface: "openai".into(),
+                dest: "local".into(),
+                prompt_tok: 5,
+                ..Default::default()
+            },
+        )];
         let csv = super::export_csv(&lines);
         assert!(csv.starts_with("kind,rid,ts,surface,dest,reason,degrade_reason,model,prompt_tok"));
         assert!(csv.contains("d,r1,10,openai,local"));
@@ -2265,8 +2701,14 @@ mod tests {
         use crate::usage::DegradeReason;
         assert_eq!(super::degrade_reason_label(DegradeReason::Quota), "Quota");
         assert_eq!(super::degrade_reason_label(DegradeReason::Auth), "Auth");
-        assert_eq!(super::degrade_reason_label(DegradeReason::ServerError), "ServerError");
-        assert_eq!(super::degrade_reason_label(DegradeReason::Offline), "Offline");
+        assert_eq!(
+            super::degrade_reason_label(DegradeReason::ServerError),
+            "ServerError"
+        );
+        assert_eq!(
+            super::degrade_reason_label(DegradeReason::Offline),
+            "Offline"
+        );
     }
 
     #[test]
@@ -2302,12 +2744,16 @@ mod tests {
     async fn get_tools_merges_registry_and_settings() {
         use axum::body::Body;
         use http_body_util::BodyExt;
-        use tower::ServiceExt;
         use std::sync::Arc;
+        use tower::ServiceExt;
 
-        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let settings_file = std::env::temp_dir()
-            .join(format!("localllm-srvtest-tools-get-{}.json", uuid::Uuid::new_v4()));
+        let _guard = crate::settings::SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let settings_file = std::env::temp_dir().join(format!(
+            "localllm-srvtest-tools-get-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
 
         // Seed settings: "anthropic" blocklist = ["Read"]
@@ -2334,8 +2780,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let status = response.status().as_u16();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: serde_json::Value =
-            serde_json::from_slice(&bytes).unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
 
         assert_eq!(status, 200, "expected 200, got {status}: {body}");
         let anthropic = body.get("anthropic").expect("anthropic key in response");
@@ -2353,9 +2798,13 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let settings_file = std::env::temp_dir()
-            .join(format!("localllm-srvtest-tools-post-{}.json", uuid::Uuid::new_v4()));
+        let _guard = crate::settings::SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let settings_file = std::env::temp_dir().join(format!(
+            "localllm-srvtest-tools-post-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
 
         let app = crate::router_for_test_with(
@@ -2376,8 +2825,7 @@ mod tests {
         let response = app.clone().oneshot(request).await.unwrap();
         let status = response.status().as_u16();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let resp: serde_json::Value =
-            serde_json::from_slice(&bytes).unwrap_or_default();
+        let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         assert_eq!(status, 200, "expected 200 for valid surface: {resp}");
         assert_eq!(resp["saved"], serde_json::json!(true));
         // Verify the filter was actually persisted.
@@ -2398,8 +2846,7 @@ mod tests {
         let response2 = app.clone().oneshot(request2).await.unwrap();
         let status2 = response2.status().as_u16();
         let bytes2 = response2.into_body().collect().await.unwrap().to_bytes();
-        let resp2: serde_json::Value =
-            serde_json::from_slice(&bytes2).unwrap_or_default();
+        let resp2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap_or_default();
         assert_eq!(status2, 400, "expected 400 for unknown surface: {resp2}");
         assert!(
             resp2["error"]
@@ -2427,7 +2874,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// POST then GET /admin/budget round-trips the config.
     #[tokio::test]
     async fn budget_get_post_round_trip() {
@@ -2435,9 +2881,11 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let settings_file = std::env::temp_dir()
-            .join(format!("localllm-bud-{}.json", uuid::Uuid::new_v4()));
+        let _guard = crate::settings::SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let settings_file =
+            std::env::temp_dir().join(format!("localllm-bud-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
 
         let app = crate::router_for_test_with(
@@ -2475,15 +2923,17 @@ mod tests {
     /// POST /admin/model/profile — happy path: kv_type and history_turns persist.
     #[tokio::test]
     async fn set_model_profile_persists_kv_and_history() {
+        use crate::config::KvType;
         use axum::body::Body;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
-        use crate::config::KvType;
 
         // Isolate settings storage so this test never touches the real file.
-        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let settings_file = std::env::temp_dir()
-            .join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
+        let _guard = crate::settings::SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let settings_file =
+            std::env::temp_dir().join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
 
         // Use the first CATALOG entry — guaranteed to exist.
@@ -2538,9 +2988,11 @@ mod tests {
         use tower::ServiceExt;
 
         // Isolate settings storage so this test never touches the real file.
-        let _guard = crate::settings::SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let settings_file = std::env::temp_dir()
-            .join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
+        let _guard = crate::settings::SETTINGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let settings_file =
+            std::env::temp_dir().join(format!("localllm-srvtest-{}.json", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLLM_SETTINGS", &settings_file);
 
         // Use the first CATALOG entry — guaranteed to exist and Q4_K_M is always valid.
@@ -2575,7 +3027,11 @@ mod tests {
 
         // Assert quant was persisted.
         let prof = crate::settings::load_model_profile(&key);
-        assert_eq!(prof.quant, Some("Q4_K_M".to_string()), "quant should be Q4_K_M");
+        assert_eq!(
+            prof.quant,
+            Some("Q4_K_M".to_string()),
+            "quant should be Q4_K_M"
+        );
 
         // --- Sad path: unknown quant Q9_NOPE → 400 ---
         let app2 = crate::router_for_test_with(
@@ -2599,9 +3055,18 @@ mod tests {
         let status2 = response2.status().as_u16();
         let bytes2 = response2.into_body().collect().await.unwrap().to_bytes();
         let resp_body2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
-        assert_eq!(status2, 400, "expected 400 for unknown quant, got {status2}: {resp_body2}");
-        assert!(resp_body2.get("error").and_then(|v| v.as_str()).map(|s| s.contains("Q9_NOPE")).unwrap_or(false),
-            "error should mention Q9_NOPE: {resp_body2}");
+        assert_eq!(
+            status2, 400,
+            "expected 400 for unknown quant, got {status2}: {resp_body2}"
+        );
+        assert!(
+            resp_body2
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("Q9_NOPE"))
+                .unwrap_or(false),
+            "error should mention Q9_NOPE: {resp_body2}"
+        );
 
         // Cleanup.
         let _ = std::fs::remove_file(&settings_file);
@@ -2616,14 +3081,20 @@ mod tests {
         use crate::model_manager::{EngineBuilder, ModelManager, ModelSpec};
         let builder: EngineBuilder = Box::new(|_spec| {
             Box::pin(async {
-                Ok(std::sync::Arc::new(crate::test_support::TaggedGen("switched"))
-                    as std::sync::Arc<dyn super::Generator>)
+                Ok(
+                    std::sync::Arc::new(crate::test_support::TaggedGen("switched"))
+                        as std::sync::Arc<dyn super::Generator>,
+                )
             })
         });
         let manager = ModelManager::new(
             std::sync::Arc::new(crate::test_support::TaggedGen("test"))
                 as std::sync::Arc<dyn super::Generator>,
-            ModelSpec { repo: "test".into(), file: "test".into(), quant: None },
+            ModelSpec {
+                repo: "test".into(),
+                file: "test".into(),
+                quant: None,
+            },
             builder,
         );
         super::AppState {
@@ -2666,7 +3137,10 @@ mod tests {
             crate::route::RouteReason::Difficulty,
         );
         assert!(out.is_none());
-        assert_eq!(breaker.snapshot(crate::route_log::now_secs() as u64).state, "open");
+        assert_eq!(
+            breaker.snapshot(crate::route_log::now_secs() as u64).state,
+            "open"
+        );
     }
 
     #[test]
@@ -2675,7 +3149,10 @@ mod tests {
         breaker.on_failure(0, crate::usage::DegradeReason::ServerError);
         let state = wiring_state(breaker.clone());
         super::record_cloud_success(&state, 10);
-        assert_eq!(breaker.snapshot(crate::route_log::now_secs() as u64).state, "closed");
+        assert_eq!(
+            breaker.snapshot(crate::route_log::now_secs() as u64).state,
+            "closed"
+        );
     }
 
     #[tokio::test]
@@ -2692,9 +3169,9 @@ mod tests {
         let app = super::make_seeded_test_router(std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::new(),
         )));
-        let body = crate::axum_test_get_with_header(
-            app, "/admin/breaker", "x-admin-token", "test-token",
-        ).await;
+        let body =
+            crate::axum_test_get_with_header(app, "/admin/breaker", "x-admin-token", "test-token")
+                .await;
         assert_eq!(body["state"], "closed");
     }
 
@@ -2709,16 +3186,50 @@ mod tests {
         std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
 
         use crate::api::common::FinishReason;
-        super::record_outcome("t1", "local", None, 10, Some(10), None, None, Some(FinishReason::Length));
-        super::record_outcome("t2", "local", None, 10, Some(10), None, None, Some(FinishReason::Stop));
-        super::record_outcome("t3", "cloud", None, 10, Some(10), None, None, Some(FinishReason::Length));
+        super::record_outcome(
+            "t1",
+            "local",
+            None,
+            10,
+            Some(10),
+            None,
+            None,
+            Some(FinishReason::Length),
+        );
+        super::record_outcome(
+            "t2",
+            "local",
+            None,
+            10,
+            Some(10),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        super::record_outcome(
+            "t3",
+            "cloud",
+            None,
+            10,
+            Some(10),
+            None,
+            None,
+            Some(FinishReason::Length),
+        );
 
         let lines = crate::route_log::read_all();
-        let has_trunc = |rid: &str| lines.iter().any(|l| matches!(l,
-            crate::route_log::LogLine::Feedback(f) if f.rid == rid && f.signal == "truncated"));
+        let has_trunc = |rid: &str| {
+            lines.iter().any(|l| {
+                matches!(l,
+            crate::route_log::LogLine::Feedback(f) if f.rid == rid && f.signal == "truncated")
+            })
+        };
         assert!(has_trunc("t1"), "local Length must emit truncated");
         assert!(!has_trunc("t2"), "local Stop must not");
-        assert!(!has_trunc("t3"), "cloud Length must not (cloud is not judged here)");
+        assert!(
+            !has_trunc("t3"),
+            "cloud Length must not (cloud is not judged here)"
+        );
 
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2745,9 +3256,18 @@ mod tests {
         let breaker = std::sync::Arc::new(crate::breaker::CircuitBreaker::new());
         let state = wiring_state(breaker);
         let _ = super::cascade_or_result(
-            true, weak, crate::cloud::Provider::OpenAI, "/v1/chat/completions",
-            &axum::http::HeaderMap::new(), axum::body::Bytes::from("{}"), &state, 1, "rc1", "openai",
-        ).await;
+            true,
+            weak,
+            crate::cloud::Provider::OpenAI,
+            "/v1/chat/completions",
+            &axum::http::HeaderMap::new(),
+            axum::body::Bytes::from("{}"),
+            &state,
+            1,
+            "rc1",
+            "openai",
+        )
+        .await;
         let lines = crate::route_log::read_all();
         assert!(lines.iter().any(|l| matches!(l,
             crate::route_log::LogLine::Feedback(f) if f.rid == "rc1" && f.signal == "cascade")));
@@ -2757,18 +3277,27 @@ mod tests {
     }
 
     fn tokset(s: &str) -> std::collections::BTreeSet<String> {
-        crate::history_select::tokenize(s).into_iter().filter(|t| t.len() >= 2).collect()
+        crate::history_select::tokenize(s)
+            .into_iter()
+            .filter(|t| t.len() >= 2)
+            .collect()
     }
 
     #[test]
     fn detect_reask_matches_similar_recent_prompt() {
         use std::collections::VecDeque;
         let mut buf: VecDeque<super::RecentPrompt> = VecDeque::new();
-        buf.push_front(super::RecentPrompt { rid: "old1".into(), ts: 1000,
-            tokens: tokset("como faço deploy do serviço no kubernetes") });
+        buf.push_front(super::RecentPrompt {
+            rid: "old1".into(),
+            ts: 1000,
+            tokens: tokset("como faço deploy do serviço no kubernetes"),
+        });
         // Near-identical re-ask 30s later → match.
         let t = tokset("como faço deploy do serviço no kubernetes agora");
-        assert_eq!(super::detect_reask(&buf, &t, 1030), Some("old1".to_string()));
+        assert_eq!(
+            super::detect_reask(&buf, &t, 1030),
+            Some("old1".to_string())
+        );
         // Different topic → no match.
         let t2 = tokset("escreva um poema sobre gatos persas");
         assert_eq!(super::detect_reask(&buf, &t2, 1030), None);
@@ -2784,12 +3313,21 @@ mod tests {
         use std::collections::VecDeque;
         let mut buf: VecDeque<super::RecentPrompt> = VecDeque::new();
         // Newest first: both similar; the front (newest) must win.
-        buf.push_front(super::RecentPrompt { rid: "older".into(), ts: 990,
-            tokens: tokset("erro de compilação no módulo de rede") });
-        buf.push_front(super::RecentPrompt { rid: "newer".into(), ts: 1000,
-            tokens: tokset("erro de compilação no módulo de rede") });
+        buf.push_front(super::RecentPrompt {
+            rid: "older".into(),
+            ts: 990,
+            tokens: tokset("erro de compilação no módulo de rede"),
+        });
+        buf.push_front(super::RecentPrompt {
+            rid: "newer".into(),
+            ts: 1000,
+            tokens: tokset("erro de compilação no módulo de rede"),
+        });
         let t = tokset("erro de compilação no módulo de rede ainda");
-        assert_eq!(super::detect_reask(&buf, &t, 1010), Some("newer".to_string()));
+        assert_eq!(
+            super::detect_reask(&buf, &t, 1010),
+            Some("newer".to_string())
+        );
     }
 
     #[test]
@@ -2797,8 +3335,13 @@ mod tests {
         use std::collections::VecDeque;
         let mut buf: VecDeque<super::RecentPrompt> = VecDeque::new();
         for i in 0..12 {
-            buf.push_front(super::RecentPrompt { rid: format!("r{i}"), ts: 1000 + i,
-                tokens: tokset(&format!("prompt número {i} totalmente diferente dos outros assunto{i}")) });
+            buf.push_front(super::RecentPrompt {
+                rid: format!("r{i}"),
+                ts: 1000 + i,
+                tokens: tokset(&format!(
+                    "prompt número {i} totalmente diferente dos outros assunto{i}"
+                )),
+            });
             buf.truncate(super::REASK_BUFFER_CAP);
         }
         assert_eq!(buf.len(), super::REASK_BUFFER_CAP);
@@ -2834,10 +3377,13 @@ mod tests {
         let _ = super::route_decision(&state, &req, &headers, "rlm1", "openai");
 
         let lines = crate::route_log::read_all();
-        let dec = lines.iter().find_map(|l| match l {
-            crate::route_log::LogLine::Decision(d) if d.rid == "rlm1" => Some(d.clone()),
-            _ => None,
-        }).expect("decision line");
+        let dec = lines
+            .iter()
+            .find_map(|l| match l {
+                crate::route_log::LogLine::Decision(d) if d.rid == "rlm1" => Some(d.clone()),
+                _ => None,
+            })
+            .expect("decision line");
         assert_eq!(dec.local_model.as_deref(), Some("test/test"));
 
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
