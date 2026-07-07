@@ -67,6 +67,18 @@ pub struct OutcomeEntry {
     pub cost_saved_usd: f64,
 }
 
+/// A routing-quality signal about an earlier decision, correlated by `rid`.
+/// Signals: "cascade" (local escalated to cloud), "reask" (user re-sent a very
+/// similar prompt shortly after a local answer), "truncated" (local hit the
+/// length limit un-escalated), "cloud_trivial" (cloud produced a trivial reply).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FeedbackEntry {
+    /// The rid of the DECISION being judged (for "reask": the PREVIOUS request).
+    pub rid: String,
+    pub ts: i64,
+    pub signal: String,
+}
+
 /// A parsed log line: a routing decision or a post-generation outcome.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind")]
@@ -75,6 +87,8 @@ pub enum LogLine {
     Decision(RouteEntry),
     #[serde(rename = "o")]
     Outcome(OutcomeEntry),
+    #[serde(rename = "f")]
+    Feedback(FeedbackEntry),
 }
 
 impl LogLine {
@@ -82,6 +96,7 @@ impl LogLine {
         match self {
             LogLine::Decision(d) => d.ts,
             LogLine::Outcome(o) => o.ts,
+            LogLine::Feedback(f) => f.ts,
         }
     }
 }
@@ -102,6 +117,11 @@ pub fn append(entry: &RouteEntry) {
 /// Append one outcome as a JSON line. Best-effort; never panics.
 pub fn append_outcome(entry: &OutcomeEntry) {
     append_line(&LogLine::Outcome(entry.clone()));
+}
+
+/// Append one feedback signal as a JSON line. Best-effort; never panics.
+pub fn append_feedback(entry: &FeedbackEntry) {
+    append_line(&LogLine::Feedback(entry.clone()));
 }
 
 fn append_line(line: &LogLine) {
@@ -230,6 +250,9 @@ pub struct RecentRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ms: Option<u64>,
     pub cost_saved_usd: f64,
+    /// Quality signals recorded against this decision (may be empty).
+    #[serde(default)]
+    pub feedback: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -269,10 +292,12 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashbo
     use std::collections::HashMap;
     let mut decisions: Vec<&RouteEntry> = Vec::new();
     let mut outcomes: HashMap<&str, &OutcomeEntry> = HashMap::new();
+    let mut feedback: HashMap<&str, Vec<String>> = HashMap::new();
     for l in entries {
         match l {
             LogLine::Decision(d) => decisions.push(d),
             LogLine::Outcome(o) => { outcomes.insert(o.rid.as_str(), o); }
+            LogLine::Feedback(f) => feedback.entry(f.rid.as_str()).or_default().push(f.signal.clone()),
         }
     }
     let (mut hour, mut day, mut month) = (Bucket::default(), Bucket::default(), Bucket::default());
@@ -339,6 +364,7 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashbo
             ttft_ms: o.and_then(|o| o.ttft_ms),
             gen_ms: o.and_then(|o| o.gen_ms),
             cost_saved_usd: o.map(|o| o.cost_saved_usd).unwrap_or(0.0),
+            feedback: feedback.get(d.rid.as_str()).cloned().unwrap_or_default(),
         }
     }).collect();
     recent.sort_by(|a, b| b.entry.ts.cmp(&a.entry.ts));
@@ -512,5 +538,35 @@ mod tests {
         assert!(matches!(lines[2], LogLine::Outcome(ref o) if o.completion_tok == Some(9)));
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn feedback_lines_parse_and_join_into_recent_rows() {
+        let now = 1_000i64;
+        let lines = vec![
+            LogLine::Decision(RouteEntry { ts: now, rid: "a".into(), surface: "openai".into(),
+                dest: "local".into(), ..Default::default() }),
+            LogLine::Feedback(FeedbackEntry { rid: "a".into(), ts: now + 1, signal: "cascade".into() }),
+            LogLine::Feedback(FeedbackEntry { rid: "a".into(), ts: now + 2, signal: "reask".into() }),
+            LogLine::Decision(RouteEntry { ts: now, rid: "b".into(), surface: "openai".into(),
+                dest: "local".into(), ..Default::default() }),
+        ];
+        let d = build_dashboard(&lines, now, 10);
+        let row_a = d.recent.iter().find(|r| r.entry.rid == "a").unwrap();
+        assert_eq!(row_a.feedback, vec!["cascade".to_string(), "reask".to_string()]);
+        let row_b = d.recent.iter().find(|r| r.entry.rid == "b").unwrap();
+        assert!(row_b.feedback.is_empty());
+    }
+
+    #[test]
+    fn feedback_line_round_trips_through_serde() {
+        let f = LogLine::Feedback(FeedbackEntry { rid: "x".into(), ts: 5, signal: "truncated".into() });
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"kind\":\"f\""), "got: {s}");
+        let back: LogLine = serde_json::from_str(&s).unwrap();
+        match back {
+            LogLine::Feedback(fe) => { assert_eq!(fe.rid, "x"); assert_eq!(fe.signal, "truncated"); }
+            other => panic!("expected Feedback, got {other:?}"),
+        }
     }
 }
