@@ -868,12 +868,16 @@ async function renderDashboard() {
   const fb = d.feedback || { local_total: 0, local_flagged: 0, cloud_total: 0, cloud_trivial: 0 };
   const acc = el("div", "dash-card");
   acc.append(el("div", "dash-card-head", "QUALIDADE (observado)"));
-  const pctLocal = fb.local_total > 0 ? ((fb.local_flagged / fb.local_total) * 100).toFixed(0) : 0;
-  const pctCloud = fb.cloud_total > 0 ? ((fb.cloud_trivial / fb.cloud_total) * 100).toFixed(0) : 0;
+  const pctLocal = fb.local_total > 0
+    ? ((fb.local_flagged / fb.local_total) * 100).toFixed(0) + "%"
+    : "—";
+  const pctCloud = fb.cloud_total > 0
+    ? ((fb.cloud_trivial / fb.cloud_total) * 100).toFixed(0) + "%"
+    : "—";
   acc.append(el("div", "dash-card-alt",
-    `local: ${fb.local_flagged}/${fb.local_total} com problemas (${pctLocal}%)`));
+    `local: ${fb.local_flagged}/${fb.local_total} com problemas (${pctLocal})`));
   acc.append(el("div", "dash-card-alt",
-    `cloud: ${fb.cloud_trivial}/${fb.cloud_total} trivial (${pctCloud}%)`));
+    `cloud: ${fb.cloud_trivial}/${fb.cloud_total} trivial (${pctCloud})`));
   wrap.append(acc);
 
   // Threshold suggestion banner (if available)
@@ -884,6 +888,9 @@ async function renderDashboard() {
     sugText.textContent = d.suggestion.why;
     sug.append(sugIcon);
     sug.append(sugText);
+    const go = el("button", "btn", "Abrir Config");
+    go.onclick = () => { location.hash = "#/config"; };
+    sug.append(go);
     wrap.append(sug);
   }
 
@@ -1044,7 +1051,9 @@ function renderDecisionsTable(panel, recent) {
     const fbCell = el("td", "fb-cell");
     if (e.feedback && e.feedback.length > 0) {
       e.feedback.forEach((signal) => {
-        fbCell.append(el("span", "fb-badge fb-" + signal, signal));
+        const badge = el("span", "fb-badge fb-" + signal);
+        badge.textContent = signal;
+        fbCell.append(badge);
       });
     }
     tr.append(fbCell);
