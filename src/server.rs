@@ -304,6 +304,7 @@ fn record_outcome(
     completion_tok: Option<u64>,
     ttft_ms: Option<u64>,
     gen_ms: Option<u64>,
+    finish: Option<crate::api::common::FinishReason>,
 ) {
     let cost_saved_usd = if dest == "local" {
         crate::pricing::price_for(model.unwrap_or("")).cost(prompt_tok, completion_tok.unwrap_or(0))
@@ -318,6 +319,16 @@ fn record_outcome(
         gen_ms,
         cost_saved_usd,
     });
+    // Weak-local signal: a local answer that hit the length cap and was served
+    // as-is (cascade escalations never reach this path with Length — they
+    // escalate instead).
+    if dest == "local" && finish == Some(crate::api::common::FinishReason::Length) {
+        crate::route_log::append_feedback(&crate::route_log::FeedbackEntry {
+            rid: rid.to_string(),
+            ts: crate::route_log::now_secs(),
+            signal: "truncated".to_string(),
+        });
+    }
 }
 
 /// Stable short label for a degrade reason, logged so the dashboard can group
@@ -517,6 +528,11 @@ async fn cascade_or_result(
         Ok(result) => {
             if want_cascade && crate::route::is_weak_result(&result) {
                 tracing::info!(target: "localllm::req", "{rid} [{api}] cascade: weak local (length) → escalating to cloud");
+                crate::route_log::append_feedback(&crate::route_log::FeedbackEntry {
+                    rid: rid.to_string(),
+                    ts: crate::route_log::now_secs(),
+                    signal: "cascade".to_string(),
+                });
                 match crate::cloud::forward(provider, upstream_path, headers, raw, Some(crate::cloud::RelayMeter { rid: rid.to_string() })).await {
                     crate::cloud::ForwardOutcome::Relayed(resp) => {
                         record_cloud_success(state, est_prompt_tokens);
@@ -538,6 +554,11 @@ async fn cascade_or_result(
         Err(e) => {
             if want_cascade {
                 tracing::warn!(target: "localllm::req", "{rid} [{api}] cascade: local generate failed ({e}) → escalating to cloud");
+                crate::route_log::append_feedback(&crate::route_log::FeedbackEntry {
+                    rid: rid.to_string(),
+                    ts: crate::route_log::now_secs(),
+                    signal: "cascade".to_string(),
+                });
                 match crate::cloud::forward(provider, upstream_path, headers, raw, Some(crate::cloud::RelayMeter { rid: rid.to_string() })).await {
                     crate::cloud::ForwardOutcome::Relayed(resp) => {
                         record_cloud_success(state, est_prompt_tokens);
@@ -1629,7 +1650,7 @@ async fn handle_oai_chat(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [openai] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
         let mut lines = crate::api::openai::stream_chunks_from_result(&result, &id, &model);
         lines.push("[DONE]".to_string());
         let sse_stream = futures::stream::iter(
@@ -1680,7 +1701,8 @@ async fn handle_oai_chat(
                             let ttft = first_at.map(|f| (f - started_at).as_millis() as u64);
                             record_outcome(&rid_stream, "local", Some(&model_clone),
                                 est_prompt_tokens as u64, Some(*ctok), ttft,
-                                Some(started_at.elapsed().as_millis() as u64));
+                                Some(started_at.elapsed().as_millis() as u64),
+                                delta.finish_reason.clone());
                         }
                         let line = crate::api::openai::stream_chunk(&delta, &id_clone, &model_clone, was_started);
                         *started = true;
@@ -1722,7 +1744,7 @@ async fn handle_oai_chat(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [openai] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
         let resp = crate::api::openai::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }
@@ -1815,7 +1837,7 @@ async fn handle_oai_responses(
     let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
     tracing::info!(target: "localllm::req", "{rid} [responses] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s",
         result.finish_reason, result.prompt_tokens, result.completion_tokens);
-    record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
+    record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
 
     if stream_flag {
         let events = crate::api::openai_responses::stream_events_from_result(&result, &resp_id, &model);
@@ -1932,7 +1954,7 @@ async fn handle_anth_messages(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [anthropic] done (buffered stream): finish={:?} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
         let events = crate::api::anthropic::stream_events_from_result(&result, &model);
         let sse_stream = futures::stream::iter(events.into_iter().map(|e_str| {
             let mut lines = e_str.splitn(2, '\n');
@@ -2014,7 +2036,7 @@ async fn handle_anth_messages(
         let secs = started_at.elapsed().as_secs_f64();
         let tps = if secs > 0.0 { result.completion_tokens as f64 / secs } else { 0.0 };
         tracing::info!(target: "localllm::req", "{rid} [anthropic] done: finish={:?} prompt_tok={} completion_tok={} {secs:.1}s {tps:.1} tok/s", result.finish_reason, result.prompt_tokens, result.completion_tokens);
-        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64));
+        record_outcome(&rid, "local", Some(&model), est_prompt_tokens as u64, Some(result.completion_tokens as u64), None, Some(started_at.elapsed().as_millis() as u64), Some(result.finish_reason.clone()));
         let resp = crate::api::anthropic::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
     }
@@ -2121,8 +2143,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing-log.jsonl");
         std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
-        super::record_outcome("r1", "local", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000));
-        super::record_outcome("r2", "cloud", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000));
+        super::record_outcome("r1", "local", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000), None);
+        super::record_outcome("r2", "cloud", Some("claude-sonnet-4-6"), 1_000_000, Some(1_000_000), Some(10), Some(1000), None);
         let lines = crate::route_log::read_all();
         let cost = |rid: &str| lines.iter().find_map(|l| match l {
             crate::route_log::LogLine::Outcome(o) if o.rid == rid => Some(o.cost_saved_usd),
@@ -2593,5 +2615,63 @@ mod tests {
             app, "/admin/breaker", "x-admin-token", "test-token",
         ).await;
         assert_eq!(body["state"], "closed");
+    }
+
+    #[test]
+    fn record_outcome_emits_truncated_for_local_length() {
+        let _guard = crate::route_log::ROUTE_LOG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("localllm-tr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+
+        use crate::api::common::FinishReason;
+        super::record_outcome("t1", "local", None, 10, Some(10), None, None, Some(FinishReason::Length));
+        super::record_outcome("t2", "local", None, 10, Some(10), None, None, Some(FinishReason::Stop));
+        super::record_outcome("t3", "cloud", None, 10, Some(10), None, None, Some(FinishReason::Length));
+
+        let lines = crate::route_log::read_all();
+        let has_trunc = |rid: &str| lines.iter().any(|l| matches!(l,
+            crate::route_log::LogLine::Feedback(f) if f.rid == rid && f.signal == "truncated"));
+        assert!(has_trunc("t1"), "local Length must emit truncated");
+        assert!(!has_trunc("t2"), "local Stop must not");
+        assert!(!has_trunc("t3"), "cloud Length must not (cloud is not judged here)");
+
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cascade_escalation_emits_cascade_feedback() {
+        let _guard = crate::route_log::ROUTE_LOG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("localllm-cf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+
+        // Weak local result (finish=Length) + cascade wanted → escalates; the
+        // unreachable upstream degrades, but the cascade signal must be logged.
+        let weak = Ok(crate::api::common::ChatResult {
+            content: vec![crate::api::common::ContentPart::Text("x".into())],
+            finish_reason: crate::api::common::FinishReason::Length,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        });
+        let breaker = std::sync::Arc::new(crate::breaker::CircuitBreaker::new());
+        let state = wiring_state(breaker);
+        let _ = super::cascade_or_result(
+            true, weak, crate::cloud::Provider::OpenAI, "/v1/chat/completions",
+            &axum::http::HeaderMap::new(), axum::body::Bytes::from("{}"), &state, 1, "rc1", "openai",
+        ).await;
+        let lines = crate::route_log::read_all();
+        assert!(lines.iter().any(|l| matches!(l,
+            crate::route_log::LogLine::Feedback(f) if f.rid == "rc1" && f.signal == "cascade")));
+
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
