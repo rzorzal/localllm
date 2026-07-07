@@ -864,6 +864,29 @@ async function renderDashboard() {
     `cloud: TTFT ${C.avg_ttft_ms}ms · ${(C.avg_tok_s || 0).toFixed(0)} tok/s (${C.n})`));
   wrap.append(lat);
 
+  // Accuracy (feedback quality metrics)
+  const fb = d.feedback || { local_total: 0, local_flagged: 0, cloud_total: 0, cloud_trivial: 0 };
+  const acc = el("div", "dash-card");
+  acc.append(el("div", "dash-card-head", "QUALIDADE (observado)"));
+  const pctLocal = fb.local_total > 0 ? ((fb.local_flagged / fb.local_total) * 100).toFixed(0) : 0;
+  const pctCloud = fb.cloud_total > 0 ? ((fb.cloud_trivial / fb.cloud_total) * 100).toFixed(0) : 0;
+  acc.append(el("div", "dash-card-alt",
+    `local: ${fb.local_flagged}/${fb.local_total} com problemas (${pctLocal}%)`));
+  acc.append(el("div", "dash-card-alt",
+    `cloud: ${fb.cloud_trivial}/${fb.cloud_total} trivial (${pctCloud}%)`));
+  wrap.append(acc);
+
+  // Threshold suggestion banner (if available)
+  if (d.suggestion) {
+    const sug = el("div", "suggestion-banner suggestion-" + d.suggestion.direction);
+    const sugIcon = el("span", "suggestion-icon", d.suggestion.direction === "lower" ? "↓" : "↑");
+    const sugText = el("span", "suggestion-text");
+    sugText.textContent = d.suggestion.why;
+    sug.append(sugIcon);
+    sug.append(sugText);
+    wrap.append(sug);
+  }
+
   // Fallback windows — why routing went local (budget or provider)
   if (d.windows && d.windows.length) {
     const box = el("div", "fallback-box");
@@ -1005,7 +1028,7 @@ function renderDecisionsTable(panel, recent) {
 
   const table = el("table", "dash-table");
   const thead = el("thead");
-  thead.innerHTML = "<tr><th>quando</th><th>surface</th><th>destino</th><th>motivo</th><th>score</th><th>prompt tok</th></tr>";
+  thead.innerHTML = "<tr><th></th><th>quando</th><th>surface</th><th>destino</th><th>motivo</th><th>score</th><th>prompt tok</th></tr>";
   table.append(thead);
   const tbody = el("tbody");
 
@@ -1017,6 +1040,14 @@ function renderDecisionsTable(panel, recent) {
   const rows = [];
   recent.forEach((e) => {
     const tr = el("tr", "drow");
+    // Feedback signals cell (badges for cascade, reask, truncated, etc.)
+    const fbCell = el("td", "fb-cell");
+    if (e.feedback && e.feedback.length > 0) {
+      e.feedback.forEach((signal) => {
+        fbCell.append(el("span", "fb-badge fb-" + signal, signal));
+      });
+    }
+    tr.append(fbCell);
     tr.append(el("td", "muted nowrap", fmtDateTime(e.ts)));
     tr.append(el("td", null, e.surface));
     const dest = el("td");
@@ -1055,7 +1086,7 @@ function renderDecisionsTable(panel, recent) {
 
     // Expandable prompt row.
     const detail = el("tr", "drow-detail hidden");
-    const dcell = el("td"); dcell.colSpan = 6;
+    const dcell = el("td"); dcell.colSpan = 7;
     if (e.prompt_snippet) {
       dcell.append(el("div", "prompt-label", "Prompt (último turno)"));
       dcell.append(el("div", "prompt-box", e.prompt_snippet));
