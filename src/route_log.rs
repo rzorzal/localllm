@@ -252,6 +252,26 @@ pub struct ThresholdSuggestion {
     pub why: String,
 }
 
+/// Per-local-model effective-capability estimate (informational; not routed).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelCapability {
+    /// Compact model key (model_ctx_key).
+    pub model: String,
+    pub local_total: u64,
+    pub flagged_rate: f64,
+    /// Nominal size (billions) from params_b_for_key.
+    pub nominal_b: f64,
+    /// Estimated effective size (billions) after inverting the capability slope.
+    pub effective_b: f64,
+}
+
+/// Effective-capability tunables — named so a later phase can calibrate them.
+pub const CAP_MIN_SAMPLE: u64 = 30;
+pub const CAP_BASELINE_FLAG_RATE: f64 = 0.10;
+pub const CAP_SCALE: f64 = 0.5;
+/// Must equal the slope in `route::capability_adjustment` (0.03 threshold / 1B).
+pub const CAP_SLOPE: f64 = 0.03;
+
 /// Suggestion tunables — named so Fase D2 can calibrate them.
 pub const SUGGEST_WINDOW_SECS: i64 = 7 * 86_400;
 pub const SUGGEST_MIN_LOCAL_SAMPLE: u64 = 20;
@@ -310,6 +330,8 @@ pub struct Dashboard {
     pub feedback: FeedbackStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<ThresholdSuggestion>,
+    #[serde(default)]
+    pub model_capabilities: Vec<ModelCapability>,
 }
 
 const HOUR: i64 = 3600;
@@ -474,6 +496,40 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
             })
         } else { None }
     } else { None };
+    // Per-model effective-capability estimate (informational).
+    use std::collections::BTreeMap;
+    let mut per_model: BTreeMap<&str, (u64, u64)> = BTreeMap::new(); // model → (total, flagged)
+    for d in &decisions {
+        if d.dest != "local" { continue; }
+        let Some(m) = d.local_model.as_deref() else { continue; };
+        let flagged = feedback
+            .get(d.rid.as_str())
+            .map(|s| s.iter().any(|x| NEG_LOCAL.contains(&x.as_str())))
+            .unwrap_or(false);
+        let e = per_model.entry(m).or_insert((0, 0));
+        e.0 += 1;
+        if flagged { e.1 += 1; }
+    }
+    let mut model_capabilities: Vec<ModelCapability> = per_model
+        .into_iter()
+        .filter(|(_, (total, _))| *total >= CAP_MIN_SAMPLE)
+        .filter_map(|(model, (total, flagged))| {
+            let nominal_b = crate::catalog::params_b_for_key(model) as f64;
+            if nominal_b <= 0.0 { return None; }
+            let flagged_rate = flagged as f64 / total as f64;
+            let excess = flagged_rate - CAP_BASELINE_FLAG_RATE;
+            let delta_b = -(excess * CAP_SCALE) / CAP_SLOPE;
+            let effective_b = (nominal_b + delta_b).clamp(0.5, nominal_b * 1.5);
+            Some(ModelCapability {
+                model: model.to_string(),
+                local_total: total,
+                flagged_rate,
+                nominal_b,
+                effective_b,
+            })
+        })
+        .collect();
+    model_capabilities.sort_by(|a, b| b.local_total.cmp(&a.local_total));
     Dashboard {
         hour, day, month,
         local_latency: latency(l_ttft, l_tps, l_n),
@@ -482,6 +538,7 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced:
         recent,
         feedback: stats,
         suggestion,
+        model_capabilities,
     }
 }
 
@@ -793,5 +850,71 @@ mod tests {
             lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: ts + 1, signal: "cascade".into() }));
         }
         assert!(build_dashboard(&lines, now, 10, true).suggestion.is_none());
+    }
+
+    #[test]
+    fn model_capability_estimates_and_filters() {
+        let now = 1_000_000i64;
+        // Model key that scans to 3.0 B nominal (params_b_for_key: "*-3b*").
+        let m = "Qwen/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-instruct-q4_k_m.gguf";
+        let mut lines = Vec::new();
+        // 40 locals for model m; 12 flagged (30% flag rate).
+        for i in 0..40 {
+            let rid = format!("m{i}");
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: rid.clone(),
+                surface: "openai".into(), dest: "local".into(), score: 0.2,
+                local_model: Some(m.into()), ..Default::default() }));
+            if i < 12 {
+                lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 9, signal: "cascade".into() }));
+            }
+        }
+        // A second model with too few locals → omitted.
+        for i in 0..5 {
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: format!("s{i}"),
+                surface: "openai".into(), dest: "local".into(), score: 0.2,
+                local_model: Some("foo/tiny-1b.gguf".into()), ..Default::default() }));
+        }
+        let d = build_dashboard(&lines, now, 10, true);
+        assert_eq!(d.model_capabilities.len(), 1, "only the 40-local model qualifies");
+        let mc = &d.model_capabilities[0];
+        assert_eq!(mc.model, m);
+        assert_eq!(mc.local_total, 40);
+        assert!((mc.flagged_rate - 0.30).abs() < 1e-9);
+        assert!((mc.nominal_b - 3.0).abs() < 1e-9);
+        // effective_b: excess=0.30-0.10=0.20; delta=-(0.20*0.5)/0.03 = -3.333..;
+        // 3.0 + (-3.333) = -0.333 → clamp low 0.5.
+        assert!((mc.effective_b - 0.5).abs() < 1e-9, "got {}", mc.effective_b);
+    }
+
+    #[test]
+    fn model_capability_high_flag_clamps_low_and_healthy_above_nominal() {
+        let now = 1_000_000i64;
+        let m = "Qwen/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-instruct-q4_k_m.gguf";
+        let mut lines = Vec::new();
+        // 40 locals, ZERO flagged → excess = -0.10; delta = +(0.10*0.5)/0.03 = +1.667;
+        // effective = 3.0 + 1.667 = 4.667 (< clamp high 3.0*1.5=4.5) → clamps to 4.5.
+        for i in 0..40 {
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: format!("h{i}"),
+                surface: "openai".into(), dest: "local".into(), score: 0.2,
+                local_model: Some(m.into()), ..Default::default() }));
+        }
+        let d = build_dashboard(&lines, now, 10, true);
+        let mc = &d.model_capabilities[0];
+        assert!((mc.flagged_rate - 0.0).abs() < 1e-9);
+        assert!((mc.effective_b - 4.5).abs() < 1e-9, "got {}", mc.effective_b);
+    }
+
+    #[test]
+    fn model_capability_skips_unknown_nominal() {
+        let now = 1_000_000i64;
+        let mut lines = Vec::new();
+        // 40 locals but the key has no size token and isn't in catalog → nominal 0 → skip.
+        for i in 0..40 {
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 10, rid: format!("u{i}"),
+                surface: "openai".into(), dest: "local".into(), score: 0.2,
+                local_model: Some("foo/mystery-model.gguf".into()), ..Default::default() }));
+        }
+        let d = build_dashboard(&lines, now, 10, true);
+        assert!(d.model_capabilities.is_empty());
     }
 }
