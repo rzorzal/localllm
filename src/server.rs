@@ -1040,7 +1040,7 @@ fn export_csv(lines: &[crate::route_log::LogLine]) -> String {
                 o.gen_ms.map(|v| v.to_string()).unwrap_or_default(),
                 o.cost_saved_usd)),
             LogLine::Feedback(f) => out.push_str(&format!(
-                "f,{},{},,,{},,,,,,\n",
+                "f,{},{},,,{},,,,,,,\n",
                 esc(&f.rid), f.ts, esc(&f.signal))),
         }
     }
