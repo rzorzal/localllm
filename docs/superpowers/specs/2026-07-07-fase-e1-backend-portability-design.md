@@ -36,8 +36,8 @@ overwhelmingly build configuration, not logic changes.
   (only `llama-cpp-2` does), and both engines must build under every selected
   backend. Revisit only if the mistralrs dependency is dropped from a build.
 - **MKL / Accelerate CPU acceleration** — the `cpu` feature ships bare
-  (portable, slower) candle-CPU + llama openmp. Faster CPU math is a later
-  optimization, not E1.
+  (portable, slower) bare candle-CPU + llama `common` (NO openmp — avoids a
+  libomp system dep). Faster CPU math is a later optimization, not E1.
 - **Runtime verification of non-Metal backends** — see Verification below.
   E1 lands correct wiring; real cuda/cpu *runtime* on Linux/Windows is proven
   by CI (E2) and the user, not on the macOS dev machine.
@@ -58,30 +58,31 @@ llama-cpp-sys-2  = { version = "0.1.150",   default-features = false }
 [features]
 # Each backend feature forwards to BOTH engines so either engine
 # (config `Backend::Llama` default, or `Backend::Mistralrs`) builds under it.
-metal = ["mistralrs/metal", "llama-cpp-2/metal", "llama-cpp-sys-2/metal"]
-cuda  = ["mistralrs/cuda",  "llama-cpp-2/cuda",  "llama-cpp-sys-2/cuda"]
-# cpu: portable, no GPU. llama gets openmp+common; mistralrs stays bare
-# candle-CPU (no mkl/accelerate) so it links on any Linux/Windows runner.
-cpu   = ["llama-cpp-2/openmp", "llama-cpp-2/common",
-         "llama-cpp-sys-2/openmp", "llama-cpp-sys-2/common"]
+metal = ["mistralrs/metal", "llama-cpp-2/metal", "llama-cpp-2/common", "llama-cpp-sys-2/metal"]
+cuda  = ["mistralrs/cuda",  "llama-cpp-2/cuda",  "llama-cpp-2/common", "llama-cpp-sys-2/cuda"]
+# cpu: portable, no GPU. llama gets `common` only; mistralrs stays bare
+# candle-CPU. NO openmp (avoids a libomp system dep), no mkl/accelerate — so it
+# links on any Linux/Windows runner.
+cpu   = ["llama-cpp-2/common", "llama-cpp-sys-2/common"]
 
 # Auto-enable Metal on macOS so a plain `cargo build` needs no flags and the
-# existing dev/build loop is unchanged. This is additive: on macOS the metal
-# upstream features are always linked.
+# existing dev/build loop is unchanged. Re-supplies the exact pre-E1 macOS
+# feature set (metal + llama's old-default common + openmp), activating the
+# UPSTREAM crates directly (does NOT set this crate's own `metal` flag).
 [target.'cfg(target_os = "macos")'.dependencies]
 mistralrs       = { version = "0.8",     default-features = false, features = ["metal"] }
-llama-cpp-2     = { version = "0.1.150", default-features = false, features = ["metal"] }
-llama-cpp-sys-2 = { version = "0.1.150", default-features = false, features = ["metal"] }
+llama-cpp-2     = { version = "0.1.150", default-features = false, features = ["metal", "common", "openmp"] }
+llama-cpp-sys-2 = { version = "0.1.150", default-features = false, features = ["metal", "common", "openmp"] }
 ```
 
 Notes:
 - **No `default` backend feature.** A plain `cargo build` on macOS gets Metal
   from the target table; on Linux/Windows a plain build activates no backend
   and hits the compile guard below, forcing an explicit `--features`.
-- The exact upstream feature names for the `cpu` set (`openmp`, `common`) are
-  confirmed against the crates' `[features]` tables; if `common` proves
-  unnecessary for a bare build, the plan drops it — it is included to match the
-  crates' own `default` set which bundled `common`.
+- The `cpu` set carries only `common` (llama's shared utilities, part of its
+  old default set). `openmp` is deliberately excluded so the CPU build needs no
+  libomp system dependency on any runner. macOS keeps `openmp` via the target
+  table above to preserve its exact pre-E1 feature set.
 
 ### Compile-time guard
 
