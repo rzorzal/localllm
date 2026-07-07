@@ -30,6 +30,13 @@ cd "$REPO_ROOT"
 APP_NAME="localllm"
 BUNDLE_ID="dev.localllm.app"
 APP_OUT="$REPO_ROOT/target/${APP_NAME}.app"
+# Version is derived from Cargo.toml — the single source of truth. The release
+# workflow (Fase E3) bumps only Cargo.toml; the bundle version follows.
+VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
+if [[ -z "$VERSION" ]]; then
+    echo "ERROR: could not read version from Cargo.toml" >&2
+    exit 1
+fi
 
 # --fast → non-LTO release-fast profile (parallel codegen): the final link of
 # the big statically-linked binary drops from minutes to ~30s for dev iteration.
@@ -106,9 +113,9 @@ cat > "$CONTENTS/Info.plist" << PLIST_EOF
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleSignature</key>
