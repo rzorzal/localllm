@@ -39,7 +39,7 @@ if [[ "${1:-}" == "--fast" ]]; then
 fi
 
 echo "==> Building ${PROFILE} binary…"
-cargo build --profile "$PROFILE"
+cargo build --profile "$PROFILE" --features metal
 
 BINARY="$REPO_ROOT/target/${PROFILE}/${APP_NAME}"
 if [[ ! -f "$BINARY" ]]; then
