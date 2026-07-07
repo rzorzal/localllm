@@ -101,7 +101,8 @@ jobs:
             backend: cpu
             asset: linux-x64-cpu
             kind: tar
-          - os: ubuntu-latest
+          # 22.04 (gcc-11) for CUDA 12.5 host-compiler compatibility; see ci.yml.
+          - os: ubuntu-22.04
             backend: cuda
             asset: linux-x64-cuda
             kind: tar
@@ -118,6 +119,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+      # nvcc on Windows needs MSVC's cl.exe on PATH; expose the dev environment.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |

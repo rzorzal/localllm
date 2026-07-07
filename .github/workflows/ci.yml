@@ -57,7 +57,10 @@ jobs:
           - os: windows-latest
             backend: cpu
             run_tests: true
-          - os: ubuntu-latest
+          # ubuntu-24.04 (ubuntu-latest) ships gcc-13/14, too new for CUDA 12.5's
+          # nvcc host compiler (kernels fail with an empty nvcc error). Pin the
+          # Linux cuda cell to 22.04 (gcc-11) for a supported host toolchain.
+          - os: ubuntu-22.04
             backend: cuda
             run_tests: false
           - os: windows-latest
@@ -65,6 +68,10 @@ jobs:
             run_tests: false
     steps:
       - uses: actions/checkout@v4
+      # nvcc on Windows needs MSVC's cl.exe on PATH; expose the dev environment.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
