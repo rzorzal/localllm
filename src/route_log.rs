@@ -226,6 +226,44 @@ pub struct RouteLatency {
     pub n: u64,
 }
 
+/// Rollup of quality signals over the dashboard window (30d).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FeedbackStats {
+    pub local_total: u64,
+    /// Locals with >=1 of: cascade | truncated | reask.
+    pub local_flagged: u64,
+    pub cloud_total: u64,
+    /// Clouds flagged cloud_trivial.
+    pub cloud_trivial: u64,
+}
+
+/// Data-driven Balanced-threshold suggestion (measurement only; never applied).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ThresholdSuggestion {
+    /// "lower" | "raise"
+    pub direction: String,
+    /// Suggested threshold, clamped to [SUGGEST_CLAMP_MIN, SUGGEST_CLAMP_MAX].
+    pub suggested: f64,
+    /// Human sentence for the dashboard banner (pt-BR, matches the UI language).
+    pub why: String,
+}
+
+/// Suggestion tunables — named so Fase D2 can calibrate them.
+pub const SUGGEST_WINDOW_SECS: i64 = 7 * 86_400;
+pub const SUGGEST_MIN_LOCAL_SAMPLE: u64 = 20;
+pub const SUGGEST_LOWER_FLAGGED_RATE: f64 = 0.15;
+pub const SUGGEST_RAISE_TRIVIAL_RATE: f64 = 0.30;
+pub const SUGGEST_CLAMP_MIN: f64 = 0.20;
+pub const SUGGEST_CLAMP_MAX: f64 = 0.80;
+
+/// p-th percentile (0.0..=1.0) of a non-empty slice; interpolation-free
+/// (nearest-rank). Returns None on empty input.
+fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() { return None; }
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted.get(idx).copied()
+}
+
 /// A contiguous window where requests fell back to local, one reason.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FallbackWindow {
@@ -265,6 +303,9 @@ pub struct Dashboard {
     pub windows: Vec<FallbackWindow>,
     /// Newest-first, capped at `recent_n`.
     pub recent: Vec<RecentRow>,
+    pub feedback: FeedbackStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<ThresholdSuggestion>,
 }
 
 const HOUR: i64 = 3600;
@@ -288,7 +329,7 @@ fn accumulate(bucket: &mut Bucket, d: &RouteEntry, o: Option<&OutcomeEntry>) {
 /// Build the dashboard rollups: rolling hour/day/month buckets (with $ saved),
 /// per-route latency, contiguous fallback windows, plus the newest `recent_n`
 /// decisions joined to their outcomes. Accepts the full `Vec<LogLine>`.
-pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashboard {
+pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize, balanced: bool) -> Dashboard {
     use std::collections::HashMap;
     let mut decisions: Vec<&RouteEntry> = Vec::new();
     let mut outcomes: HashMap<&str, &OutcomeEntry> = HashMap::new();
@@ -369,12 +410,74 @@ pub fn build_dashboard(entries: &[LogLine], now: i64, recent_n: usize) -> Dashbo
     }).collect();
     recent.sort_by(|a, b| b.entry.ts.cmp(&a.entry.ts));
     recent.truncate(recent_n);
+    // Quality-signal rollup (whole retained log) + threshold suggestion (7d).
+    const NEG_LOCAL: [&str; 3] = ["cascade", "truncated", "reask"];
+    let mut stats = FeedbackStats::default();
+    let mut lower_scores: Vec<f64> = Vec::new(); // flagged locals, 7d
+    let mut raise_scores: Vec<f64> = Vec::new(); // trivial clouds, 7d
+    let mut w_local_total = 0u64;
+    let mut w_local_flagged = 0u64;
+    let mut w_cloud_total = 0u64;
+    let mut w_cloud_trivial = 0u64;
+    let window_start = now - SUGGEST_WINDOW_SECS;
+    for d in &decisions {
+        let sigs = feedback.get(d.rid.as_str());
+        let in_window = d.ts >= window_start;
+        if d.dest == "local" {
+            stats.local_total += 1;
+            let flagged = sigs.map(|s| s.iter().any(|x| NEG_LOCAL.contains(&x.as_str()))).unwrap_or(false);
+            if flagged { stats.local_flagged += 1; }
+            if in_window {
+                w_local_total += 1;
+                if flagged { w_local_flagged += 1; lower_scores.push(d.score); }
+            }
+        } else {
+            stats.cloud_total += 1;
+            let trivial = sigs.map(|s| s.iter().any(|x| x == "cloud_trivial")).unwrap_or(false);
+            if trivial { stats.cloud_trivial += 1; }
+            if in_window {
+                w_cloud_total += 1;
+                if trivial { w_cloud_trivial += 1; raise_scores.push(d.score); }
+            }
+        }
+    }
+    let suggestion = if balanced && w_local_total >= SUGGEST_MIN_LOCAL_SAMPLE {
+        let flagged_rate = w_local_flagged as f64 / w_local_total as f64;
+        let trivial_rate = if w_cloud_total > 0 { w_cloud_trivial as f64 / w_cloud_total as f64 } else { 0.0 };
+        if flagged_rate > SUGGEST_LOWER_FLAGGED_RATE {
+            lower_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            percentile(&lower_scores, 0.25).map(|p| {
+                let v = p.clamp(SUGGEST_CLAMP_MIN, SUGGEST_CLAMP_MAX);
+                ThresholdSuggestion {
+                    direction: "lower".into(),
+                    suggested: v,
+                    why: format!(
+                        "{:.0}% dos pedidos locais precisaram da cloud — considere baixar o limiar para {:.0}%",
+                        flagged_rate * 100.0, v * 100.0),
+                }
+            })
+        } else if trivial_rate > SUGGEST_RAISE_TRIVIAL_RATE {
+            raise_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            percentile(&raise_scores, 0.75).map(|p| {
+                let v = p.clamp(SUGGEST_CLAMP_MIN, SUGGEST_CLAMP_MAX);
+                ThresholdSuggestion {
+                    direction: "raise".into(),
+                    suggested: v,
+                    why: format!(
+                        "{:.0}% dos pedidos na cloud foram triviais — considere subir o limiar para {:.0}%",
+                        trivial_rate * 100.0, v * 100.0),
+                }
+            })
+        } else { None }
+    } else { None };
     Dashboard {
         hour, day, month,
         local_latency: latency(l_ttft, l_tps, l_n),
         cloud_latency: latency(c_ttft, c_tps, c_n),
         windows,
         recent,
+        feedback: stats,
+        suggestion,
     }
 }
 
@@ -454,7 +557,7 @@ mod tests {
             completion_tok: Some(20), ttft_ms: Some(30), gen_ms: Some(100), cost_saved_usd: 0.42 }));
         lines.push(LogLine::Outcome(OutcomeEntry { rid: "b".into(), ts: now - 19,
             completion_tok: Some(50), ttft_ms: Some(80), gen_ms: Some(500), cost_saved_usd: 0.0 }));
-        let d = build_dashboard(&lines, now, 10);
+        let d = build_dashboard(&lines, now, 10, true);
         // hour bucket: local 120 saved, all-cloud 120+250
         assert_eq!(d.hour.tokens_saved, 120);
         assert_eq!(d.hour.tokens_if_all_cloud, 370);
@@ -482,7 +585,7 @@ mod tests {
             LogLine::Decision(RouteEntry { ts: now - 50, rid: "4".into(), surface: "openai".into(),
                 dest: "local".into(), reason: Some("CloudDown".into()), ..Default::default() }),
         ];
-        let d = build_dashboard(&lines, now, 10);
+        let d = build_dashboard(&lines, now, 10, true);
         assert_eq!(d.windows.len(), 3);
         let prov = d.windows.iter().find(|w| w.reason == "Quota").unwrap();
         assert_eq!(prov.kind, "provider");
@@ -498,7 +601,7 @@ mod tests {
     fn dashboard_recent_is_capped() {
         let now = 100i64;
         let entries: Vec<LogLine> = (0..20).map(|i| LogLine::Decision(e(now - i, "local", 1, 1))).collect();
-        let d = build_dashboard(&entries, now, 5);
+        let d = build_dashboard(&entries, now, 5, true);
         assert_eq!(d.recent.len(), 5);
     }
 
@@ -551,7 +654,7 @@ mod tests {
             LogLine::Decision(RouteEntry { ts: now, rid: "b".into(), surface: "openai".into(),
                 dest: "local".into(), ..Default::default() }),
         ];
-        let d = build_dashboard(&lines, now, 10);
+        let d = build_dashboard(&lines, now, 10, true);
         let row_a = d.recent.iter().find(|r| r.entry.rid == "a").unwrap();
         assert_eq!(row_a.feedback, vec!["cascade".to_string(), "reask".to_string()]);
         let row_b = d.recent.iter().find(|r| r.entry.rid == "b").unwrap();
@@ -568,5 +671,107 @@ mod tests {
             LogLine::Feedback(fe) => { assert_eq!(fe.rid, "x"); assert_eq!(fe.signal, "truncated"); }
             other => panic!("expected Feedback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn feedback_stats_count_flagged_and_trivial() {
+        let now = 1_000_000i64;
+        let mk = |rid: &str, dest: &str| LogLine::Decision(RouteEntry {
+            ts: now - 10, rid: rid.into(), surface: "openai".into(),
+            dest: dest.into(), score: 0.3, ..Default::default() });
+        let fb = |rid: &str, sig: &str| LogLine::Feedback(FeedbackEntry {
+            rid: rid.into(), ts: now - 9, signal: sig.into() });
+        let lines = vec![
+            mk("l1", "local"), fb("l1", "cascade"),
+            mk("l2", "local"), fb("l2", "truncated"), fb("l2", "reask"), // flagged once, not twice
+            mk("l3", "local"),
+            mk("c1", "cloud"), fb("c1", "cloud_trivial"),
+            mk("c2", "cloud"),
+        ];
+        let d = build_dashboard(&lines, now, 10, true);
+        assert_eq!(d.feedback.local_total, 3);
+        assert_eq!(d.feedback.local_flagged, 2);
+        assert_eq!(d.feedback.cloud_total, 2);
+        assert_eq!(d.feedback.cloud_trivial, 1);
+    }
+
+    #[test]
+    fn suggestion_lower_triggers_on_flagged_locals() {
+        let now = 1_000_000i64;
+        let mut lines = Vec::new();
+        // 20 local decisions in the 7d window; 4 flagged (20% > 15%).
+        for i in 0..20 {
+            let rid = format!("l{i}");
+            // Flagged locals get scores 0.30/0.32/0.34/0.36 → p25 = 0.315-ish.
+            let score = if i < 4 { 0.30 + 0.02 * i as f64 } else { 0.10 };
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: rid.clone(),
+                surface: "openai".into(), dest: "local".into(), score, ..Default::default() }));
+            if i < 4 {
+                lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 99, signal: "cascade".into() }));
+            }
+        }
+        let d = build_dashboard(&lines, now, 10, true);
+        let s = d.suggestion.expect("expected a suggestion");
+        assert_eq!(s.direction, "lower");
+        assert!(s.suggested >= 0.20 && s.suggested <= 0.80);
+        assert!(s.suggested <= 0.36, "should sit within the flagged score range, got {}", s.suggested);
+    }
+
+    #[test]
+    fn suggestion_raise_triggers_on_trivial_clouds() {
+        let now = 1_000_000i64;
+        let mut lines = Vec::new();
+        // 20 healthy locals (sample floor) + 10 clouds of which 4 trivial (40% > 30%).
+        for i in 0..20 {
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: format!("l{i}"),
+                surface: "openai".into(), dest: "local".into(), score: 0.1, ..Default::default() }));
+        }
+        for i in 0..10 {
+            let rid = format!("c{i}");
+            let score = if i < 4 { 0.50 + 0.02 * i as f64 } else { 0.90 };
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: rid.clone(),
+                surface: "openai".into(), dest: "cloud".into(), score, ..Default::default() }));
+            if i < 4 {
+                lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 99, signal: "cloud_trivial".into() }));
+            }
+        }
+        let d = build_dashboard(&lines, now, 10, true);
+        let s = d.suggestion.expect("expected a suggestion");
+        assert_eq!(s.direction, "raise");
+    }
+
+    #[test]
+    fn suggestion_none_when_sample_small_or_not_balanced() {
+        let now = 1_000_000i64;
+        // Only 5 locals, all flagged — sample below 20 → None.
+        let mut lines = Vec::new();
+        for i in 0..5 {
+            let rid = format!("l{i}");
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: rid.clone(),
+                surface: "openai".into(), dest: "local".into(), score: 0.3, ..Default::default() }));
+            lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: now - 99, signal: "cascade".into() }));
+        }
+        assert!(build_dashboard(&lines, now, 10, true).suggestion.is_none());
+        // Enough sample but balanced=false → None.
+        for i in 5..25 {
+            lines.push(LogLine::Decision(RouteEntry { ts: now - 100, rid: format!("l{i}"),
+                surface: "openai".into(), dest: "local".into(), score: 0.1, ..Default::default() }));
+        }
+        assert!(build_dashboard(&lines, now, 10, false).suggestion.is_none());
+    }
+
+    #[test]
+    fn suggestion_ignores_signals_older_than_7_days() {
+        let now = 1_000_000_000i64;
+        let mut lines = Vec::new();
+        // 20 flagged locals, but 8 days old → outside the window → None.
+        for i in 0..20 {
+            let rid = format!("l{i}");
+            let ts = now - 8 * 86_400;
+            lines.push(LogLine::Decision(RouteEntry { ts, rid: rid.clone(),
+                surface: "openai".into(), dest: "local".into(), score: 0.3, ..Default::default() }));
+            lines.push(LogLine::Feedback(FeedbackEntry { rid, ts: ts + 1, signal: "cascade".into() }));
+        }
+        assert!(build_dashboard(&lines, now, 10, true).suggestion.is_none());
     }
 }

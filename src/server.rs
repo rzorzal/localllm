@@ -997,7 +997,8 @@ async fn handle_dashboard(
         return resp;
     }
     let entries = crate::route_log::read_all();
-    let dash = crate::route_log::build_dashboard(&entries, crate::route_log::now_secs(), 50);
+    let balanced = crate::settings::load_profile() == crate::route::Profile::Balanced;
+    let dash = crate::route_log::build_dashboard(&entries, crate::route_log::now_secs(), 50, balanced);
     Json(dash).into_response()
 }
 
@@ -1082,7 +1083,7 @@ async fn handle_export(
 
 /// Render 30-day routing counters in Prometheus text format.
 fn metrics_text(lines: &[crate::route_log::LogLine], now: i64) -> String {
-    let d = crate::route_log::build_dashboard(lines, now, 0);
+    let d = crate::route_log::build_dashboard(lines, now, 0, false);
     format!(
         "# HELP localllm_requests_total Requests by destination (30d)\n\
          # TYPE localllm_requests_total counter\n\
