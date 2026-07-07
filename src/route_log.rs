@@ -49,6 +49,10 @@ pub struct RouteEntry {
     /// (Quota/Auth/ServerError/Offline). None otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degrade_reason: Option<String>,
+    /// Compact key (model_ctx_key(repo,file)) of the LOCAL model active when
+    /// this decision was made. Set on every decision; None on legacy lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_model: Option<String>,
 }
 
 /// Post-generation outcome for a request, correlated to its RouteEntry by `rid`.
@@ -758,6 +762,22 @@ mod tests {
                 surface: "openai".into(), dest: "local".into(), score: 0.1, ..Default::default() }));
         }
         assert!(build_dashboard(&lines, now, 10, false).suggestion.is_none());
+    }
+
+    #[test]
+    fn route_entry_local_model_round_trips_and_defaults() {
+        let e = RouteEntry { ts: 1, rid: "r".into(), surface: "openai".into(),
+            dest: "local".into(), local_model: Some("Owner/Repo/file.gguf".into()),
+            ..Default::default() };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"local_model\":\"Owner/Repo/file.gguf\""), "got {s}");
+        let back: RouteEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.local_model.as_deref(), Some("Owner/Repo/file.gguf"));
+        // Legacy line without the field → None.
+        let legacy: RouteEntry = serde_json::from_str(
+            r#"{"ts":1,"surface":"openai","dest":"local","score":0.1,"prompt_tok":5,"rid":"r"}"#
+        ).unwrap();
+        assert_eq!(legacy.local_model, None);
     }
 
     #[test]

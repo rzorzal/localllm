@@ -323,6 +323,7 @@ fn route_decision(
         ctx_window: Some(signals.local_ctx_window as u64),
         threshold: Some(threshold),
         capability_b: Some(local_capability_b as f64),
+        local_model: Some(crate::settings::model_ctx_key(&active.repo, &active.file)),
         prompt_snippet,
         ..Default::default()
     });
@@ -2802,5 +2803,44 @@ mod tests {
         }
         assert_eq!(buf.len(), super::REASK_BUFFER_CAP);
         assert_eq!(buf.front().unwrap().rid, "r11"); // newest kept
+    }
+
+    #[tokio::test]
+    async fn route_decision_records_active_local_model() {
+        let _guard = crate::route_log::ROUTE_LOG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("localllm-lm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let logp = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &logp);
+
+        let breaker = std::sync::Arc::new(crate::breaker::CircuitBreaker::new());
+        let state = wiring_state(breaker);
+        let req = crate::api::common::ChatRequest {
+            messages: vec![crate::api::common::ChatMessage {
+                role: crate::api::common::Role::User,
+                text: Some("oi".into()),
+                tool_calls: vec![],
+                tool_result: None,
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            model: String::new(),
+        };
+        let headers = axum::http::HeaderMap::new();
+        let _ = super::route_decision(&state, &req, &headers, "rlm1", "openai");
+
+        let lines = crate::route_log::read_all();
+        let dec = lines.iter().find_map(|l| match l {
+            crate::route_log::LogLine::Decision(d) if d.rid == "rlm1" => Some(d.clone()),
+            _ => None,
+        }).expect("decision line");
+        assert_eq!(dec.local_model.as_deref(), Some("test/test"));
+
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
