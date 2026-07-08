@@ -16,7 +16,6 @@ pub mod catalog_variants;
 pub mod cloud;
 pub mod config;
 pub mod download;
-pub mod engine;
 pub mod engine_llama;
 pub mod fit;
 pub mod history_select;
@@ -138,8 +137,6 @@ pub async fn run_server_with_ready_policy_token(
     >,
     breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
 ) -> anyhow::Result<()> {
-    use crate::config::Backend;
-    use crate::engine::Engine;
     use crate::engine_llama::LlamaEngine;
     use crate::server::{router, Generator};
     use std::sync::Arc;
@@ -165,45 +162,41 @@ pub async fn run_server_with_ready_policy_token(
     crate::route_log::prune_file(crate::route_log::now_secs(), 30 * 24 * 3600);
     crate::route_log::rotate_app_log(crate::route_log::now_secs(), 7 * 24 * 3600);
 
-    let (engine, effective_ctx): (Arc<dyn Generator>, usize) = match cfg.backend {
-        Backend::Llama => {
-            let kv_cache_dir = cfg.resolved_kv_cache_dir();
-            tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
-            tracing::info!(
-                "KV persist dir: {:?} (no-persist={})",
-                kv_cache_dir,
-                cfg.no_kv_persist
-            );
-            let r = resolve_load_params(
-                &cfg.model_id,
-                &cfg.gguf_files[0],
-                cfg.ctx_len as u32,
-                cfg.kv_type.clone(),
-            );
-            tracing::info!(
-                "resolved load params: ctx={} kv={:?} gpu_layers={:?}",
-                r.ctx,
-                r.kv_type,
-                r.gpu_layers
-            );
-            // Startup: use CLI --gguf-file directly; saved-quant variant resolution applies on switch, not here.
-            let llama = LlamaEngine::load(
-                &cfg.model_id,
-                &cfg.gguf_files,
-                r.ctx as usize,
-                kv_type_to_llama(r.kv_type),
-                kv_cache_dir,
-                r.gpu_layers,
-                total_ram_mb,
-            )
-            .await?;
-            let eff = llama.ctx_window();
-            (Arc::new(llama) as Arc<dyn Generator>, eff)
-        }
-        Backend::Mistralrs => (
-            Arc::new(Engine::load(&cfg.engine_config()).await?) as Arc<dyn Generator>,
-            cfg.ctx_len,
-        ),
+    // Single backend: embedded llama.cpp. (The mistralrs backend was removed —
+    // it was an unused alternate that also blocked the CUDA build.)
+    let (engine, effective_ctx): (Arc<dyn Generator>, usize) = {
+        let kv_cache_dir = cfg.resolved_kv_cache_dir();
+        tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
+        tracing::info!(
+            "KV persist dir: {:?} (no-persist={})",
+            kv_cache_dir,
+            cfg.no_kv_persist
+        );
+        let r = resolve_load_params(
+            &cfg.model_id,
+            &cfg.gguf_files[0],
+            cfg.ctx_len as u32,
+            cfg.kv_type.clone(),
+        );
+        tracing::info!(
+            "resolved load params: ctx={} kv={:?} gpu_layers={:?}",
+            r.ctx,
+            r.kv_type,
+            r.gpu_layers
+        );
+        // Startup: use CLI --gguf-file directly; saved-quant variant resolution applies on switch, not here.
+        let llama = LlamaEngine::load(
+            &cfg.model_id,
+            &cfg.gguf_files,
+            r.ctx as usize,
+            kv_type_to_llama(r.kv_type),
+            kv_cache_dir,
+            r.gpu_layers,
+            total_ram_mb,
+        )
+        .await?;
+        let eff = llama.ctx_window();
+        (Arc::new(llama) as Arc<dyn Generator>, eff)
     };
 
     crate::usage::enable_notifications();

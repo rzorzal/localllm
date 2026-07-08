@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-mistralrs = { version = "0.8", default-features = false }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -38,22 +37,19 @@ png = "0.17"
 wry = "0.45"
 
 [features]
-# Backend selection. Each forwards to BOTH engines so either the Llama
-# (default) or Mistralrs engine builds under the chosen backend.
+# Backend selection (embedded llama.cpp only; the mistralrs backend was removed).
 # `common` is llama.cpp's shared utilities (part of its old default set).
-metal = ["mistralrs/metal", "llama-cpp-2/metal", "llama-cpp-2/common", "llama-cpp-sys-2/metal"]
-cuda  = ["mistralrs/cuda",  "llama-cpp-2/cuda",  "llama-cpp-2/common", "llama-cpp-sys-2/cuda"]
+metal = ["llama-cpp-2/metal", "llama-cpp-2/common", "llama-cpp-sys-2/metal"]
+cuda  = ["llama-cpp-2/cuda", "llama-cpp-2/common", "llama-cpp-sys-2/cuda"]
 # Portable CPU: no openmp (avoids a libomp system dep), no mkl/accelerate.
-# mistralrs stays bare (candle CPU) — it needs no feature for CPU.
 cpu   = ["llama-cpp-2/common", "llama-cpp-sys-2/common"]
 
 # Auto-enable Metal on macOS so a plain `cargo build` needs no flags and the
 # existing dev/build loop is unchanged. Re-supplies the exact feature set the
 # project built with before (metal + llama's default common + openmp). These
 # activate the UPSTREAM crates' features directly — they do NOT set this
-# crate's own `metal` feature flag (see Task 2's guard).
+# crate's own `metal` feature flag (see the backend guard in src/lib.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
-mistralrs = { version = "0.8", default-features = false, features = ["metal"] }
 llama-cpp-2 = { version = "0.1.150", default-features = false, features = ["metal", "common", "openmp"] }
 llama-cpp-sys-2 = { version = "0.1.150", default-features = false, features = ["metal", "common", "openmp"] }
 

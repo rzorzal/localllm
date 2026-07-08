@@ -140,7 +140,7 @@ restores the **last activated model** unless `--model-id` is passed explicitly.
 | `--model-id` | `Qwen/Qwen2.5-3B-Instruct-GGUF` | HuggingFace GGUF repo |
 | `--gguf-file` | `qwen2.5-3b-instruct-q4_k_m.gguf` | GGUF filename(s); repeat for split models |
 | `--ctx-len` | `32768` | Context window in tokens (sizes the KV cache) |
-| `--backend` | `llama` | `llama` (embedded llama.cpp) or `mistralrs` |
+| `--backend` | `llama` | `llama` (embedded llama.cpp) |
 | `--kv-type` | `q8` | KV-cache quant: `q8` (½ RAM), `f16` (max quality), `q4` (min RAM) |
 | `--kv-cache-dir` | `<cache>/localllm/kvcache` | On-disk prefix-cache dir |
 | `--no-kv-persist` | `false` | Disable on-disk KV persistence |

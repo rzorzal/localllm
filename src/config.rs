@@ -1,9 +1,6 @@
 //! CLI configuration parsed with clap.
 //!
 //! `Config` is the single source of truth for all runtime parameters.
-//! `force_cpu` defaults to `false`: the Metal toolchain is installed and
-//! shaders compile, so the model runs on the Apple GPU. Pass
-//! `--force-cpu true` to force CPU (e.g. if the Metal toolchain breaks again).
 
 /// Which inference backend to use.
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
@@ -12,9 +9,6 @@ pub enum Backend {
     /// llama.cpp via the llama-cpp-2 crate (default). Works on Metal without
     /// pre-compiling shaders. Supports incremental token streaming.
     Llama,
-    /// mistral.rs GgufModelBuilder. Feature-rich but requires
-    /// MISTRALRS_METAL_PRECOMPILE=0 on this machine.
-    Mistralrs,
 }
 
 /// KV-cache quantization type. Controls the precision of the K and V tensors
@@ -67,17 +61,8 @@ pub struct Config {
     #[arg(long, default_value_t = 32768)]
     pub ctx_len: usize,
 
-    /// Disable paged attention.
-    #[arg(long, default_value_t = false)]
-    pub no_paged_attn: bool,
-
-    /// Force CPU execution. Defaults to false (use the Apple GPU via Metal).
-    /// Set to true to fall back to CPU.
-    #[arg(long, default_value_t = false)]
-    pub force_cpu: bool,
-
-    /// Inference backend. Default `llama` (embedded llama.cpp, single binary,
-    /// no MISTRALRS_METAL_PRECOMPILE needed, supports KV persistence).
+    /// Inference backend. Default (and only) `llama` — embedded llama.cpp,
+    /// single binary, supports KV persistence.
     #[arg(long, value_enum, default_value_t = Backend::Llama)]
     pub backend: Backend,
 
@@ -130,17 +115,6 @@ impl Config {
         dirs::cache_dir().map(|d| d.join("localllm").join("kvcache"))
     }
 
-    /// Map CLI config into the `EngineConfig` expected by `Engine::load`.
-    pub fn engine_config(&self) -> crate::engine::EngineConfig {
-        crate::engine::EngineConfig {
-            model_id: self.model_id.clone(),
-            gguf_files: self.gguf_files.clone(),
-            ctx_len: self.ctx_len,
-            paged_attn: !self.no_paged_attn,
-            force_cpu: self.force_cpu,
-        }
-    }
-
     /// Map CLI `kv_type` to the llama-cpp-2 `KvCacheType`.
     pub fn llama_kv_cache_type(&self) -> llama_cpp_2::context::params::KvCacheType {
         use llama_cpp_2::context::params::KvCacheType;
@@ -169,20 +143,6 @@ mod tests {
         assert_eq!(c.port, 31415);
         assert_eq!(c.ctx_len, 32768);
         assert!(c.model_id.contains("Qwen2.5-3B-Instruct"));
-    }
-
-    #[test]
-    fn engine_config_maps_fields_correctly() {
-        let c = Config::parse_from(["localllm"]);
-        let ec = c.engine_config();
-        // no_paged_attn defaults to false → paged_attn should be true
-        assert!(
-            ec.paged_attn,
-            "paged_attn should be true when no_paged_attn=false"
-        );
-        // default is the single-file 3B gguf
-        assert_eq!(ec.gguf_files.len(), 1);
-        assert!(ec.gguf_files[0].contains("qwen2.5-3b-instruct-q4_k_m"));
     }
 
     #[test]

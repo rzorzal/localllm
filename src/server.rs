@@ -770,21 +770,6 @@ pub struct AppState {
     >,
 }
 
-// Implement Generator for Engine by delegating to its inherent methods.
-#[async_trait::async_trait]
-impl Generator for crate::engine::Engine {
-    async fn generate(&self, req: ChatRequest) -> anyhow::Result<ChatResult> {
-        crate::engine::Engine::generate(self, req).await
-    }
-
-    async fn generate_stream(
-        &self,
-        req: ChatRequest,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>> {
-        crate::engine::Engine::generate_stream(self, req).await
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
