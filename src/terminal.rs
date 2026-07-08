@@ -63,13 +63,17 @@ pub fn installed() -> Vec<TerminalApp> {
 }
 
 /// Open a new terminal window in `dir` running `command`. Best-effort.
+///
+/// `command` must already be shell-safe (the caller single-quotes the binary
+/// path). `dir` is single-quoted here so folder names with spaces work.
 pub fn open(app: TerminalApp, dir: &Path, command: &str) -> std::io::Result<()> {
     let dir = dir.display();
+    // Shell fragment run inside the terminal: `cd '<dir>' && <command>`.
+    let shell = format!("cd '{dir}' && {command}");
     match app {
         // Scriptable: run the command directly in a new window.
         TerminalApp::Terminal => {
-            let script =
-                format!("tell application \"Terminal\" to do script \"cd {dir} && {command}\"");
+            let script = format!("tell application \"Terminal\" to do script \"{shell}\"");
             Command::new("osascript")
                 .arg("-e")
                 .arg(script)
@@ -78,7 +82,7 @@ pub fn open(app: TerminalApp, dir: &Path, command: &str) -> std::io::Result<()> 
         }
         TerminalApp::ITerm => {
             let script = format!(
-                "tell application \"iTerm\"\ncreate window with default profile\ntell current session of current window to write text \"cd {dir} && {command}\"\nend tell"
+                "tell application \"iTerm\"\ncreate window with default profile\ntell current session of current window to write text \"{shell}\"\nend tell"
             );
             Command::new("osascript")
                 .arg("-e")

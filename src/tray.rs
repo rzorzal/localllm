@@ -776,7 +776,9 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                                 let exe = std::env::current_exe()
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|_| "localllm".into());
-                                let command = format!("{exe:?} {sub}");
+                                // Single-quote the binary path for the shell (it
+                                // runs inside an AppleScript double-quoted string).
+                                let command = format!("'{exe}' {sub}");
                                 let app = crate::settings::load_terminal();
                                 if let Err(e) = crate::terminal::open(
                                     app,
