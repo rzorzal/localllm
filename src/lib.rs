@@ -299,6 +299,13 @@ pub async fn run_server_with_ready_policy_token(
         tokio::spawn(async move {
             const MAX_ATTEMPTS: u32 = 3;
             for attempt in 1..=MAX_ATTEMPTS {
+                // A concurrent start_switch may have already loaded an engine
+                // while we were sleeping in backoff. Stop to avoid a redundant
+                // or racing load.
+                if mgr.has_engine() {
+                    tracing::info!(target: "localllm", "engine already loaded by start_switch; stopping retry loop");
+                    return;
+                }
                 if mgr.try_initial_load(spec.clone()).await {
                     tracing::info!(target: "localllm", "initial model loaded (attempt {attempt})");
                     return;

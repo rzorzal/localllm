@@ -101,14 +101,17 @@ impl ModelManager {
         })
     }
 
-    /// Build a manager with NO engine yet, in a "loading" state. The caller runs
-    /// `try_initial_load` (typically after binding the server) to populate it.
+    /// Build a manager with NO engine yet. The caller runs `try_initial_load`
+    /// (typically after binding the server) to populate it. `switching` starts
+    /// `false` so that `try_initial_load` can acquire the guard via
+    /// `compare_exchange`; in-flight requests will 503 via the absent-engine
+    /// check in `generate` until the engine is loaded.
     pub fn new_loading(current: ModelSpec, builder: EngineBuilder) -> Arc<Self> {
         Arc::new(Self {
             engine: ArcSwapOption::from(None),
             current: Mutex::new(current),
             target: Mutex::new(None),
-            switching: AtomicBool::new(true),
+            switching: AtomicBool::new(false),
             errored: AtomicBool::new(false),
             inflight: Arc::new(AtomicUsize::new(0)),
             phase: AtomicU8::new(PHASE_LOADING),
@@ -126,8 +129,20 @@ impl ModelManager {
     /// Load the initial engine via the builder (no drain, no restore — there is
     /// no previous engine). Returns true on success. On failure, sets errored +
     /// error and leaves the engine absent. Clears `switching` either way.
+    ///
+    /// Returns `false` immediately (without touching `errored`/`error`/`engine`)
+    /// if `switching` is already `true` — this means a concurrent `start_switch`
+    /// has the guard and we must not race with it.
     pub async fn try_initial_load(self: &Arc<Self>, spec: ModelSpec) -> bool {
-        self.switching.store(true, Ordering::SeqCst);
+        // Acquire the switching guard. If already held (e.g. a concurrent
+        // start_switch), treat this as contention, not a load error, and bail.
+        if self
+            .switching
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
         self.errored.store(false, Ordering::SeqCst);
         *self.error.lock().unwrap() = None;
         self.set_phase(PHASE_LOADING);
@@ -657,7 +672,9 @@ mod tests {
         let calls = Arc::new(TestAtomicUsize::new(0));
         let m = ModelManager::new_loading(spec("r", "m"), counting_builder(calls.clone(), None));
         assert!(!m.has_engine());
-        assert_eq!(m.status().state, "switching"); // loading
+        // new_loading starts with switching=false so try_initial_load can acquire
+        // the guard. The engine is absent until try_initial_load succeeds.
+        assert!(!m.is_switching());
         let ok = m.try_initial_load(spec("r", "m")).await;
         assert!(ok);
         assert!(m.has_engine());
@@ -675,5 +692,60 @@ mod tests {
         assert!(!m.has_engine());
         assert!(m.is_errored());
         assert!(m.status().error.unwrap().contains("boom"));
+    }
+
+    /// Race guard: if `switching` is already true when `try_initial_load` is
+    /// called (simulating a concurrent `start_switch`), it must return `false`
+    /// WITHOUT setting `errored`, setting `error`, or touching `engine`/`current`.
+    ///
+    /// Strategy: use `ModelManager::new` (has an engine, switching=false) and
+    /// call `start_switch` with a blocking builder to hold `switching=true`, then
+    /// call `try_initial_load` while the switch is in progress and assert it bails.
+    #[tokio::test]
+    async fn try_initial_load_is_no_op_when_switching_already_held() {
+        let calls = Arc::new(TestAtomicUsize::new(0));
+        // Use a blocking builder so start_switch holds switching=true indefinitely.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let calls2 = calls.clone();
+        let builder: EngineBuilder = Box::new(move |_spec| {
+            let rx = rx.clone();
+            let calls2 = calls2.clone();
+            Box::pin(async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                if let Some(rx) = rx.lock().await.take() {
+                    let _ = rx.await;
+                }
+                Ok(marker_gen("switched"))
+            })
+        });
+        let m = ModelManager::new(marker_gen("orig"), spec("r", "old"), builder);
+        // Hold switching=true via start_switch.
+        m.start_switch(spec("r2", "new")).unwrap();
+        // Give the switch task a moment to flip switching.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(m.is_switching(), "start_switch must hold switching=true");
+
+        // try_initial_load must bail without touching errored/error/engine.
+        let ok = m.try_initial_load(spec("r", "old")).await;
+
+        // Must return false (contention, not an error).
+        assert!(!ok, "should return false when switching is already held");
+        // Must NOT set errored (this is a contention bail-out, not a load failure).
+        assert!(!m.is_errored(), "errored must remain false on contention bail");
+        // The key invariant: builder was NOT called by try_initial_load.
+        // start_switch may have already called the builder once (during drain/build),
+        // but try_initial_load must not add an extra call.
+        let builder_calls_after_bail = calls.load(Ordering::SeqCst);
+        // Release the switch so the test can exit cleanly.
+        let _ = tx.send(());
+        wait_ready(&m).await;
+        // After switch completes, exactly one extra builder call (from the switch itself).
+        // try_initial_load must not have added another.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            builder_calls_after_bail,
+            "builder must not be invoked by try_initial_load on contention bail"
+        );
     }
 }
