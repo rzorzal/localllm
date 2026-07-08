@@ -182,6 +182,11 @@ impl ModelManager {
             "switching"
         } else if self.errored.load(Ordering::SeqCst) {
             "error"
+        } else if !self.has_engine() {
+            // No engine yet (initial-load window before try_initial_load takes
+            // the guard). Report loading, not "ready" — otherwise the tray would
+            // briefly show green "Running" with no model loaded.
+            "switching"
         } else {
             "ready"
         };
@@ -673,8 +678,10 @@ mod tests {
         let m = ModelManager::new_loading(spec("r", "m"), counting_builder(calls.clone(), None));
         assert!(!m.has_engine());
         // new_loading starts with switching=false so try_initial_load can acquire
-        // the guard. The engine is absent until try_initial_load succeeds.
+        // the guard. The engine is absent until try_initial_load succeeds — but
+        // status() must report loading (not "ready") while there is no engine.
         assert!(!m.is_switching());
+        assert_eq!(m.status().state, "switching");
         let ok = m.try_initial_load(spec("r", "m")).await;
         assert!(ok);
         assert!(m.has_engine());
