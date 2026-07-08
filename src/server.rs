@@ -233,6 +233,8 @@ fn route_decision(
         last_turn_tokens,
         has_cloud_creds,
         local_capability_b,
+        cold_tokens: 0,
+        prefill_tok_s: 200.0,
     };
     let policy = *state.policy.read().unwrap();
     let raw_decision = crate::route::decide(&signals, &policy);

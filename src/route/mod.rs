@@ -28,6 +28,12 @@ pub struct Signals {
     /// Active local model's parameter size in billions (0.0 = unknown/neutral).
     /// Shifts the difficulty threshold: weaker local → more cloud.
     pub local_capability_b: f32,
+    /// Tokens NOT already in the local KV cache — the cold prefill this request
+    /// would incur (0 when fully warm). Measured by the server via the engine.
+    pub cold_tokens: usize,
+    /// Measured local prefill speed (tokens/sec); server passes a fallback when
+    /// no sample exists. Used to estimate cold-prefill seconds.
+    pub prefill_tok_s: f64,
 }
 
 /// Why a request was sent to cloud.
@@ -39,6 +45,9 @@ pub enum RouteReason {
     Difficulty,
     /// Profile forces cloud (e.g. MaxQuality, Phase B).
     Profile,
+    /// Local would need an expensive cold KV prefill; served from cloud while a
+    /// background local prefill warms the cache for the next turn.
+    ColdPrefill,
 }
 
 /// The routing outcome for a single request.
@@ -119,6 +128,18 @@ pub fn decide(s: &Signals, p: &RoutingPolicy) -> Decision {
     // 2. Cloud impossible (profile forbids it or no credential to forward) → local.
     if !p.allow_cloud || !s.has_cloud_creds {
         return Decision::Local;
+    }
+
+    // 2b. Cold-prefill gate: a large uncached prefill would make the local
+    // model take too long. Serve from cloud now; the caller warms local in the
+    // background. Reaching here means cloud is allowed AND creds are present.
+    let prefill_secs = if s.prefill_tok_s > 0.0 {
+        s.cold_tokens as f64 / s.prefill_tok_s
+    } else {
+        f64::INFINITY
+    };
+    if prefill_secs > p.cold_prefill_gate_secs {
+        return Decision::Cloud(RouteReason::ColdPrefill);
     }
 
     // 3. Difficulty above the *capability-adjusted* threshold → cloud now.
@@ -209,6 +230,8 @@ mod tests {
             last_turn_tokens: prompt_tokens,
             has_cloud_creds: has_creds,
             local_capability_b: 0.0,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         }
     }
 
@@ -242,6 +265,8 @@ mod tests {
             last_turn_tokens: 1600,
             has_cloud_creds: true,
             local_capability_b: 0.0,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         };
         assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::Difficulty));
     }
@@ -258,6 +283,8 @@ mod tests {
             last_turn_tokens: 600,
             has_cloud_creds: true,
             local_capability_b: 0.0,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         };
         // turn 600/2000 = 0.3 → 0.8*0.3 = 0.24 > 0.2 → cloud.
         assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::Difficulty));
@@ -278,6 +305,8 @@ mod tests {
             last_turn_tokens: 4, // "ls"
             has_cloud_creds: true,
             local_capability_b: 8.0,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         };
         // score = 0.8*(4/2000) + 0.2*(7/20) = 0.0016 + 0.07 ≈ 0.07 << threshold.
         assert_eq!(decide(&s, &p), Decision::LocalThenCascade);
@@ -300,6 +329,8 @@ mod tests {
             last_turn_tokens: 10,
             has_cloud_creds: true,
             local_capability_b: 0.0,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         };
         let full = Signals {
             prompt_tokens: 2000,
@@ -309,6 +340,8 @@ mod tests {
             last_turn_tokens: 2000,
             has_cloud_creds: true,
             local_capability_b: 0.0,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         };
         assert!(difficulty_score(&trivial) < 0.1);
         assert!(difficulty_score(&full) > 0.95);
@@ -398,6 +431,8 @@ mod tests {
             last_turn_tokens: 1000,
             has_cloud_creds: true,
             local_capability_b: cap,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         }
     }
 
@@ -426,6 +461,8 @@ mod tests {
             last_turn_tokens: 1600,
             has_cloud_creds: true,
             local_capability_b: cap,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         }
     }
 
@@ -452,11 +489,64 @@ mod tests {
             last_turn_tokens: 5000,
             has_cloud_creds: true,
             local_capability_b: 32.0,
+            cold_tokens: 0,
+            prefill_tok_s: 200.0,
         };
         assert_eq!(
             decide(&s, &Profile::SaveTokens.policy()),
             Decision::Cloud(RouteReason::ContextOverflow)
         );
+    }
+
+    #[test]
+    fn cold_big_prefill_with_cloud_routes_coldprefill() {
+        let mut p = pol(); // Balanced-like, allow_cloud=true, cascade=true
+        p.cold_prefill_gate_secs = 8.0;
+        let s = Signals {
+            prompt_tokens: 24000, local_ctx_window: 32768, n_tools: 32, n_messages: 3,
+            last_turn_tokens: 40, has_cloud_creds: true, local_capability_b: 8.0,
+            cold_tokens: 19000, prefill_tok_s: 200.0, // 19000/200 = 95s > 8s
+        };
+        assert_eq!(decide(&s, &p), Decision::Cloud(RouteReason::ColdPrefill));
+    }
+
+    #[test]
+    fn warm_request_stays_local_despite_big_prompt() {
+        let mut p = pol();
+        p.cold_prefill_gate_secs = 8.0;
+        let s = Signals {
+            prompt_tokens: 24000, local_ctx_window: 32768, n_tools: 32, n_messages: 5,
+            last_turn_tokens: 40, has_cloud_creds: true, local_capability_b: 8.0,
+            cold_tokens: 300, prefill_tok_s: 200.0, // 300/200 = 1.5s < 8s → not cold-escalated
+        };
+        // low difficulty + under gate → cascade/local, NOT ColdPrefill
+        assert!(matches!(decide(&s, &p), Decision::LocalThenCascade | Decision::Local));
+    }
+
+    #[test]
+    fn cold_big_prefill_without_cloud_stays_local() {
+        let mut p = pol();
+        p.cold_prefill_gate_secs = 8.0;
+        p.allow_cloud = true;
+        let s = Signals {
+            prompt_tokens: 24000, local_ctx_window: 32768, n_tools: 32, n_messages: 3,
+            last_turn_tokens: 40, has_cloud_creds: false, local_capability_b: 8.0,
+            cold_tokens: 19000, prefill_tok_s: 200.0,
+        };
+        // no creds → cloud impossible → must NOT be ColdPrefill
+        assert!(!matches!(decide(&s, &p), Decision::Cloud(RouteReason::ColdPrefill)));
+    }
+
+    #[test]
+    fn zero_prefill_tok_s_does_not_panic() {
+        let mut p = pol();
+        p.cold_prefill_gate_secs = 8.0;
+        let s = Signals {
+            prompt_tokens: 24000, local_ctx_window: 32768, n_tools: 32, n_messages: 3,
+            last_turn_tokens: 40, has_cloud_creds: true, local_capability_b: 8.0,
+            cold_tokens: 19000, prefill_tok_s: 0.0,
+        };
+        let _ = decide(&s, &p); // must not divide-by-zero panic
     }
 
     #[test]

@@ -56,6 +56,7 @@ impl Profile {
                 cascade: true,
                 ctx_gate_frac: 0.95,
                 allow_cloud: true,
+                cold_prefill_gate_secs: 360.0,
             },
             Profile::Balanced => RoutingPolicy {
                 // Lowered 0.6 → 0.45 so medium-difficulty turns escalate to cloud
@@ -64,18 +65,21 @@ impl Profile {
                 cascade: true,
                 ctx_gate_frac: 0.9,
                 allow_cloud: true,
+                cold_prefill_gate_secs: 360.0,
             },
             Profile::MaxQuality => RoutingPolicy {
                 escalation_threshold: 0.2,
                 cascade: false,
                 ctx_gate_frac: 0.75,
                 allow_cloud: true,
+                cold_prefill_gate_secs: 360.0,
             },
             Profile::LocalOnly => RoutingPolicy {
                 escalation_threshold: 1.0,
                 cascade: false,
                 ctx_gate_frac: 1.0,
                 allow_cloud: false,
+                cold_prefill_gate_secs: 360.0,
             },
         }
     }
@@ -93,6 +97,9 @@ pub struct RoutingPolicy {
     pub ctx_gate_frac: f64,
     /// Whether cloud routing is permitted at all.
     pub allow_cloud: bool,
+    /// Escalate to cloud + background-warm local when the estimated COLD
+    /// prefill would exceed this many seconds. Large = patient with local.
+    pub cold_prefill_gate_secs: f64,
 }
 
 /// Write `p`'s knobs into the shared policy under the lock. Used by the tray to
