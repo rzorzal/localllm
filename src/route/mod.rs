@@ -48,6 +48,9 @@ pub enum RouteReason {
     /// Local would need an expensive cold KV prefill; served from cloud while a
     /// background local prefill warms the cache for the next turn.
     ColdPrefill,
+    /// No local engine loaded (initial load in progress / failed) — served from
+    /// cloud instead.
+    LocalUnavailable,
 }
 
 /// The routing outcome for a single request.
@@ -63,6 +66,8 @@ pub enum Decision {
     /// Cloud was wanted but no usable credentials / cloud disallowed; serve
     /// local and warn (local will reject an over-window prompt cleanly).
     LocalNoCreds,
+    /// No local engine AND cloud not possible → the caller returns 503.
+    NoModel,
 }
 
 /// Tokens in the latest turn that count as a "full-difficulty" ask.

@@ -196,6 +196,20 @@ fn detect_reask(
     None
 }
 
+/// Override the routing decision when no local engine is loaded: prefer cloud if
+/// available, else signal a 503 via `NoModel`. Returns None when an engine is
+/// present (normal routing applies).
+pub(crate) fn no_engine_decision(has_engine: bool, cloud_available: bool) -> Option<crate::route::Decision> {
+    if has_engine {
+        return None;
+    }
+    Some(if cloud_available {
+        crate::route::Decision::Cloud(crate::route::RouteReason::LocalUnavailable)
+    } else {
+        crate::route::Decision::NoModel
+    })
+}
+
 /// Decide whether the circuit breaker forces a cloud-bound decision to local.
 /// Returns the tripping `DegradeReason` when the raw decision is cloud, budget
 /// did not already force local, and the breaker gate is closed to cloud (Open,
@@ -2087,7 +2101,19 @@ async fn handle_oai_chat(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "openai").await;
+    // No local engine (initial load in progress / failed): cloud if possible, else 503.
+    let no_engine_cloud_available = !state.manager.has_engine() && {
+        let pol = state.policy.read().unwrap_or_else(|e| e.into_inner());
+        pol.allow_cloud && (headers.contains_key("x-api-key") || headers.contains_key("authorization"))
+    };
+
+    let (decision, est_prompt_tokens) = {
+        let (d, pt) = route_decision(&state, &internal, &headers, &rid, "openai").await;
+        match no_engine_decision(state.manager.has_engine(), no_engine_cloud_available) {
+            Some(forced) => (forced, pt),
+            None => (d, pt),
+        }
+    };
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
@@ -2115,6 +2141,13 @@ async fn handle_oai_chat(
                     false
                 }
             }
+        }
+        crate::route::Decision::NoModel => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "modelo carregando, tente em instantes"})),
+            )
+                .into_response();
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [openai] route=local (cloud wanted but no creds/disallowed)");
@@ -2337,8 +2370,20 @@ async fn handle_oai_responses(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) =
-        route_decision(&state, &internal, &headers, &rid, "openai-responses").await;
+    // No local engine (initial load in progress / failed): cloud if possible, else 503.
+    let no_engine_cloud_available = !state.manager.has_engine() && {
+        let pol = state.policy.read().unwrap_or_else(|e| e.into_inner());
+        pol.allow_cloud && (headers.contains_key("x-api-key") || headers.contains_key("authorization"))
+    };
+
+    let (decision, est_prompt_tokens) = {
+        let (d, pt) =
+            route_decision(&state, &internal, &headers, &rid, "openai-responses").await;
+        match no_engine_decision(state.manager.has_engine(), no_engine_cloud_available) {
+            Some(forced) => (forced, pt),
+            None => (d, pt),
+        }
+    };
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [responses] route=cloud reason={reason:?}");
@@ -2372,6 +2417,13 @@ async fn handle_oai_responses(
                     false
                 }
             }
+        }
+        crate::route::Decision::NoModel => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "modelo carregando, tente em instantes"})),
+            )
+                .into_response();
         }
         crate::route::Decision::LocalNoCreds => false,
         crate::route::Decision::LocalThenCascade => true,
@@ -2489,8 +2541,20 @@ async fn handle_anth_messages(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) =
-        route_decision(&state, &internal, &headers, &rid, "anthropic").await;
+    // No local engine (initial load in progress / failed): cloud if possible, else 503.
+    let no_engine_cloud_available = !state.manager.has_engine() && {
+        let pol = state.policy.read().unwrap_or_else(|e| e.into_inner());
+        pol.allow_cloud && (headers.contains_key("x-api-key") || headers.contains_key("authorization"))
+    };
+
+    let (decision, est_prompt_tokens) = {
+        let (d, pt) =
+            route_decision(&state, &internal, &headers, &rid, "anthropic").await;
+        match no_engine_decision(state.manager.has_engine(), no_engine_cloud_available) {
+            Some(forced) => (forced, pt),
+            None => (d, pt),
+        }
+    };
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
@@ -2524,6 +2588,13 @@ async fn handle_anth_messages(
                     false
                 }
             }
+        }
+        crate::route::Decision::NoModel => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "modelo carregando, tente em instantes"})),
+            )
+                .into_response();
         }
         crate::route::Decision::LocalNoCreds => {
             tracing::warn!(target: "localllm::req", "{rid} [anthropic] route=local (cloud wanted but no creds/disallowed)");
@@ -3582,5 +3653,17 @@ mod tests {
 
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_engine_decision_prefers_cloud_then_503() {
+        use crate::route::{Decision, RouteReason};
+        // engine present → no override
+        assert_eq!(super::no_engine_decision(true, true), None);
+        assert_eq!(super::no_engine_decision(true, false), None);
+        // no engine + cloud available → cloud
+        assert_eq!(super::no_engine_decision(false, true), Some(Decision::Cloud(RouteReason::LocalUnavailable)));
+        // no engine + no cloud → NoModel (→ 503)
+        assert_eq!(super::no_engine_decision(false, false), Some(Decision::NoModel));
     }
 }
