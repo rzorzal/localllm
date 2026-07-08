@@ -27,9 +27,12 @@ pub struct RelayMeter {
 struct MeteredStream<S> {
     inner: S,
     rid: String,
+    provider: Provider,
+    is_stream: bool,
     started: std::time::Instant,
     first_chunk_ms: Option<u64>,
     bytes: u64,
+    buf: Vec<u8>,
     done: bool,
 }
 
@@ -49,6 +52,11 @@ where
                     this.first_chunk_ms = Some(this.started.elapsed().as_millis() as u64);
                 }
                 this.bytes += chunk.len() as u64;
+                const CLOUD_BUF_CAP: usize = 256 * 1024;
+                if this.buf.len() < CLOUD_BUF_CAP {
+                    let room = CLOUD_BUF_CAP - this.buf.len();
+                    this.buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }
             std::task::Poll::Ready(None) => {
@@ -65,7 +73,7 @@ where
                         ttft_ms: this.first_chunk_ms,
                         gen_ms: Some(this.started.elapsed().as_millis() as u64),
                         cost_saved_usd: 0.0,
-                        output_text: None,
+                        output_text: extract_cloud_text(&this.buf, this.provider, this.is_stream),
                     });
                     if est_tok < CLOUD_TRIVIAL_MAX_TOK {
                         crate::route_log::append_feedback(&crate::route_log::FeedbackEntry {
@@ -78,6 +86,51 @@ where
                 std::task::Poll::Ready(None)
             }
             other => other,
+        }
+    }
+}
+
+/// Recover the assistant text from a relayed cloud response buffer. Streaming
+/// bodies are provider SSE; non-streaming are the JSON response body. Best-effort:
+/// returns None if nothing parses.
+fn extract_cloud_text(buf: &[u8], provider: Provider, is_stream: bool) -> Option<String> {
+    let s = std::str::from_utf8(buf).ok()?;
+    if is_stream {
+        let mut out = String::new();
+        for line in s.lines() {
+            let Some(data) = line.strip_prefix("data: ") else { continue };
+            if data.trim() == "[DONE]" { continue; }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            match provider {
+                Provider::Anthropic => {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+                        if let Some(t) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                            out.push_str(t);
+                        }
+                    }
+                }
+                Provider::OpenAI => {
+                    if let Some(t) = v.pointer("/choices/0/delta/content").and_then(|t| t.as_str()) {
+                        out.push_str(t);
+                    }
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    } else {
+        let v = serde_json::from_str::<serde_json::Value>(s).ok()?;
+        match provider {
+            Provider::Anthropic => {
+                let arr = v.get("content")?.as_array()?;
+                let out: String = arr.iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                (!out.is_empty()).then_some(out)
+            }
+            Provider::OpenAI => {
+                v.pointer("/choices/0/message/content").and_then(|t| t.as_str()).map(|s| s.to_string())
+            }
         }
     }
 }
@@ -187,6 +240,12 @@ pub async fn forward(
         return ForwardOutcome::Degrade(reason);
     }
 
+    let is_stream = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
     let mut resp_headers = HeaderMap::new();
     for (name, value) in upstream.headers().iter() {
         if !is_skipped_header(name.as_str()) {
@@ -201,9 +260,12 @@ pub async fn forward(
             let metered = MeteredStream {
                 inner: stream,
                 rid: m.rid,
+                provider,
+                is_stream,
                 started: std::time::Instant::now(),
                 first_chunk_ms: None,
                 bytes: 0,
+                buf: Vec::new(),
                 done: false,
             };
             ForwardOutcome::Relayed(
@@ -390,5 +452,29 @@ mod tests {
             outcome_for_status(500).await,
             ForwardOutcome::Degrade(crate::usage::DegradeReason::ServerError)
         ));
+    }
+
+    #[test]
+    fn extract_cloud_text_anthropic_sse() {
+        let sse = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n";
+        assert_eq!(extract_cloud_text(sse.as_bytes(), Provider::Anthropic, true).as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn extract_cloud_text_openai_sse() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(extract_cloud_text(sse.as_bytes(), Provider::OpenAI, true).as_deref(), Some("Hi there"));
+    }
+
+    #[test]
+    fn extract_cloud_text_anthropic_json() {
+        let body = "{\"content\":[{\"type\":\"text\",\"text\":\"full reply\"}]}";
+        assert_eq!(extract_cloud_text(body.as_bytes(), Provider::Anthropic, false).as_deref(), Some("full reply"));
+    }
+
+    #[test]
+    fn extract_cloud_text_openai_json() {
+        let body = "{\"choices\":[{\"message\":{\"content\":\"full reply\"}}]}";
+        assert_eq!(extract_cloud_text(body.as_bytes(), Provider::OpenAI, false).as_deref(), Some("full reply"));
     }
 }
