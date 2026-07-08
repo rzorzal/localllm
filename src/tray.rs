@@ -37,7 +37,7 @@ use std::sync::{Arc, RwLock};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
 };
 
@@ -533,9 +533,6 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // Config submenu items each open/show it and navigate to their SPA route.
     // admin_token (function param) is captured by the closure for window injection.
     let mut config_home_id: Option<tray_icon::menu::MenuId> = None;
-    let mut config_models_id: Option<tray_icon::menu::MenuId> = None;
-    let mut config_tools_id: Option<tray_icon::menu::MenuId> = None;
-    let mut config_dash_id: Option<tray_icon::menu::MenuId> = None;
     let mut manager_window: Option<window::ModelManagerWindow> = None;
 
     // Read-only wired sub-line: reflects the integration state toggled from the
@@ -579,30 +576,12 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let backend_line = MenuItem::new(format!("Backend: {info_backend}"), false, None);
                 let logs_item = MenuItem::new("🗎  Open Logs", true, None);
                 logs_id = Some(logs_item.id().clone());
-                let config_submenu = Submenu::new("Config", true);
-                let cfg_home = MenuItem::new("⚙  Abrir Config", true, None);
-                let cfg_models = MenuItem::new("◈  Models", true, None);
-                let cfg_tools = MenuItem::new("⛭  Tools", true, None);
-                let cfg_dash = MenuItem::new("▤  Dashboard", true, None);
-                config_home_id = Some(cfg_home.id().clone());
-                config_models_id = Some(cfg_models.id().clone());
-                config_tools_id = Some(cfg_tools.id().clone());
-                config_dash_id = Some(cfg_dash.id().clone());
-                config_submenu
-                    .append(&cfg_home)
-                    .expect("append config home");
-                config_submenu
-                    .append(&PredefinedMenuItem::separator())
-                    .expect("config sep");
-                config_submenu
-                    .append(&cfg_models)
-                    .expect("append config models");
-                config_submenu
-                    .append(&cfg_tools)
-                    .expect("append config tools");
-                config_submenu
-                    .append(&cfg_dash)
-                    .expect("append config dashboard");
+                // Single top-level Config item (no submenu — tray_icon submenus
+                // dismiss the whole menu on hover on macOS). Opens the manager
+                // window at #/config; the page's own nav reaches Models/Tools/
+                // Budget/Dashboard.
+                let config_item = MenuItem::new("⚙  Config", true, None);
+                config_home_id = Some(config_item.id().clone());
                 let quit_item = MenuItem::new("⏻  Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
@@ -637,7 +616,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&PredefinedMenuItem::separator())
                     .expect("append separator2");
                 menu.append(&logs_item).expect("append logs item");
-                menu.append(&config_submenu).expect("append config submenu");
+                menu.append(&config_item).expect("append config item");
                 menu.append(&quit_item).expect("append quit item");
 
                 _tray_keeper.push(
@@ -742,20 +721,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     } else if retry_cloud_id.as_ref() == Some(&menu_event.id) {
                         breaker_for_menu.reset(crate::route_log::now_secs() as u64);
                         tracing::info!("circuit breaker manually reset via tray");
-                    } else if config_home_id.as_ref() == Some(&menu_event.id)
-                        || config_models_id.as_ref() == Some(&menu_event.id)
-                        || config_tools_id.as_ref() == Some(&menu_event.id)
-                        || config_dash_id.as_ref() == Some(&menu_event.id)
-                    {
-                        let route = if config_models_id.as_ref() == Some(&menu_event.id) {
-                            "#/models"
-                        } else if config_tools_id.as_ref() == Some(&menu_event.id) {
-                            "#/tools"
-                        } else if config_dash_id.as_ref() == Some(&menu_event.id) {
-                            "#/dashboard"
-                        } else {
-                            "#/config"
-                        };
+                    } else if config_home_id.as_ref() == Some(&menu_event.id) {
+                        let route = "#/config";
                         match &manager_window {
                             Some(w) => {
                                 w.window.set_visible(true);
