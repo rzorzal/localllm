@@ -334,6 +334,11 @@ pub mod test_support {
             ];
             Ok(Box::pin(futures::stream::iter(deltas)))
         }
+        /// Test generators represent a warm engine; return 0 to avoid spurious
+        /// ColdPrefill escalations in unit/integration tests.
+        async fn estimate_cold_tokens(&self, _req: crate::api::common::ChatRequest) -> usize {
+            0
+        }
     }
 }
 
@@ -392,6 +397,11 @@ impl Generator for FakeGen {
         ];
         Ok(Box::pin(futures::stream::iter(deltas)))
     }
+
+    /// Test generators have a warm cache; override to prevent spurious ColdPrefill escalations.
+    async fn estimate_cold_tokens(&self, _req: crate::api::common::ChatRequest) -> usize {
+        0
+    }
 }
 
 /// A fake generator that always returns a length-truncated text answer.
@@ -407,6 +417,11 @@ impl Generator for FakeGenWeak {
             prompt_tokens: 5,
             completion_tokens: 5,
         })
+    }
+
+    /// Test generators have a warm cache; override to prevent spurious ColdPrefill escalations.
+    async fn estimate_cold_tokens(&self, _req: crate::api::common::ChatRequest) -> usize {
+        0
     }
 
     async fn generate_stream(
@@ -463,6 +478,10 @@ impl Generator for RecordingGen {
         ];
         Ok(Box::pin(futures::stream::iter(deltas)))
     }
+
+    async fn estimate_cold_tokens(&self, _req: crate::api::common::ChatRequest) -> usize {
+        0
+    }
 }
 
 /// A generator that records the tool names it receives (for assertion in tests).
@@ -498,6 +517,10 @@ impl Generator for ToolRecordingGen {
             }),
         ];
         Ok(Box::pin(futures::stream::iter(deltas)))
+    }
+
+    async fn estimate_cold_tokens(&self, _req: crate::api::common::ChatRequest) -> usize {
+        0
     }
 }
 

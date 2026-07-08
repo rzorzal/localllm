@@ -256,6 +256,65 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Recency window for the local prefill throughput estimate (7 days, matching
+/// the suggestion window so a week of cold starts informs the estimate).
+const PREFILL_WINDOW_SECS: i64 = 7 * 86_400;
+
+/// Compute the local model's average prefill throughput (tokens/second) from
+/// recent local outcomes. Uses prompt_tokens (RouteEntry) / ttft_ms (OutcomeEntry)
+/// as a proxy for prefill speed, averaged over requests within the 7-day window.
+///
+/// Returns `None` when there are no usable local samples in the window.
+/// Best-effort and cheap: reuses `read_all()`.
+pub fn local_prefill_tok_s() -> Option<f64> {
+    let now = now_secs();
+    let cutoff = now - PREFILL_WINDOW_SECS;
+    let lines = read_all();
+
+    // Index outcomes by rid so we can join them to decisions.
+    let mut outcome_map: std::collections::HashMap<&str, &OutcomeEntry> =
+        std::collections::HashMap::new();
+    for l in &lines {
+        if let LogLine::Outcome(o) = l {
+            outcome_map.insert(o.rid.as_str(), o);
+        }
+    }
+
+    let mut total_tok_s = 0.0f64;
+    let mut count = 0u64;
+
+    for l in &lines {
+        if let LogLine::Decision(d) = l {
+            // Only local decisions within the recency window.
+            if d.dest != "local" || d.ts < cutoff {
+                continue;
+            }
+            // Join with outcome by rid; we need a valid ttft_ms > 0.
+            let Some(o) = outcome_map.get(d.rid.as_str()) else {
+                continue;
+            };
+            let Some(ttft_ms) = o.ttft_ms else {
+                continue;
+            };
+            if ttft_ms == 0 {
+                continue;
+            }
+            let ttft_secs = ttft_ms as f64 / 1000.0;
+            let tok_s = d.prompt_tok as f64 / ttft_secs;
+            if tok_s > 0.0 && tok_s.is_finite() {
+                total_tok_s += tok_s;
+                count += 1;
+            }
+        }
+    }
+
+    if count == 0 {
+        None
+    } else {
+        Some(total_tok_s / count as f64)
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Bucket {
     pub local_count: u64,
@@ -1280,6 +1339,61 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines, vec!["line6", "line7", "line8", "line9"]);
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
+    }
+
+    #[test]
+    fn local_prefill_tok_s_returns_positive_rate() {
+        let _guard = ROUTE_LOG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("localllm-pf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+
+        let now = now_secs();
+        // One local decision: 600 prompt tokens, ttft 2000ms → 300 tok/s.
+        append(&RouteEntry {
+            ts: now - 60,
+            rid: "pf1".into(),
+            surface: "openai".into(),
+            dest: "local".into(),
+            prompt_tok: 600,
+            score: 0.1,
+            ..Default::default()
+        });
+        append_outcome(&OutcomeEntry {
+            rid: "pf1".into(),
+            ts: now - 59,
+            ttft_ms: Some(2000),
+            completion_tok: Some(10),
+            gen_ms: Some(500),
+            cost_saved_usd: 0.0,
+            output_text: None,
+        });
+
+        let rate = local_prefill_tok_s();
+        assert!(rate.is_some(), "expected Some rate");
+        let r = rate.unwrap();
+        assert!(r > 0.0 && r.is_finite(), "rate must be positive finite, got {r}");
+        // 600 / 2.0 = 300 tok/s exactly
+        assert!((r - 300.0).abs() < 1.0, "expected ~300 tok/s, got {r}");
+
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_prefill_tok_s_returns_none_when_no_local_outcomes() {
+        let _guard = ROUTE_LOG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("localllm-pf2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+
+        // No entries at all → None.
+        assert_eq!(local_prefill_tok_s(), None);
+
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

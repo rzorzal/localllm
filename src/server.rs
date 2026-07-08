@@ -156,6 +156,12 @@ const REASK_JACCARD: f64 = 0.6;
 const REASK_WINDOW_SECS: i64 = 120;
 const REASK_BUFFER_CAP: usize = 8;
 
+/// Cold-prefill routing tunables.
+/// Requests with fewer uncached tokens than this margin are considered warm.
+const COLD_TOKENS_WARM_MARGIN: usize = 512;
+/// Conservative M-series 8B prefill floor used when no measured sample exists.
+const DEFAULT_PREFILL_TOK_S: f64 = 150.0;
+
 /// One recent LOCAL decision's prompt fingerprint for re-ask detection.
 #[derive(Debug, Clone)]
 pub struct RecentPrompt {
@@ -212,7 +218,7 @@ fn breaker_gate_block(
 
 /// Returns the routing decision plus the estimated prompt token count (so the
 /// caller can record cloud usage without recomputing).
-fn route_decision(
+async fn route_decision(
     state: &AppState,
     internal: &ChatRequest,
     headers: &axum::http::HeaderMap,
@@ -225,6 +231,13 @@ fn route_decision(
     let last_turn_tokens = crate::route::estimate_last_turn_tokens(internal);
     let active = state.manager.status().current;
     let local_capability_b = crate::catalog::active_params_b(&active.repo, &active.file);
+
+    // Cold-prefill estimate: how many prompt tokens are NOT in the local KV
+    // cache, and the local model's measured prefill speed.
+    let cold_tokens = state.manager.estimate_cold_tokens(internal.clone()).await;
+    let was_cold = cold_tokens > COLD_TOKENS_WARM_MARGIN;
+    let prefill_tok_s = crate::route_log::local_prefill_tok_s().unwrap_or(DEFAULT_PREFILL_TOK_S);
+
     let signals = crate::route::Signals {
         prompt_tokens,
         local_ctx_window: state.local_ctx_window,
@@ -233,8 +246,8 @@ fn route_decision(
         last_turn_tokens,
         has_cloud_creds,
         local_capability_b,
-        cold_tokens: 0,
-        prefill_tok_s: 200.0,
+        cold_tokens,
+        prefill_tok_s,
     };
     let policy = *state.policy.read().unwrap();
     let raw_decision = crate::route::decide(&signals, &policy);
@@ -269,12 +282,24 @@ fn route_decision(
     tracing::info!(
         target: "localllm::req",
         "{rid} route: {decision:?} score={score:.3} threshold={threshold:.3} \
-         (last_turn_tok={last_turn_tokens} msgs={} prompt_tok={prompt_tokens} ctx_window={} fill={:.2} tools={} cap_b={local_capability_b:.1} creds={has_cloud_creds})",
+         (last_turn_tok={last_turn_tokens} msgs={} prompt_tok={prompt_tokens} ctx_window={} fill={:.2} tools={} cap_b={local_capability_b:.1} creds={has_cloud_creds} cold_tok={cold_tokens} was_cold={was_cold})",
         signals.n_messages,
         signals.local_ctx_window,
         if signals.local_ctx_window == 0 { 1.0 } else { (prompt_tokens as f64 / signals.local_ctx_window as f64).min(1.0) },
         signals.n_tools,
     );
+
+    // On a ColdPrefill decision, fire a best-effort background local prefill so
+    // the next turn benefits from a warm KV cache. Never blocks the response.
+    let bg_prefill_fired =
+        if matches!(decision, crate::route::Decision::Cloud(crate::route::RouteReason::ColdPrefill)) {
+            let mgr = state.manager.clone();
+            let warm_req = internal.clone();
+            tokio::spawn(async move { let _ = mgr.prefill(warm_req).await; });
+            true
+        } else {
+            false
+        };
 
     // Persist the routing decision (where + why + score + prompt size) for the
     // dashboard. Completion tokens are unknown at decision time → None. Records
@@ -327,6 +352,13 @@ fn route_decision(
         capability_b: Some(local_capability_b as f64),
         local_model: Some(crate::settings::model_ctx_key(&active.repo, &active.file)),
         prompt_snippet,
+        cold_tokens: Some(cold_tokens as u64),
+        prefill_secs_est: {
+            let secs = if prefill_tok_s > 0.0 { cold_tokens as f64 / prefill_tok_s } else { f64::INFINITY };
+            secs.is_finite().then_some(secs)
+        },
+        was_cold: Some(was_cold),
+        bg_prefill_fired: Some(bg_prefill_fired),
         ..Default::default()
     });
 
@@ -1927,7 +1959,7 @@ async fn handle_oai_chat(
             .into_response();
     }
 
-    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "openai");
+    let (decision, est_prompt_tokens) = route_decision(&state, &internal, &headers, &rid, "openai").await;
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [openai] route=cloud reason={reason:?}");
@@ -2178,7 +2210,7 @@ async fn handle_oai_responses(
     }
 
     let (decision, est_prompt_tokens) =
-        route_decision(&state, &internal, &headers, &rid, "openai-responses");
+        route_decision(&state, &internal, &headers, &rid, "openai-responses").await;
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [responses] route=cloud reason={reason:?}");
@@ -2330,7 +2362,7 @@ async fn handle_anth_messages(
     }
 
     let (decision, est_prompt_tokens) =
-        route_decision(&state, &internal, &headers, &rid, "anthropic");
+        route_decision(&state, &internal, &headers, &rid, "anthropic").await;
     let want_cascade = match decision {
         crate::route::Decision::Cloud(reason) => {
             tracing::info!(target: "localllm::req", "{rid} [anthropic] route=cloud reason={reason:?}");
@@ -3408,7 +3440,7 @@ mod tests {
             model: String::new(),
         };
         let headers = axum::http::HeaderMap::new();
-        let _ = super::route_decision(&state, &req, &headers, "rlm1", "openai");
+        let _ = super::route_decision(&state, &req, &headers, "rlm1", "openai").await;
 
         let lines = crate::route_log::read_all();
         let dec = lines
