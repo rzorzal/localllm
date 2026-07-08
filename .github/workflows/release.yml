@@ -47,16 +47,17 @@ jobs:
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
           cargo set-version "$NEW"
+      # Install the git-cliff binary directly instead of the Docker action
+      # orhun/git-cliff-action@v3, whose image build is broken (its base image's
+      # apt mirrors 404 on `apt-get install jq`).
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
       - name: Generate CHANGELOG.md
-        uses: orhun/git-cliff-action@v3
-        with:
-          config: cliff.toml
-          args: --tag ${{ steps.bump.outputs.tag }} --output CHANGELOG.md
+        run: git-cliff --config cliff.toml --tag "${{ steps.bump.outputs.tag }}" --output CHANGELOG.md
       - name: Generate release notes body
-        uses: orhun/git-cliff-action@v3
-        with:
-          config: cliff.toml
-          args: --tag ${{ steps.bump.outputs.tag }} --unreleased --strip all --output RELEASE_NOTES.md
+        run: git-cliff --config cliff.toml --tag "${{ steps.bump.outputs.tag }}" --unreleased --strip all --output RELEASE_NOTES.md
       - name: Append unsigned-binary note to release body
         run: |
           cat >> RELEASE_NOTES.md <<'NOTE'
