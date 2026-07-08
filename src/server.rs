@@ -393,6 +393,7 @@ fn record_outcome(
         ttft_ms,
         gen_ms,
         cost_saved_usd,
+        output_text: None,
     });
     // Weak-local signal: a local answer that hit the length cap and was served
     // as-is (cascade escalations never reach this path with Length — they

@@ -67,6 +67,18 @@ pub struct ChatResult {
     pub completion_tokens: usize,
 }
 
+/// Concatenate the text parts of a content vector, ignoring tool calls.
+pub fn content_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text(t) => Some(t.as_str()),
+            ContentPart::Call(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 /// A single incremental chunk emitted by the streaming engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamDelta {
@@ -261,5 +273,19 @@ mod tests {
     fn filter_tools_unknown_name_is_noop() {
         let tools = vec![tool("Bash")];
         assert_eq!(filter_tools(tools.clone(), &["Nope".to_string()]), tools);
+    }
+
+    #[test]
+    fn content_text_concatenates_text_parts_only() {
+        let parts = vec![
+            ContentPart::Text("hello ".into()),
+            ContentPart::Call(ToolCall {
+                id: "tc1".into(),
+                name: "tool_name".into(),
+                arguments: "{}".into(),
+            }),
+            ContentPart::Text("world".into()),
+        ];
+        assert_eq!(content_text(&parts), "hello world");
     }
 }

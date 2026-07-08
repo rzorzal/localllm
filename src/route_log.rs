@@ -69,6 +69,9 @@ pub struct OutcomeEntry {
     /// What this LOCAL request would have cost on cloud (0.0 for cloud requests).
     #[serde(default)]
     pub cost_saved_usd: f64,
+    /// Full generated response text (local or cloud). None on legacy lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_text: Option<String>,
 }
 
 /// A routing-quality signal about an earlier decision, correlated by `rid`.
@@ -336,6 +339,9 @@ pub struct RecentRow {
     /// Quality signals recorded against this decision (may be empty).
     #[serde(default)]
     pub feedback: Vec<String>,
+    /// Full response text joined from the outcome (may be absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_text: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -489,6 +495,7 @@ pub fn build_dashboard(
                 gen_ms: o.and_then(|o| o.gen_ms),
                 cost_saved_usd: o.map(|o| o.cost_saved_usd).unwrap_or(0.0),
                 feedback: feedback.get(d.rid.as_str()).cloned().unwrap_or_default(),
+                output_text: o.and_then(|o| o.output_text.clone()),
             }
         })
         .collect();
@@ -723,6 +730,7 @@ mod tests {
             ttft_ms: Some(30),
             gen_ms: Some(100),
             cost_saved_usd: 0.42,
+            output_text: None,
         }));
         lines.push(LogLine::Outcome(OutcomeEntry {
             rid: "b".into(),
@@ -731,6 +739,7 @@ mod tests {
             ttft_ms: Some(80),
             gen_ms: Some(500),
             cost_saved_usd: 0.0,
+            output_text: None,
         }));
         let d = build_dashboard(&lines, now, 10, true);
         // hour bucket: local 120 saved, all-cloud 120+250
@@ -847,6 +856,7 @@ mod tests {
             ttft_ms: Some(30),
             gen_ms: Some(100),
             cost_saved_usd: 0.5,
+            output_text: None,
         });
         let lines = read_all();
         assert_eq!(lines.len(), 3);
@@ -1217,5 +1227,17 @@ mod tests {
         }
         let d = build_dashboard(&lines, now, 10, true);
         assert!(d.model_capabilities.is_empty());
+    }
+
+    #[test]
+    fn dashboard_surfaces_output_text_on_recent_row() {
+        let now = 1_000_000;
+        let entries = vec![
+            LogLine::Decision(RouteEntry { ts: now, rid: "x".into(), dest: "local".into(), ..Default::default() }),
+            LogLine::Outcome(OutcomeEntry { rid: "x".into(), ts: now, output_text: Some("resposta".into()), ..Default::default() }),
+        ];
+        let d = build_dashboard(&entries, now, 50, false);
+        let row = d.recent.iter().find(|r| r.entry.rid == "x").unwrap();
+        assert_eq!(row.output_text.as_deref(), Some("resposta"));
     }
 }

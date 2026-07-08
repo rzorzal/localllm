@@ -65,6 +65,7 @@ where
                         ttft_ms: this.first_chunk_ms,
                         gen_ms: Some(this.started.elapsed().as_millis() as u64),
                         cost_saved_usd: 0.0,
+                        output_text: None,
                     });
                     if est_tok < CLOUD_TRIVIAL_MAX_TOK {
                         crate::route_log::append_feedback(&crate::route_log::FeedbackEntry {
