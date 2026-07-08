@@ -241,6 +241,9 @@ impl ModelManager {
     /// Number of tokens currently resident in the KV cache.
     /// Returns 0 if the engine is switching or unavailable (safe: server treats as fully cold).
     pub fn prefix_len(&self) -> usize {
+        if self.switching.load(Ordering::SeqCst) {
+            return 0;
+        }
         match self.engine.load_full() {
             Some(e) => Arc::clone(&*e).prefix_len(),
             None => 0,
