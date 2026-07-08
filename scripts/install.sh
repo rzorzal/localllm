@@ -7,6 +7,21 @@ set -euo pipefail
 REPO="rzorzal/localllm"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 
+# The repo is private: set GITHUB_TOKEN (or GH_TOKEN) to a token with `repo`
+# read access so the API + asset download authenticate. Without it, a private
+# repo returns 404 to everything.
+TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+
+# curl wrapper that adds the auth header when a token is set (bash 3.2 safe —
+# no arrays). Pass all other curl flags/args through.
+gh_curl() {
+    if [ -n "$TOKEN" ]; then
+        curl -H "Authorization: Bearer ${TOKEN}" "$@"
+    else
+        curl "$@"
+    fi
+}
+
 PRINT_ONLY=0
 [ "${1:-}" = "--print" ] && PRINT_ONLY=1
 
@@ -52,12 +67,18 @@ echo "Detected: ${os}/${arch} -> variant '${variant}'"
 
 # Fetch the latest release, capturing the HTTP status separately from the body
 # so a 404 (no release yet) is distinguishable from a real network failure.
-resp="$(curl -sSL -w '\n%{http_code}' -H 'Accept: application/vnd.github+json' "$API")" \
+resp="$(gh_curl -sSL -w '\n%{http_code}' -H 'Accept: application/vnd.github+json' "$API")" \
     || { echo "Failed to reach the GitHub API (network error)." >&2; exit 1; }
 code="${resp##*$'\n'}"
 json="${resp%$'\n'*}"
 if [ "$code" = "404" ]; then
-    echo "No published release yet for ${REPO}. See https://github.com/${REPO}/releases" >&2
+    if [ -z "$TOKEN" ]; then
+        echo "Got 404 from ${REPO} — it's a private repo. Set GITHUB_TOKEN (or GH_TOKEN)" >&2
+        echo "to a token with repo read access, or there is no release yet." >&2
+    else
+        echo "No published release yet for ${REPO}." >&2
+    fi
+    echo "See https://github.com/${REPO}/releases" >&2
     exit 1
 fi
 [ "$code" = "200" ] || { echo "GitHub API returned HTTP ${code}." >&2; exit 1; }
@@ -86,7 +107,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 pkg="${tmp}/pkg.${ext}"
 echo "Downloading..."
-curl -fsSL "$url" -o "$pkg"
+gh_curl -fsSL "$url" -o "$pkg"
 
 case "$os" in
     Darwin)

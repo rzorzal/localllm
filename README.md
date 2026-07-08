@@ -37,23 +37,34 @@ local and free, difficult turns still get a frontier model.
 
 ## Install
 
-**One-liner (auto-detects your GPU and installs the right build):**
+> **This repo is currently private.** Downloads and the raw-script one-liners
+> require access. With a checkout of the repo, run the installer with a GitHub
+> token that has `repo` read access; or grab the assets from the Releases page
+> while signed in. (A public download site is planned.)
+
+**Auto-detect installer (clone the repo, then run):**
 
 - macOS / Linux:
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/rzorzal/localllm/main/scripts/install.sh | bash
+  GITHUB_TOKEN=<your-token> ./scripts/install.sh
   ```
 - Windows (PowerShell):
   ```powershell
-  irm https://raw.githubusercontent.com/rzorzal/localllm/main/scripts/install.ps1 | iex
+  $env:GITHUB_TOKEN='<your-token>'; .\scripts\install.ps1
   ```
 
-The scripts install user-local (no admin): `~/Applications` (macOS),
-`~/.local/bin` (Linux), `%LOCALAPPDATA%\localllm` + your user PATH (Windows).
-The binaries are unsigned — on macOS right-click the app → **Open**; on Windows
-choose **More info → Run anyway** if SmartScreen warns.
+The scripts auto-detect your GPU and install the right build user-local (no
+admin): `~/Applications` (macOS), `~/.local/bin` (Linux), `%LOCALAPPDATA%\localllm`
++ your user PATH (Windows). Add `--print` (bash) / `-Print` (ps1) to see the
+chosen artifact without installing. The binaries are unsigned — on macOS
+right-click the app → **Open**; on Windows choose **More info → Run anyway**.
 
-**Or pick the download manually** from the [Releases page](https://github.com/rzorzal/localllm/releases):
+Once the repo is public, the raw-script one-liners work without a token:
+```bash
+curl -fsSL https://raw.githubusercontent.com/rzorzal/localllm/main/scripts/install.sh | bash
+```
+
+**Or pick the download manually** from the [Releases page](https://github.com/rzorzal/localllm/releases) (signed in):
 
 | Your machine | Download |
 |---|---|
@@ -66,9 +77,6 @@ choose **More info → Run anyway** if SmartScreen warns.
 The CUDA builds target compute capability 8.0 (Ampere). On older Nvidia cards
 (Turing/Pascal) use the CPU build. The GPU backend is chosen at build time —
 there is no runtime auto-switch — so download the row that matches your machine.
-
-> The `curl … | bash` / `irm … | iex` URLs point at `main`; they work once this
-> branch is merged to `main` and a release has been published.
 
 ---
 

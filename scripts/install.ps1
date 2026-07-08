@@ -8,6 +8,11 @@ $Repo = 'rzorzal/localllm'
 $Api  = "https://api.github.com/repos/$Repo/releases/latest"
 $Headers = @{ 'User-Agent' = 'localllm-install'; 'Accept' = 'application/vnd.github+json' }
 
+# The repo is private: set GITHUB_TOKEN (or GH_TOKEN) with repo read access so
+# the API + asset download authenticate. Without it, a private repo 404s.
+$Token = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } elseif ($env:GH_TOKEN) { $env:GH_TOKEN } else { $null }
+if ($Token) { $Headers['Authorization'] = "Bearer $Token" }
+
 function Get-Variant {
     $cuda = $false
     if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
@@ -33,7 +38,11 @@ Write-Host "Detected variant: $variant"
 try {
     $rel = Invoke-RestMethod -Uri $Api -Headers $Headers -UseBasicParsing
 } catch {
-    Write-Error "No published release yet for $Repo (or the API is unreachable). See https://github.com/$Repo/releases"
+    if (-not $Token) {
+        Write-Error "Got an error from $Repo — it's a private repo. Set GITHUB_TOKEN (or GH_TOKEN) with repo read access, or there is no release yet. See https://github.com/$Repo/releases"
+    } else {
+        Write-Error "No published release yet for $Repo (or the API is unreachable). See https://github.com/$Repo/releases"
+    }
     exit 1
 }
 $asset = $rel.assets | Where-Object { $_.name -like "*-$variant.zip" } | Select-Object -First 1
