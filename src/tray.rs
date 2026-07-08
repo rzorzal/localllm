@@ -533,6 +533,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // Config submenu items each open/show it and navigate to their SPA route.
     // admin_token (function param) is captured by the closure for window injection.
     let mut config_home_id: Option<tray_icon::menu::MenuId> = None;
+    let mut launch_claude_id: Option<tray_icon::menu::MenuId> = None;
+    let mut launch_codex_id: Option<tray_icon::menu::MenuId> = None;
     let mut manager_window: Option<window::ModelManagerWindow> = None;
 
     // Read-only wired sub-line: reflects the integration state toggled from the
@@ -582,6 +584,10 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 // Budget/Dashboard.
                 let config_item = MenuItem::new("⚙  Config", true, None);
                 config_home_id = Some(config_item.id().clone());
+                let launch_claude = MenuItem::new("🚀  Launch Claude Code via LocalLLM", true, None);
+                let launch_codex = MenuItem::new("🚀  Launch Codex via LocalLLM", true, None);
+                launch_claude_id = Some(launch_claude.id().clone());
+                launch_codex_id = Some(launch_codex.id().clone());
                 let quit_item = MenuItem::new("⏻  Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
@@ -617,6 +623,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     .expect("append separator2");
                 menu.append(&logs_item).expect("append logs item");
                 menu.append(&config_item).expect("append config item");
+                menu.append(&launch_claude).expect("append launch claude");
+                menu.append(&launch_codex).expect("append launch codex");
                 menu.append(&quit_item).expect("append quit item");
 
                 _tray_keeper.push(
@@ -745,6 +753,37 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                                     Err(e) => tracing::error!(
                                         "Config window failed: {e} (needs WebView2/WebKitGTK)"
                                     ),
+                                }
+                            }
+                        }
+                    } else if launch_claude_id.as_ref() == Some(&menu_event.id)
+                        || launch_codex_id.as_ref() == Some(&menu_event.id)
+                    {
+                        let sub = if launch_claude_id.as_ref() == Some(&menu_event.id) {
+                            "claude"
+                        } else {
+                            "codex"
+                        };
+                        // Native folder picker → open the chosen terminal in that
+                        // folder running `localllm <client>`. Best-effort.
+                        let out = std::process::Command::new("osascript")
+                            .arg("-e")
+                            .arg("POSIX path of (choose folder)")
+                            .output();
+                        if let Ok(o) = out {
+                            let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            if !dir.is_empty() {
+                                let exe = std::env::current_exe()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|_| "localllm".into());
+                                let command = format!("{exe:?} {sub}");
+                                let app = crate::settings::load_terminal();
+                                if let Err(e) = crate::terminal::open(
+                                    app,
+                                    std::path::Path::new(&dir),
+                                    &command,
+                                ) {
+                                    tracing::error!("launch {sub}: terminal open failed: {e}");
                                 }
                             }
                         }
