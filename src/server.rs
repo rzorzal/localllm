@@ -380,6 +380,7 @@ fn record_outcome(
     ttft_ms: Option<u64>,
     gen_ms: Option<u64>,
     finish: Option<crate::api::common::FinishReason>,
+    output_text: Option<String>,
 ) {
     let cost_saved_usd = if dest == "local" {
         crate::pricing::price_for(model.unwrap_or("")).cost(prompt_tok, completion_tok.unwrap_or(0))
@@ -393,7 +394,7 @@ fn record_outcome(
         ttft_ms,
         gen_ms,
         cost_saved_usd,
-        output_text: None,
+        output_text,
     });
     // Weak-local signal: a local answer that hit the length cap and was served
     // as-is (cascade escalations never reach this path with Length — they
@@ -1985,6 +1986,7 @@ async fn handle_oai_chat(
             None,
             Some(started_at.elapsed().as_millis() as u64),
             Some(result.finish_reason.clone()),
+            Some(crate::api::common::content_text(&result.content)),
         );
         let mut lines = crate::api::openai::stream_chunks_from_result(&result, &id, &model);
         lines.push("[DONE]".to_string());
@@ -2014,20 +2016,22 @@ async fn handle_oai_chat(
             }
         };
 
-        // Scan state: (started, completion_tok_estimate, first_delta_at). `started`
+        // Scan state: (started, completion_tok_estimate, first_delta_at, acc). `started`
         // threads the "role":"assistant" flag per the OpenAI streaming spec; the
         // other two capture latency (TTFT) and an estimated completion count so we
-        // can record the outcome when the stream finishes.
+        // can record the outcome when the stream finishes. `acc` accumulates the
+        // full response text for output_text logging.
         let est_prompt_tokens = est_prompt_tokens;
         let sse_stream = delta_stream
-            .scan((false, 0u64, None::<Instant>), move |st, result| {
-                let (started, ctok, first_at) = st;
+            .scan((false, 0u64, None::<Instant>, String::new()), move |st, result| {
+                let (started, ctok, first_at, acc) = st;
                 let was_started = *started;
                 let event: Result<Event, Infallible> = match result {
                     Ok(delta) => {
                         if first_at.is_none() { *first_at = Some(Instant::now()); }
                         if let Some(t) = &delta.text {
                             *ctok += crate::route::estimate_text_tokens(t) as u64;
+                            acc.push_str(t);
                         }
                         if delta.done {
                             let secs = started_at.elapsed().as_secs_f64();
@@ -2036,7 +2040,8 @@ async fn handle_oai_chat(
                             record_outcome(&rid_stream, "local", Some(&model_clone),
                                 est_prompt_tokens as u64, Some(*ctok), ttft,
                                 Some(started_at.elapsed().as_millis() as u64),
-                                delta.finish_reason.clone());
+                                delta.finish_reason.clone(),
+                                Some(std::mem::take(acc)));
                         }
                         let line = crate::api::openai::stream_chunk(&delta, &id_clone, &model_clone, was_started);
                         *started = true;
@@ -2093,6 +2098,7 @@ async fn handle_oai_chat(
             None,
             Some(started_at.elapsed().as_millis() as u64),
             Some(result.finish_reason.clone()),
+            Some(crate::api::common::content_text(&result.content)),
         );
         let resp = crate::api::openai::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
@@ -2231,6 +2237,7 @@ async fn handle_oai_responses(
         None,
         Some(started_at.elapsed().as_millis() as u64),
         Some(result.finish_reason.clone()),
+        Some(crate::api::common::content_text(&result.content)),
     );
 
     if stream_flag {
@@ -2387,6 +2394,7 @@ async fn handle_anth_messages(
             None,
             Some(started_at.elapsed().as_millis() as u64),
             Some(result.finish_reason.clone()),
+            Some(crate::api::common::content_text(&result.content)),
         );
         let events = crate::api::anthropic::stream_events_from_result(&result, &model);
         let sse_stream = futures::stream::iter(events.into_iter().map(|e_str| {
@@ -2411,6 +2419,8 @@ async fn handle_anth_messages(
     if stream_flag {
         // Streaming path: return Anthropic SSE protocol
         let rid_stream = rid.clone();
+        let model_clone = model.clone();
+        let est_prompt_tokens = est_prompt_tokens;
         let delta_stream = match state.manager.generate_stream(internal).await {
             Ok(s) => s,
             Err(e) => {
@@ -2424,15 +2434,27 @@ async fn handle_anth_messages(
         };
 
         // Collect all events, tracking whether the first chunk was sent.
-        // We use scan to thread `started` state through the stream.
+        // We use scan to thread state (started, ctok, first_at, acc) through the stream.
         let sse_stream = delta_stream
-            .scan(false, move |started, result| {
+            .scan((false, 0u64, None::<Instant>, String::new()), move |st, result| {
+                let (started, ctok, first_at, acc) = st;
                 let was_started = *started;
                 let events: Vec<Result<Event, Infallible>> = match result {
                     Ok(delta) => {
+                        if first_at.is_none() { *first_at = Some(Instant::now()); }
+                        if let Some(t) = &delta.text {
+                            *ctok += crate::route::estimate_text_tokens(t) as u64;
+                            acc.push_str(t);
+                        }
                         if delta.done {
                             let secs = started_at.elapsed().as_secs_f64();
                             tracing::info!(target: "localllm::req", "{rid_stream} [anthropic] done (stream): {secs:.1}s");
+                            let ttft = first_at.map(|f| (f - started_at).as_millis() as u64);
+                            record_outcome(&rid_stream, "local", Some(&model_clone),
+                                est_prompt_tokens as u64, Some(*ctok), ttft,
+                                Some(started_at.elapsed().as_millis() as u64),
+                                delta.finish_reason.clone(),
+                                Some(std::mem::take(acc)));
                         }
                         let event_strs = crate::api::anthropic::stream_events(&delta, was_started);
                         *started = true;
@@ -2495,6 +2517,7 @@ async fn handle_anth_messages(
             None,
             Some(started_at.elapsed().as_millis() as u64),
             Some(result.finish_reason.clone()),
+            Some(crate::api::common::content_text(&result.content)),
         );
         let resp = crate::api::anthropic::from_internal(result, &model);
         Json(serde_json::to_value(resp).unwrap()).into_response()
@@ -2615,6 +2638,7 @@ mod tests {
             Some(10),
             Some(1000),
             None,
+            None,
         );
         super::record_outcome(
             "r2",
@@ -2624,6 +2648,7 @@ mod tests {
             Some(1_000_000),
             Some(10),
             Some(1000),
+            None,
             None,
         );
         let lines = crate::route_log::read_all();
@@ -3181,6 +3206,7 @@ mod tests {
             None,
             None,
             Some(FinishReason::Length),
+            None,
         );
         super::record_outcome(
             "t2",
@@ -3191,6 +3217,7 @@ mod tests {
             None,
             None,
             Some(FinishReason::Stop),
+            None,
         );
         super::record_outcome(
             "t3",
@@ -3201,6 +3228,7 @@ mod tests {
             None,
             None,
             Some(FinishReason::Length),
+            None,
         );
 
         let lines = crate::route_log::read_all();
