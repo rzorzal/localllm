@@ -888,6 +888,10 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
             get(handle_cold_gate_get).post(handle_cold_gate_set),
         )
         .route(
+            "/admin/terminal",
+            get(handle_terminal_get).post(handle_terminal_set),
+        )
+        .route(
             "/admin/budget",
             get(handle_budget_get).post(handle_budget_set),
         )
@@ -1150,6 +1154,57 @@ async fn handle_cold_gate_set(
         .unwrap_or_else(|e| e.into_inner())
         .cold_prefill_gate_secs = secs;
     Json(json!({ "secs": secs })).into_response()
+}
+
+/// GET /admin/terminal — the Launch terminal + installed options (token-guarded).
+async fn handle_terminal_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let available: Vec<&str> = crate::terminal::installed().iter().map(|a| a.id()).collect();
+    Json(json!({ "terminal": crate::settings::load_terminal().id(), "available": available }))
+        .into_response()
+}
+
+/// POST /admin/terminal {"terminal": "<id>"} — set the Launch terminal.
+async fn handle_terminal_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let Some(app) = body
+        .get("terminal")
+        .and_then(|v| v.as_str())
+        .and_then(crate::terminal::TerminalApp::from_id)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unknown terminal"})),
+        )
+            .into_response();
+    };
+    if let Err(e) = crate::settings::save_terminal(app) {
+        tracing::warn!("failed to persist Launch terminal: {e}");
+    }
+    Json(json!({ "terminal": app.id() })).into_response()
 }
 
 /// GET /admin/budget — budget cap config + today's spend (token-guarded).

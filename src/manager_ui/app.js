@@ -137,6 +137,7 @@ function renderConfig() {
   renderRoutingSelector(shell);
   renderThresholdConfig(shell);
   renderColdGateConfig(shell);
+  renderTerminalConfig(shell);
   renderSmartHistoryToggle(shell);
   renderIntegrationToggle(shell);
 }
@@ -213,6 +214,45 @@ async function renderColdGateConfig(container) {
       input.value = r.secs; toast(`Limite de prefill frio: ${r.secs}s`);
     } catch (e) { toast(e.message, true); }
     finally { busy = false; input.disabled = false; }
+  };
+}
+
+// Launch-terminal picker. GET/POST /admin/terminal.
+const TERMINAL_LABELS = { terminal: "Terminal", iterm: "iTerm", warp: "Warp", wave: "Wave" };
+async function renderTerminalConfig(container) {
+  const panel = el("div", "intpanel");
+  panel.append(el("div", "intpanel-title", "Terminal do Launch"));
+  panel.append(el("div", "intpanel-sub",
+    "Terminal usado pelo botão Launch do tray (abre o cliente já apontado pro localllm)."));
+
+  const row = el("div", "thresh-row");
+  const select = el("select", "ctxinput gate-input");
+  row.append(select);
+  panel.append(row);
+  const status = el("div", "intpanel-status");
+  panel.append(status);
+  container.append(panel);
+
+  let data;
+  try { data = await api("GET", "/admin/terminal"); }
+  catch (e) { status.textContent = e.message; return; }
+  (data.available || []).forEach((id) => {
+    const opt = el("option");
+    opt.value = id;
+    opt.textContent = TERMINAL_LABELS[id] || id;
+    select.append(opt);
+  });
+  if (data.terminal) select.value = data.terminal;
+
+  let busy = false;
+  select.onchange = async () => {
+    if (busy) return;
+    busy = true; select.disabled = true;
+    try {
+      const r = await api("POST", "/admin/terminal", { terminal: select.value });
+      toast(`Terminal: ${TERMINAL_LABELS[r.terminal] || r.terminal}`);
+    } catch (e) { toast(e.message, true); }
+    finally { busy = false; select.disabled = false; }
   };
 }
 

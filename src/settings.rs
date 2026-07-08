@@ -82,6 +82,10 @@ struct Settings {
     /// `None` keeps the built-in default (360 s) for all profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cold_prefill_gate_secs: Option<f64>,
+    /// Terminal app id (`terminal`/`iterm`/`warp`/`wave`) used by the tray Launch
+    /// items. `None` → auto-pick an installed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal: Option<String>,
     /// Whether the daily cloud-spend budget cap is enforced.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     budget_enabled: bool,
@@ -190,6 +194,26 @@ pub fn load_cold_prefill_gate() -> f64 {
 pub fn save_cold_prefill_gate(secs: f64) -> anyhow::Result<()> {
     let mut s = load_settings();
     s.cold_prefill_gate_secs = Some(secs.clamp(1.0, 3600.0));
+    save_settings(&s)
+}
+
+/// The terminal app for the tray Launch items — user override if set, else the
+/// first installed terminal in preference order (Apple Terminal always exists).
+pub fn load_terminal() -> crate::terminal::TerminalApp {
+    match load_settings()
+        .terminal
+        .as_deref()
+        .and_then(crate::terminal::TerminalApp::from_id)
+    {
+        Some(a) => a,
+        None => crate::terminal::pick_default(&crate::terminal::installed()),
+    }
+}
+
+/// Persist the chosen Launch terminal, preserving the rest of the settings file.
+pub fn save_terminal(app: crate::terminal::TerminalApp) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.terminal = Some(app.id().to_string());
     save_settings(&s)
 }
 
@@ -491,6 +515,21 @@ mod tests {
             assert!((resolve_policy(Profile::Balanced).cold_prefill_gate_secs - 120.0).abs() < 1e-9);
             assert!((resolve_policy(Profile::MaxQuality).cold_prefill_gate_secs - 120.0).abs() < 1e-9);
             assert!((resolve_policy(Profile::LocalOnly).cold_prefill_gate_secs - 120.0).abs() < 1e-9);
+        });
+    }
+
+    #[test]
+    fn terminal_round_trips_and_defaults_installed() {
+        with_temp_settings(|| {
+            // Unset → a default that is installed (or Apple Terminal fallback).
+            let d = load_terminal();
+            assert!(
+                crate::terminal::installed().contains(&d)
+                    || d == crate::terminal::TerminalApp::Terminal
+            );
+            // Explicit save round-trips.
+            save_terminal(crate::terminal::TerminalApp::ITerm).unwrap();
+            assert_eq!(load_terminal(), crate::terminal::TerminalApp::ITerm);
         });
     }
 
