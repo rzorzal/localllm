@@ -15,7 +15,7 @@ have_ampere_gpu() {
     command -v nvidia-smi >/dev/null 2>&1 || return 1
     local cap
     cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
-        | tr -d ' ' | sort -rn | head -1)" || return 1
+        | tr -d ' ' | awk 'BEGIN { m = 0 } { v = $1 + 0; if (v > m) m = v } END { print m }')" || return 1
     [ -n "$cap" ] || return 1
     awk -v c="$cap" 'BEGIN { exit !(c + 0 >= 8.0) }'
 }
@@ -46,9 +46,22 @@ case "$os" in
         ;;
 esac
 
-# Resolve the download URL for the chosen variant from the latest release.
-json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API")" \
-    || { echo "Failed to reach the GitHub API." >&2; exit 1; }
+# Print the detected variant first, so --print shows it even if the API call
+# below fails (e.g. no release published yet).
+echo "Detected: ${os}/${arch} -> variant '${variant}'"
+
+# Fetch the latest release, capturing the HTTP status separately from the body
+# so a 404 (no release yet) is distinguishable from a real network failure.
+resp="$(curl -sSL -w '\n%{http_code}' -H 'Accept: application/vnd.github+json' "$API")" \
+    || { echo "Failed to reach the GitHub API (network error)." >&2; exit 1; }
+code="${resp##*$'\n'}"
+json="${resp%$'\n'*}"
+if [ "$code" = "404" ]; then
+    echo "No published release yet for ${REPO}. See https://github.com/${REPO}/releases" >&2
+    exit 1
+fi
+[ "$code" = "200" ] || { echo "GitHub API returned HTTP ${code}." >&2; exit 1; }
+
 suffix="-${variant}.${ext}"
 if command -v jq >/dev/null 2>&1; then
     url="$(printf '%s' "$json" \
@@ -61,12 +74,11 @@ else
         | grep -- "${suffix}\$" | head -1)"
 fi
 if [ -z "${url:-}" ]; then
-    echo "No published asset for '${variant}' yet (no release, or asset missing)." >&2
+    echo "No asset matching *${suffix} in the latest release of ${REPO}." >&2
     echo "See https://github.com/${REPO}/releases" >&2
     exit 1
 fi
 
-echo "Detected: ${os}/${arch} -> variant '${variant}'"
 echo "Asset:    ${url}"
 [ "$PRINT_ONLY" = "1" ] && exit 0
 
