@@ -791,19 +791,6 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 }
             }
 
-            // Hide the Config window when it loses focus (blur) to save memory.
-            Event::WindowEvent {
-                event: tao::event::WindowEvent::Focused(false),
-                window_id,
-                ..
-            } => {
-                if let Some(w) = &manager_window {
-                    if w.window.id() == window_id {
-                        w.window.set_visible(false);
-                    }
-                }
-            }
-
             _ => {}
         }
     })
