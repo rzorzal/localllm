@@ -192,6 +192,19 @@ pub fn prune_file(now: i64, max_age_secs: i64) {
     let _ = crate::integrations::atomic_write(&path, buf.as_bytes());
 }
 
+/// Best-effort: cap the route log at `max_lines`, keeping the newest lines.
+/// Guards against unbounded growth when full response bodies are stored.
+pub fn cap_lines_file(max_lines: usize) {
+    let Some(path) = log_path() else { return };
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        return;
+    }
+    let tail = lines[lines.len() - max_lines..].join("\n");
+    let _ = crate::integrations::atomic_write(&path, format!("{tail}\n").as_bytes());
+}
+
 /// Best-effort app-log rotation: cap the plain-text app log at a line budget so
 /// it cannot grow unbounded. `LOCALLLM_LOG` (default `/tmp/localllm.log`).
 /// `_now`/`_max_age_secs` are accepted for symmetry with `prune_file`, but
@@ -1239,5 +1252,21 @@ mod tests {
         let d = build_dashboard(&entries, now, 50, false);
         let row = d.recent.iter().find(|r| r.entry.rid == "x").unwrap();
         assert_eq!(row.output_text.as_deref(), Some("resposta"));
+    }
+
+    #[test]
+    fn cap_lines_file_keeps_newest() {
+        let _guard = ROUTE_LOG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("caplines-{}", now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing-log.jsonl");
+        std::env::set_var("LOCALLLM_ROUTE_LOG", &path);
+        let body: String = (0..10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        cap_lines_file(4);
+        let out = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines, vec!["line6", "line7", "line8", "line9"]);
+        std::env::remove_var("LOCALLLM_ROUTE_LOG");
     }
 }

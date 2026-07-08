@@ -160,6 +160,7 @@ pub async fn run_server_with_ready_policy_token(
     // Rolling retention: drop routing-log lines older than ~30 days at boot,
     // and cap the plain-text app log so neither grows unbounded.
     crate::route_log::prune_file(crate::route_log::now_secs(), 30 * 24 * 3600);
+    crate::route_log::cap_lines_file(20_000);
     crate::route_log::rotate_app_log(crate::route_log::now_secs(), 7 * 24 * 3600);
 
     // Single backend: embedded llama.cpp. (The mistralrs backend was removed —
