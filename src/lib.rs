@@ -20,6 +20,7 @@ pub mod engine_llama;
 pub mod fit;
 pub mod history_select;
 pub mod integrations;
+pub mod launch;
 pub mod model_manager;
 pub mod pricing;
 pub mod profile;
