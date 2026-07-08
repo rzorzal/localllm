@@ -101,6 +101,59 @@ impl ModelManager {
         })
     }
 
+    /// Build a manager with NO engine yet, in a "loading" state. The caller runs
+    /// `try_initial_load` (typically after binding the server) to populate it.
+    pub fn new_loading(current: ModelSpec, builder: EngineBuilder) -> Arc<Self> {
+        Arc::new(Self {
+            engine: ArcSwapOption::from(None),
+            current: Mutex::new(current),
+            target: Mutex::new(None),
+            switching: AtomicBool::new(true),
+            errored: AtomicBool::new(false),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            phase: AtomicU8::new(PHASE_LOADING),
+            progress: AtomicU8::new(0),
+            error: Mutex::new(None),
+            builder,
+        })
+    }
+
+    /// True when a local engine is loaded and ready to serve.
+    pub fn has_engine(&self) -> bool {
+        self.engine.load_full().is_some()
+    }
+
+    /// Load the initial engine via the builder (no drain, no restore — there is
+    /// no previous engine). Returns true on success. On failure, sets errored +
+    /// error and leaves the engine absent. Clears `switching` either way.
+    pub async fn try_initial_load(self: &Arc<Self>, spec: ModelSpec) -> bool {
+        self.switching.store(true, Ordering::SeqCst);
+        self.errored.store(false, Ordering::SeqCst);
+        *self.error.lock().unwrap() = None;
+        self.set_phase(PHASE_LOADING);
+        *self.target.lock().unwrap() = Some(spec.clone());
+        let result = (self.builder)(spec.clone()).await;
+        match result {
+            Ok(engine) => {
+                self.engine.store(Some(Arc::new(engine)));
+                *self.current.lock().unwrap() = spec;
+                *self.target.lock().unwrap() = None;
+                self.progress.store(100, Ordering::SeqCst);
+                self.set_phase(PHASE_IDLE);
+                self.switching.store(false, Ordering::SeqCst);
+                true
+            }
+            Err(e) => {
+                *self.error.lock().unwrap() = Some(format!("model load failed: {e}"));
+                self.errored.store(true, Ordering::SeqCst);
+                self.set_phase(PHASE_IDLE);
+                *self.target.lock().unwrap() = None;
+                self.switching.store(false, Ordering::SeqCst);
+                false
+            }
+        }
+    }
+
     pub fn is_switching(&self) -> bool {
         self.switching.load(Ordering::SeqCst)
     }
@@ -597,5 +650,30 @@ mod tests {
         };
         let j = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<ModelSpec>(&j).unwrap(), s);
+    }
+
+    #[tokio::test]
+    async fn new_loading_has_no_engine_until_initial_load() {
+        let calls = Arc::new(TestAtomicUsize::new(0));
+        let m = ModelManager::new_loading(spec("r", "m"), counting_builder(calls.clone(), None));
+        assert!(!m.has_engine());
+        assert_eq!(m.status().state, "switching"); // loading
+        let ok = m.try_initial_load(spec("r", "m")).await;
+        assert!(ok);
+        assert!(m.has_engine());
+        assert_eq!(m.status().state, "ready");
+        let out = m.generate(req()).await.unwrap();
+        assert!(matches!(&out.content[0], ContentPart::Text(_)));
+    }
+
+    #[tokio::test]
+    async fn initial_load_failure_leaves_no_engine_and_errored() {
+        let builder: EngineBuilder = Box::new(|_spec| Box::pin(async { Err(anyhow::anyhow!("boom")) }));
+        let m = ModelManager::new_loading(spec("bad", "x"), builder);
+        let ok = m.try_initial_load(spec("bad", "x")).await;
+        assert!(!ok);
+        assert!(!m.has_engine());
+        assert!(m.is_errored());
+        assert!(m.status().error.unwrap().contains("boom"));
     }
 }
