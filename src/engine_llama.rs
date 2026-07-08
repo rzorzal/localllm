@@ -56,7 +56,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::stream::BoxStream;
@@ -111,6 +113,19 @@ enum Job {
         req: ChatRequest,
         reply: tokio::sync::mpsc::Sender<Result<StreamDelta>>,
     },
+    /// Cheap query: how many prompt tokens are NOT in the current KV cache.
+    /// Tokenizes the prompt and computes the cold (uncached) token count.
+    /// No generation or KV mutation occurs.
+    EstimateCold {
+        req: ChatRequest,
+        reply: tokio::sync::oneshot::Sender<usize>,
+    },
+    /// Decode the prompt into the KV cache WITHOUT sampling, to warm the prefix.
+    /// On success the cached prefix is updated; on failure the context is recovered.
+    Prefill {
+        req: ChatRequest,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +142,10 @@ pub struct LlamaEngine {
     tx: std_mpsc::SyncSender<Job>,
     /// The context length the worker actually created (after any fit clamp).
     ctx_window: usize,
+    /// Number of tokens currently resident in the KV cache (the cached prefix length).
+    /// Updated by the worker after each Generate, Stream, and Prefill job.
+    /// Published via `Relaxed` ordering — suitable for advisory routing decisions.
+    prefix_len: Arc<AtomicUsize>,
 }
 
 // SyncSender<Job> is Send+Sync (Job: Send via ChatRequest + tokio senders).
@@ -136,6 +155,41 @@ impl LlamaEngine {
     /// The context length the worker actually created (after any fit clamp).
     pub fn ctx_window(&self) -> usize {
         self.ctx_window
+    }
+
+    /// Number of tokens currently resident in the KV cache (the cached prefix length).
+    /// Updated after each Generate, Stream, and Prefill job completes.
+    /// Uses `Relaxed` ordering — suitable for advisory routing decisions.
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_len.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Estimate how many tokens in `req`'s prompt are NOT currently in the KV cache.
+    ///
+    /// Enqueues a `Job::EstimateCold` on the worker thread (no generation or KV
+    /// mutation). Returns `usize::MAX` if the worker has stopped or the channel
+    /// was dropped.
+    pub async fn estimate_cold_tokens(&self, req: ChatRequest) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Job::EstimateCold { req, reply: tx }).is_err() {
+            return usize::MAX;
+        }
+        rx.await.unwrap_or(usize::MAX)
+    }
+
+    /// Prefill the KV cache with `req`'s prompt without generating any output.
+    ///
+    /// Enqueues a `Job::Prefill` on the worker thread. On success the worker's
+    /// `cached_tokens` is updated so the next call with the same (or extended)
+    /// prompt reuses the prefix. Failures are non-fatal: the worker recovers its
+    /// context and returns `Err(...)`.
+    pub async fn prefill(&self, req: ChatRequest) -> anyhow::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Job::Prefill { req, reply: tx })
+            .map_err(|_| anyhow::anyhow!("engine gone"))?;
+        rx.await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("engine dropped reply")))
     }
 
     /// Load a GGUF model from HuggingFace (or local cache), spawn the persistent
@@ -170,6 +224,11 @@ impl LlamaEngine {
         // Channel for sending jobs to the worker thread.
         // Bound of 4: limits queue depth (we process one at a time anyway).
         let (tx, rx) = std_mpsc::sync_channel::<Job>(4);
+
+        // Shared atomic tracking the number of tokens in the KV-cache prefix.
+        // The worker updates this after each Generate/Stream/Prefill job.
+        let prefix_len = Arc::new(AtomicUsize::new(0));
+        let prefix_len_worker = Arc::clone(&prefix_len);
 
         // Oneshot to receive the load result back from the worker thread.
         // Carries the effective ctx after any fit clamp.
@@ -214,6 +273,7 @@ impl LlamaEngine {
                 total_ram_mb,
                 rx,
                 load_tx,
+                prefix_len_worker,
             );
         });
 
@@ -226,6 +286,7 @@ impl LlamaEngine {
         Ok(LlamaEngine {
             tx,
             ctx_window: effective_ctx as usize,
+            prefix_len,
         })
     }
 }
@@ -342,6 +403,7 @@ fn worker_thread(
     total_ram_mb: u64,
     rx: std_mpsc::Receiver<Job>,
     load_tx: tokio::sync::oneshot::Sender<Result<u32>>,
+    prefix_len: Arc<AtomicUsize>,
 ) {
     // Route llama.cpp/ggml/Metal logs into tracing before anything loads, so
     // even backend/model-load diagnostics reach the file log.
@@ -470,6 +532,7 @@ fn worker_thread(
                 // That tail decode produces valid logits from which sampling
                 // proceeds normally. No logits are needed until that first request.
                 cached_tokens = tokens;
+                prefix_len.store(cached_tokens.len(), std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
                     target: "localllm::llama",
                     "warm-started from disk: {} tokens (KV cache preloaded; logits will be primed on first request tail-decode)",
@@ -559,6 +622,7 @@ fn worker_thread(
                         kv_cache_type,
                     );
                 }
+                prefix_len.store(cached_tokens.len(), std::sync::atomic::Ordering::Relaxed);
                 let _ = reply.send(chat_result);
             }
 
@@ -615,6 +679,7 @@ fn worker_thread(
                         kv_cache_type,
                     );
                 }
+                prefix_len.store(cached_tokens.len(), std::sync::atomic::Ordering::Relaxed);
                 // Terminal delta.
                 match result {
                     Ok((_, _, hit_max)) => {
@@ -634,6 +699,71 @@ fn worker_thread(
                     }
                 }
             }
+
+            Job::EstimateCold { req, reply } => {
+                // Tokenize the prompt and subtract the common prefix from cached_tokens.
+                // No KV mutation occurs — this is a read-only estimate.
+                let cold = match tokenize_prompt(&model, &req) {
+                    Ok(toks) => toks
+                        .len()
+                        .saturating_sub(common_prefix_len(&cached_tokens, &toks)),
+                    Err(_) => {
+                        // Tokenization failed: conservatively treat the whole prompt as cold.
+                        req_estimate_fallback(&req)
+                    }
+                };
+                let _ = reply.send(cold);
+            }
+
+            Job::Prefill { req, reply } => {
+                // Reuse the decode loop with a sink callback that returns `false`
+                // immediately so no tokens are sampled beyond what's needed to
+                // produce valid logits; `run_decode_loop` updates `cached_tokens`
+                // with the full prompt prefix before returning.
+                // Wrap in catch_unwind + recover_context like the Generate arm.
+                let panic_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_decode_loop(
+                            &model,
+                            &mut ctx,
+                            &mut cached_tokens,
+                            &req,
+                            kv_cache_dir.as_deref(),
+                            &provenance_prefix,
+                            |_piece| false, // stop after first non-empty piece → prefill only
+                        )
+                    }));
+                let out: Result<()> = match panic_result {
+                    Ok(r) => r.map(|_| ()),
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "localllm::llama",
+                            "prefill panicked — rebuilding context, continuing worker",
+                        );
+                        recover_context(
+                            &model,
+                            backend,
+                            &mut ctx,
+                            &mut cached_tokens,
+                            ctx_len,
+                            kv_cache_type,
+                        );
+                        Err(anyhow::anyhow!("prefill panicked"))
+                    }
+                };
+                if out.is_err() {
+                    recover_context(
+                        &model,
+                        backend,
+                        &mut ctx,
+                        &mut cached_tokens,
+                        ctx_len,
+                        kv_cache_type,
+                    );
+                }
+                prefix_len.store(cached_tokens.len(), std::sync::atomic::Ordering::Relaxed);
+                let _ = reply.send(out);
+            }
         }
     }
     // rx disconnected → process is shutting down. Worker exits cleanly.
@@ -650,6 +780,43 @@ fn truncate_chars(s: &str, n: usize) -> &str {
         Some((i, _)) => &s[..i],
         None => s,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt tokenization helpers
+// ---------------------------------------------------------------------------
+
+/// Render and tokenize `req` into the model's prompt token IDs.
+///
+/// Calls `build_prompt` to produce the formatted prompt string, then converts
+/// it to tokens via `model.str_to_token`. The `AddBos::Never` flag is used
+/// because the chat template already includes the BOS token.
+fn tokenize_prompt(model: &LlamaModel, req: &ChatRequest) -> Result<Vec<LlamaToken>> {
+    let prompt = build_prompt(model, req)?;
+    tracing::debug!(
+        target: "localllm::llama",
+        "prompt ({} chars):\n{}",
+        prompt.len(),
+        truncate_chars(&prompt, 400),
+    );
+    model
+        .str_to_token(&prompt, AddBos::Never)
+        .context("str_to_token failed")
+}
+
+/// Length of the longest shared prefix of two token slices.
+///
+/// Returns `0` if either slice is empty or the first tokens differ.
+fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Fallback cold-token estimate when tokenization is unavailable.
+///
+/// Uses the cheap character-based heuristic from `route::estimate_prompt_tokens`
+/// to treat the whole prompt as cold (conservative: overestimates cold tokens).
+fn req_estimate_fallback(req: &ChatRequest) -> usize {
+    crate::route::estimate_prompt_tokens(req)
 }
 
 // ---------------------------------------------------------------------------
@@ -687,14 +854,8 @@ fn run_decode_loop(
     usize, /*generated*/
     bool,  /*hit_max*/
 )> {
-    // --- Build prompt string ---
-    let prompt = build_prompt(model, req)?;
-    tracing::debug!(target: "localllm::llama", "prompt ({} chars):\n{}", prompt.len(), truncate_chars(&prompt, 400));
-
-    // --- Tokenize ---
-    let new_tokens = model
-        .str_to_token(&prompt, AddBos::Never) // chat template already includes BOS
-        .context("str_to_token failed")?;
+    // --- Tokenize prompt (build prompt string + tokenize) ---
+    let new_tokens = tokenize_prompt(model, req)?;
     let prompt_len = new_tokens.len();
     tracing::debug!(target: "localllm::llama", "prompt tokens: {prompt_len}");
 
@@ -712,14 +873,10 @@ fn run_decode_loop(
 
     // --- Compute longest common prefix for KV reuse ---
     // Cap at new_tokens.len()-1 so there is always at least one token to decode
-    // and produce fresh logits.
+    // and produce fresh logits. Slicing new_tokens to max_common ensures the zip
+    // in common_prefix_len stops before the last new token.
     let max_common = new_tokens.len().saturating_sub(1);
-    let common = cached_tokens
-        .iter()
-        .zip(new_tokens.iter())
-        .take(max_common)
-        .take_while(|(a, b)| a == b)
-        .count();
+    let common = common_prefix_len(&cached_tokens, &new_tokens[..max_common]);
 
     tracing::info!(
         target: "localllm::llama",
@@ -1409,10 +1566,75 @@ pub async fn run_smoke_test() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn resolve_n_gpu_layers_maps_none_to_all() {
         assert_eq!(super::resolve_n_gpu_layers(None), u32::MAX);
         assert_eq!(super::resolve_n_gpu_layers(Some(0)), 0);
         assert_eq!(super::resolve_n_gpu_layers(Some(24)), 24);
+    }
+
+    #[test]
+    fn common_prefix_len_counts_shared_leading_tokens() {
+        let a = vec![LlamaToken(1), LlamaToken(2), LlamaToken(3)];
+        let b = vec![LlamaToken(1), LlamaToken(2), LlamaToken(9)];
+        assert_eq!(common_prefix_len(&a, &b), 2);
+        assert_eq!(common_prefix_len(&a, &[]), 0);
+        assert_eq!(common_prefix_len(&[], &b), 0);
+        assert_eq!(common_prefix_len(&a, &a), 3);
+    }
+
+    /// Integration test: prefill warms the KV prefix so a subsequent
+    /// estimate_cold_tokens for the same prompt returns ~0 cold tokens.
+    ///
+    /// Requires the Qwen2.5-3B GGUF model to be cached locally.
+    /// Marked `#[ignore]` because:
+    ///   1. The model must be downloaded/cached before the test can run.
+    ///   2. No tiny test-model helper exists in the codebase to reuse here.
+    /// Run manually with: `cargo test -p localllm prefill_warms_prefix -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires cached Qwen2.5-3B GGUF model — run manually with --ignored"]
+    async fn prefill_warms_prefix_so_next_estimate_is_low() {
+        use crate::api::common::{ChatMessage, Role};
+        use sysinfo::System;
+
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let total_ram_mb = sys.total_memory() / (1024 * 1024);
+
+        let eng = LlamaEngine::load(
+            "Qwen/Qwen2.5-3B-Instruct-GGUF",
+            &["qwen2.5-3b-instruct-q4_k_m.gguf".to_string()],
+            4096,
+            llama_cpp_2::context::params::KvCacheType::Q8_0,
+            None,
+            None,
+            total_ram_mb,
+        )
+        .await
+        .expect("model load failed");
+
+        let req = crate::api::common::ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                text: Some("hello world this is a warm-up prompt".to_string()),
+                tool_calls: vec![],
+                tool_result: None,
+            }],
+            tools: vec![],
+            max_tokens: Some(1),
+            temperature: Some(0.0),
+            stream: false,
+            model: "qwen2.5-3b".to_string(),
+        };
+
+        eng.prefill(req.clone()).await.expect("prefill failed");
+        assert!(eng.prefix_len() > 0, "prefix_len should be > 0 after prefill");
+        let cold = eng.estimate_cold_tokens(req).await;
+        assert!(
+            cold <= 1,
+            "cold tokens should be ~0 after prefill, got {cold}"
+        );
     }
 }
