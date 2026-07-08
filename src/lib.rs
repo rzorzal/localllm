@@ -73,6 +73,15 @@ fn effective_quant(spec_quant: Option<String>, resolved_quant: String) -> String
     spec_quant.unwrap_or(resolved_quant)
 }
 
+/// Retry backoff for the initial model load: 5 s, 15 s, then 30 s (capped).
+pub fn backoff_secs(attempt: u32) -> u64 {
+    match attempt {
+        1 => 5,
+        2 => 15,
+        _ => 30,
+    }
+}
+
 /// Map `KvType` to the llama-cpp-2 KV cache type.
 fn kv_type_to_llama(t: crate::config::KvType) -> llama_cpp_2::context::params::KvCacheType {
     use llama_cpp_2::context::params::KvCacheType;
@@ -144,7 +153,7 @@ pub async fn run_server_with_ready_policy_token(
     use std::sync::Arc;
 
     tracing::info!(
-        "loading model {} (backend={:?})…",
+        "starting server for model {} (backend={:?})…",
         cfg.model_id,
         cfg.backend
     );
@@ -165,42 +174,31 @@ pub async fn run_server_with_ready_policy_token(
     crate::route_log::cap_lines_file(20_000);
     crate::route_log::rotate_app_log(crate::route_log::now_secs(), 7 * 24 * 3600);
 
-    // Single backend: embedded llama.cpp. (The mistralrs backend was removed —
-    // it was an unused alternate that also blocked the CUDA build.)
-    let (engine, effective_ctx): (Arc<dyn Generator>, usize) = {
-        let kv_cache_dir = cfg.resolved_kv_cache_dir();
-        tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
-        tracing::info!(
-            "KV persist dir: {:?} (no-persist={})",
-            kv_cache_dir,
-            cfg.no_kv_persist
-        );
-        let r = resolve_load_params(
-            &cfg.model_id,
-            &cfg.gguf_files[0],
-            cfg.ctx_len as u32,
-            cfg.kv_type.clone(),
-        );
-        tracing::info!(
-            "resolved load params: ctx={} kv={:?} gpu_layers={:?}",
-            r.ctx,
-            r.kv_type,
-            r.gpu_layers
-        );
-        // Startup: use CLI --gguf-file directly; saved-quant variant resolution applies on switch, not here.
-        let llama = LlamaEngine::load(
-            &cfg.model_id,
-            &cfg.gguf_files,
-            r.ctx as usize,
-            kv_type_to_llama(r.kv_type),
-            kv_cache_dir,
-            r.gpu_layers,
-            total_ram_mb,
-        )
-        .await?;
-        let eff = llama.ctx_window();
-        (Arc::new(llama) as Arc<dyn Generator>, eff)
-    };
+    // Resolve load params now (before bind) so we have effective_ctx without
+    // needing a live engine. The actual engine load happens in a background task
+    // after the listener is bound.
+    let kv_cache_dir = cfg.resolved_kv_cache_dir();
+    tracing::info!("KV cache type: --kv-type={:?}", cfg.kv_type);
+    tracing::info!(
+        "KV persist dir: {:?} (no-persist={})",
+        kv_cache_dir,
+        cfg.no_kv_persist
+    );
+    let r = resolve_load_params(
+        &cfg.model_id,
+        &cfg.gguf_files[0],
+        cfg.ctx_len as u32,
+        cfg.kv_type.clone(),
+    );
+    tracing::info!(
+        "resolved load params: ctx={} kv={:?} gpu_layers={:?}",
+        r.ctx,
+        r.kv_type,
+        r.gpu_layers
+    );
+    // Use the resolved ctx window as the effective ctx for the router.
+    // The live engine is loaded in the background; it will use the same r.ctx.
+    let effective_ctx: usize = r.ctx as usize;
 
     crate::usage::enable_notifications();
     let usage = std::sync::Arc::new(crate::usage::Usage::new());
@@ -257,7 +255,8 @@ pub async fn run_server_with_ready_policy_token(
             Ok(Arc::new(engine) as Arc<dyn Generator>)
         })
     });
-    let manager = ModelManager::new(engine, initial_spec, builder);
+    // Build manager with no pre-loaded engine; the initial load runs in background.
+    let manager = ModelManager::new_loading(initial_spec.clone(), builder);
     let _ = manager_slot.set(Arc::downgrade(&manager));
     // Hand the live manager to the tray (if any) so it can poll the active model.
     if let Some(slot) = manager_out {
@@ -267,7 +266,7 @@ pub async fn run_server_with_ready_policy_token(
     crate::server::write_admin_token_file(&admin_token);
 
     let app = router(
-        manager,
+        manager.clone(),
         cfg.model_id.clone(),
         policy,
         effective_ctx,
@@ -287,10 +286,38 @@ pub async fn run_server_with_ready_policy_token(
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
     tracing::info!("listening on http://{addr}");
 
+    // BIND FIRST — the listener is up regardless of model load success.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if let Some(flag) = ready {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    // Spawn the initial model load with retries in the background.
+    {
+        let mgr = manager.clone();
+        let spec = initial_spec.clone();
+        tokio::spawn(async move {
+            const MAX_ATTEMPTS: u32 = 3;
+            for attempt in 1..=MAX_ATTEMPTS {
+                if mgr.try_initial_load(spec.clone()).await {
+                    tracing::info!(target: "localllm", "initial model loaded (attempt {attempt})");
+                    return;
+                }
+                if attempt < MAX_ATTEMPTS {
+                    let secs = backoff_secs(attempt);
+                    tracing::warn!(target: "localllm", "model load attempt {attempt} failed; retry in {secs}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                }
+            }
+            let reason = mgr.status().error.unwrap_or_else(|| "unknown".into());
+            tracing::error!(target: "localllm", "initial model load failed after {MAX_ATTEMPTS} attempts: {reason}");
+            crate::usage::notify(
+                "localllm — modelo não carregou",
+                &format!("{reason} — abra Config → Models para escolher outro"),
+            );
+        });
+    }
+
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -754,6 +781,17 @@ pub async fn axum_test_request_with_header(
     let response = app.oneshot(request).await.unwrap();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    #[test]
+    fn backoff_schedule_is_5_15_30() {
+        assert_eq!(super::backoff_secs(1), 5);
+        assert_eq!(super::backoff_secs(2), 15);
+        assert_eq!(super::backoff_secs(3), 30);
+        assert_eq!(super::backoff_secs(9), 30); // caps
+    }
 }
 
 #[cfg(test)]
