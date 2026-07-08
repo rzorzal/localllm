@@ -765,6 +765,13 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                             None => {
                                 match window::ModelManagerWindow::open(target, port, &admin_token) {
                                     Ok(w) => {
+                                        // Accessory (LSUIElement) app: a freshly-created
+                                        // window is not auto-activated, so force it visible
+                                        // and front on first open — otherwise it appears
+                                        // then drops behind as the status menu dismisses,
+                                        // and only the second click (the Some arm) shows it.
+                                        w.window.set_visible(true);
+                                        w.window.set_focus();
                                         w.navigate(route);
                                         manager_window = Some(w);
                                     }
