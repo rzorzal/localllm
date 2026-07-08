@@ -110,7 +110,8 @@ jobs:
             backend: cpu
             asset: windows-x64-cpu
             kind: zip
-          - os: windows-latest
+          # windows-2022 (VS 2022): windows-latest's VS 2026 is unsupported by CUDA 12.5.
+          - os: windows-2022
             backend: cuda
             asset: windows-x64-cuda
             kind: zip
@@ -119,6 +120,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+      # Free ~20 GB on the Linux cuda runner (static cuda link exhausts disk).
+      - name: Free disk space (Linux CUDA)
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
       # nvcc (Windows CUDA build) needs MSVC's cl.exe on PATH. Only the cuda cell
       # needs it — the cpu cell builds fine with cargo/cmake's native MSVC lookup.
       - name: Set up MSVC (Windows CUDA)
@@ -145,10 +153,11 @@ jobs:
       - name: Build macOS app
         if: matrix.kind == 'app'
         run: bash scripts/build-app.sh
-      # Linux/Windows: build the release binary.
+      # Linux/Windows: build just the shippable binary (not the diagnostic bins,
+      # which would re-link the huge cuda blob and exhaust the runner at link).
       - name: Build binary
         if: matrix.kind != 'app'
-        run: cargo build --release --features ${{ matrix.backend }}
+        run: cargo build --release --features ${{ matrix.backend }} --bin localllm
       # Package per OS.
       - name: Package macOS app (zip)
         if: matrix.kind == 'app'

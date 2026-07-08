@@ -63,11 +63,21 @@ jobs:
           - os: ubuntu-22.04
             backend: cuda
             run_tests: false
-          - os: windows-latest
+          # windows-latest now ships VS 2026, which CUDA 12.5 can't detect a CUDA
+          # compiler for. Pin the cuda cell to windows-2022 (VS 2022, supported).
+          - os: windows-2022
             backend: cuda
             run_tests: false
     steps:
       - uses: actions/checkout@v4
+      # Free ~20 GB on the Linux cuda runner: the static cuda binary link
+      # otherwise exhausts disk and ld dies with SIGBUS.
+      - name: Free disk space (Linux CUDA)
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
       # nvcc (Windows CUDA build) needs MSVC's cl.exe on PATH. Only the cuda cell
       # needs it — the cpu cell builds fine with cargo/cmake's native MSVC lookup.
       - name: Set up MSVC (Windows CUDA)
@@ -90,8 +100,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}-${{ matrix.backend }}
-      - name: Build
+      # cpu/metal cells build all targets (they run the test suite next). The
+      # build-only cuda cells build just the shippable binary — the diagnostic
+      # bins (spike_llama, harvest_quants) would each re-link the huge cuda blob
+      # and blow the runner's disk/RAM at link time.
+      - name: Build (all targets)
+        if: matrix.run_tests
         run: cargo build --features ${{ matrix.backend }}
+      - name: Build (binary only)
+        if: ${{ !matrix.run_tests }}
+        run: cargo build --features ${{ matrix.backend }} --bin localllm
       # cpu/metal cells run the (pure, model-free) suite; cuda cells are
       # build-only — hosted runners have no NVIDIA driver.
       - name: Test
