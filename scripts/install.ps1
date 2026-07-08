@@ -14,20 +14,33 @@ function Get-Variant {
         $caps = & nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>$null
         foreach ($c in $caps) {
             $v = 0.0
-            if ([double]::TryParse($c.Trim(), [ref]$v) -and $v -ge 8.0) { $cuda = $true }
+            $ok = [double]::TryParse(
+                $c.Trim(),
+                [System.Globalization.NumberStyles]::Float,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$v)
+            if ($ok -and $v -ge 8.0) { $cuda = $true }
         }
     }
     if ($cuda) { 'windows-x64-cuda' } else { 'windows-x64-cpu' }
 }
 
+# Print the detected variant first, so it shows even if the API call below
+# fails (e.g. no release published yet -> Invoke-RestMethod throws on 404).
 $variant = Get-Variant
-$rel = Invoke-RestMethod -Uri $Api -Headers $Headers
-$asset = $rel.assets | Where-Object { $_.name -like "*-$variant.zip" } | Select-Object -First 1
-if (-not $asset) {
-    Write-Error "No published asset for '$variant' yet. See https://github.com/$Repo/releases"
+Write-Host "Detected variant: $variant"
+
+try {
+    $rel = Invoke-RestMethod -Uri $Api -Headers $Headers -UseBasicParsing
+} catch {
+    Write-Error "No published release yet for $Repo (or the API is unreachable). See https://github.com/$Repo/releases"
     exit 1
 }
-Write-Host "Detected variant: $variant"
+$asset = $rel.assets | Where-Object { $_.name -like "*-$variant.zip" } | Select-Object -First 1
+if (-not $asset) {
+    Write-Error "No asset matching *-$variant.zip in the latest release of $Repo."
+    exit 1
+}
 Write-Host "Asset: $($asset.browser_download_url)"
 if ($Print) { exit 0 }
 
@@ -35,7 +48,7 @@ $dest = Join-Path $env:LOCALAPPDATA 'localllm'
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 $zip = Join-Path $env:TEMP "localllm-$variant.zip"
 Write-Host "Downloading..."
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -Headers $Headers
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -Headers $Headers -UseBasicParsing
 Expand-Archive -Path $zip -DestinationPath $dest -Force
 Remove-Item $zip -Force
 
