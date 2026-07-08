@@ -36,6 +36,43 @@ local and free, difficult turns still get a frontier model.
 
 ---
 
+## Install
+
+**One-liner (auto-detects your GPU and installs the right build):**
+
+- macOS / Linux:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/rzorzal/localllm/main/scripts/install.sh | bash
+  ```
+- Windows (PowerShell):
+  ```powershell
+  irm https://raw.githubusercontent.com/rzorzal/localllm/main/scripts/install.ps1 | iex
+  ```
+
+The scripts install user-local (no admin): `~/Applications` (macOS),
+`~/.local/bin` (Linux), `%LOCALAPPDATA%\localllm` + your user PATH (Windows).
+The binaries are unsigned — on macOS right-click the app → **Open**; on Windows
+choose **More info → Run anyway** if SmartScreen warns.
+
+**Or pick the download manually** from the [Releases page](https://github.com/rzorzal/localllm/releases):
+
+| Your machine | Download |
+|---|---|
+| macOS (Apple Silicon) | `localllm-<ver>-macos-arm64.zip` (Metal) |
+| Linux + Nvidia (Ampere / RTX 30xx and newer) | `localllm-<ver>-linux-x64-cuda.tar.gz` |
+| Linux (older/no Nvidia GPU) | `localllm-<ver>-linux-x64-cpu.tar.gz` |
+| Windows + Nvidia (Ampere / RTX 30xx and newer) | `localllm-<ver>-windows-x64-cuda.zip` |
+| Windows (older/no Nvidia GPU) | `localllm-<ver>-windows-x64-cpu.zip` |
+
+The CUDA builds target compute capability 8.0 (Ampere). On older Nvidia cards
+(Turing/Pascal) use the CPU build. The GPU backend is chosen at build time —
+there is no runtime auto-switch — so download the row that matches your machine.
+
+> The `curl … | bash` / `irm … | iex` URLs point at `main`; they work once this
+> branch is merged to `main` and a release has been published.
+
+---
+
 ## Screenshots
 
 **Config** — the hub: model picker, tools, dashboard, routing profile, smart-history toggle, and app wiring.
