@@ -19,9 +19,8 @@ local and free, difficult turns still get a frontier model.
 - **Smart routing** — a cheap pre-generation score decides local vs cloud per
   request; a hard context gate sends over-window prompts to cloud; optional
   cascade escalates a weak local answer.
-- **Local engine** — embedded **llama.cpp** (default) on the Apple GPU (Metal),
-  with KV-cache quantization and on-disk prefix-cache persistence. `mistralrs`
-  is available as an alternate backend.
+- **Local engine** — embedded **llama.cpp** on the Apple GPU (Metal), with
+  KV-cache quantization and on-disk prefix-cache persistence.
 - **Menu-bar app** — status, live model, and a webview **Config** window:
   Models · Tools · Dashboard, plus routing profile, app wiring, and the smart
   history toggle. Opens on the last-used model; hides on blur to save memory.
@@ -131,15 +130,10 @@ Selectable live from the Config page (persisted). Lower threshold = more cloud.
 cargo build --release
 ```
 
-Default backend is embedded **llama.cpp** — no special toolchain needed. The
-optional `mistralrs` backend uses Metal GPU shaders; if you build/run it and hit
-`missing Metal Toolchain`, install it:
-
-```bash
-xcodebuild -runFirstLaunch
-xcodebuild -downloadComponent MetalToolchain
-# or build CPU-only: MISTRALRS_METAL_PRECOMPILE=0 … --force-cpu true
-```
+The engine is embedded **llama.cpp** — no special toolchain needed; it runs on
+the Apple GPU (Metal) directly. On Linux/Windows, select a backend at build time
+with `--features cuda` (Nvidia Ampere+) or `--features cpu`; macOS uses Metal
+automatically.
 
 ### macOS menu-bar app
 
@@ -184,8 +178,6 @@ restores the **last activated model** unless `--model-id` is passed explicitly.
 | `--profile` | *(saved)* | Routing profile for this run (`save-tokens`, `balanced`, `max-quality`, `local-only`) |
 | `--cloud-token-alert` | `200000` | Session cloud prompt-token total that fires a one-shot high-usage alert |
 | `--admin-token` | *(random)* | Token for `/admin/*`; else generated + written to `<config>/localllm/admin-token` (0600) |
-| `--force-cpu` | `false` | Force CPU instead of the Apple GPU |
-| `--no-paged-attn` | `false` | Disable PagedAttention (mistralrs) |
 | `--tray` | `false` | Run as a macOS menu-bar app |
 
 ---
@@ -343,14 +335,11 @@ hf download Qwen/Qwen2.5-7B-Instruct-GGUF \
 | Optimization | Status | Notes |
 |---|---|---|
 | GGUF Q4_K_M weights | **ACTIVE** | mmap-loaded |
-| Metal GPU acceleration | **ACTIVE** | Apple GPU; `--force-cpu` to disable |
+| Metal GPU acceleration | **ACTIVE** | Apple GPU (Metal) |
 | KV-cache quantization | **ACTIVE** | `--kv-type q8`/`q4`/`f16` |
 | Prefix caching (in-process) | **ACTIVE** | Reuses shared prompt prefixes |
 | On-disk KV persistence | **ACTIVE** | Prefix state saved under `<cache>/localllm/kvcache` (`--no-kv-persist` off) |
 | Flash Attention | **UNAVAILABLE** | CUDA-only; Metal uses its own kernels |
-
-The `mistralrs` backend adds PagedAttention (GPU-only) but does not expose
-KV-cache quantization.
 
 ---
 
@@ -388,7 +377,7 @@ src/
   server.rs          axum routes, routing decision, admin API
   route/             local-vs-cloud decision (pure) + profiles
   cloud.rs           provider reverse-proxy + degrade
-  engine_llama.rs    llama.cpp backend      engine.rs / mistralrs
+  engine_llama.rs    llama.cpp inference backend
   model_manager.rs   hot-swappable model + switch state machine
   catalog*.rs        model catalog, quant variants, fit verdicts
   history_select.rs  smart history selection (BM25 + MMR)
