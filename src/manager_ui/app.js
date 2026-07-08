@@ -868,16 +868,16 @@ async function renderDashboard() {
   const fb = d.feedback || { local_total: 0, local_flagged: 0, cloud_total: 0, cloud_trivial: 0 };
   const acc = el("div", "dash-card");
   acc.append(el("div", "dash-card-head", "QUALIDADE (observado)"));
-  const pctLocal = fb.local_total > 0
+  const flaggedPct = fb.local_total > 0
     ? ((fb.local_flagged / fb.local_total) * 100).toFixed(0) + "%"
     : "—";
-  const pctCloud = fb.cloud_total > 0
+  const trivialPct = fb.cloud_total > 0
     ? ((fb.cloud_trivial / fb.cloud_total) * 100).toFixed(0) + "%"
     : "—";
   acc.append(el("div", "dash-card-alt",
-    `local: ${fb.local_flagged}/${fb.local_total} com problemas (${pctLocal})`));
+    `local: ${fb.local_flagged}/${fb.local_total} com problemas (${flaggedPct})`));
   acc.append(el("div", "dash-card-alt",
-    `cloud: ${fb.cloud_trivial}/${fb.cloud_total} trivial (${pctCloud})`));
+    `cloud: ${fb.cloud_trivial}/${fb.cloud_total} trivial (${trivialPct})`));
   wrap.append(acc);
 
   // Per-model effective capability (informational)
