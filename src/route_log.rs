@@ -53,6 +53,18 @@ pub struct RouteEntry {
     /// this decision was made. Set on every decision; None on legacy lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_model: Option<String>,
+    /// Uncached tokens the local model would have to prefill (cold prefill size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_tokens: Option<u64>,
+    /// Estimated cold-prefill seconds at decision time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_secs_est: Option<f64>,
+    /// True when the KV cache missed at decision time (a cold prefill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_cold: Option<bool>,
+    /// True when a background local prefill was fired to warm the next turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_prefill_fired: Option<bool>,
 }
 
 /// Post-generation outcome for a request, correlated to its RouteEntry by `rid`.
@@ -1268,5 +1280,17 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines, vec!["line6", "line7", "line8", "line9"]);
         std::env::remove_var("LOCALLLM_ROUTE_LOG");
+    }
+
+    #[test]
+    fn route_entry_round_trips_cold_prefill_fields() {
+        let e = RouteEntry { ts: 1, rid: "z".into(), dest: "cloud".into(),
+            cold_tokens: Some(19000), prefill_secs_est: Some(95.0),
+            was_cold: Some(true), bg_prefill_fired: Some(true), ..Default::default() };
+        let s = serde_json::to_string(&e).unwrap();
+        let back: RouteEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.cold_tokens, Some(19000));
+        assert_eq!(back.was_cold, Some(true));
+        assert_eq!(back.bg_prefill_fired, Some(true));
     }
 }

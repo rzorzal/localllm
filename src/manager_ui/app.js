@@ -1044,6 +1044,13 @@ function scoreExplainNode(e) {
     const fill = e.prompt_tok / e.ctx_window;
     line(`preenchimento do contexto = ${fmtNum(e.prompt_tok)}/${fmtNum(e.ctx_window)} = ${(fill * 100).toFixed(0)}%`);
   }
+  if (e.was_cold != null) {
+    line(`cache local: <b>${e.was_cold ? "frio (miss)" : "quente"}</b>`);
+    if (e.cold_tokens != null) {
+      line(`prefill frio ≈ ${fmtNum(e.cold_tokens)} tok${e.prefill_secs_est != null ? ` (~${e.prefill_secs_est.toFixed(0)}s)` : ""}`);
+    }
+    if (e.bg_prefill_fired) line(`→ cloud agora; aquecendo local em background`);
+  }
   const why = el("div", "score-pop-why");
   if (e.reason === "ContextOverflow") {
     why.textContent = "→ prompt maior que o contexto local → cloud.";
