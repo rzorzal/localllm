@@ -1123,6 +1123,14 @@ function renderDecisionsTable(panel, recent) {
     } else {
       dcell.append(el("div", "muted", "sem prompt registrado para esta linha"));
     }
+    if (e.output_text) {
+      dcell.append(el("div", "prompt-label", "Resposta"));
+      const respBox = el("div", "prompt-box");
+      respBox.textContent = e.output_text;
+      dcell.append(respBox);
+    } else {
+      dcell.append(el("div", "muted", "sem resposta registrada para esta linha"));
+    }
     detail.append(dcell);
     tr.onclick = () => detail.classList.toggle("hidden");
 
