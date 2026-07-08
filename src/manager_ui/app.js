@@ -1144,7 +1144,9 @@ function renderDecisionsTable(panel, recent) {
     const dcell = el("td"); dcell.colSpan = 7;
     if (e.prompt_snippet) {
       dcell.append(el("div", "prompt-label", "Prompt (último turno)"));
-      dcell.append(el("div", "prompt-box", e.prompt_snippet));
+      const promptBox = el("div", "prompt-box");
+      promptBox.textContent = e.prompt_snippet;
+      dcell.append(promptBox);
     } else {
       dcell.append(el("div", "muted", "sem prompt registrado para esta linha"));
     }
