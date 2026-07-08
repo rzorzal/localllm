@@ -530,3 +530,6 @@ body {
 .perf-row { display: flex; justify-content: space-between; font-size: 13px; padding: 1px 0; }
 .perf-k { color: var(--muted); }
 .perf-v { font-variant-numeric: tabular-nums; }
+
+/* Cold-prefill gate: a compact, readable number field (not the slider style). */
+.gate-input { width: 120px; text-align: right; font-size: 15px; height: 34px; box-sizing: border-box; }

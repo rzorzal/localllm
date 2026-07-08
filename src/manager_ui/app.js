@@ -188,9 +188,8 @@ async function renderColdGateConfig(container) {
     "Acima disso, o 1º request de contexto grande vai pra cloud e o local aquece em background. O timeout do seu cliente deve ser maior que este valor."));
 
   const row = el("div", "thresh-row");
-  const input = el("input", "thresh-range");
+  const input = el("input", "ctxinput gate-input");
   input.type = "number"; input.min = 1; input.max = 3600; input.step = 1;
-  input.style.width = "80px";
   const unit = el("span", "thresh-unit", "s");
   row.append(input, unit);
   panel.append(row);
