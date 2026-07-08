@@ -161,6 +161,9 @@ const REASK_BUFFER_CAP: usize = 8;
 const COLD_TOKENS_WARM_MARGIN: usize = 512;
 /// Conservative M-series 8B prefill floor used when no measured sample exists.
 const DEFAULT_PREFILL_TOK_S: f64 = 150.0;
+/// Maximum ms to wait for the engine to return a cold-token estimate before
+/// falling back to the cheap lock-free prefix_len() atomic.
+const ESTIMATE_TIMEOUT_MS: u64 = 200;
 
 /// One recent LOCAL decision's prompt fingerprint for re-ask detection.
 #[derive(Debug, Clone)]
@@ -234,7 +237,27 @@ async fn route_decision(
 
     // Cold-prefill estimate: how many prompt tokens are NOT in the local KV
     // cache, and the local model's measured prefill speed.
-    let cold_tokens = state.manager.estimate_cold_tokens(internal.clone()).await;
+    //
+    // ColdPrefill can only fire when cloud is allowed AND creds are present
+    // (see route::decide step 2). Skip the engine round-trip entirely when
+    // cloud is not available — it would be unused and may stall the Tokio task
+    // behind a busy single-threaded engine worker.
+    let policy = *state.policy.read().unwrap();
+    let cloud_available = policy.allow_cloud && has_cloud_creds;
+    let cold_tokens = if cloud_available {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_millis(ESTIMATE_TIMEOUT_MS),
+            state.manager.estimate_cold_tokens(internal.clone()),
+        )
+        .await
+        {
+            Ok(c) => c,
+            // Engine busy: fall back to the lock-free prefix_len() atomic (no round-trip).
+            Err(_) => prompt_tokens.saturating_sub(state.manager.prefix_len()),
+        }
+    } else {
+        0
+    };
     let was_cold = cold_tokens > COLD_TOKENS_WARM_MARGIN;
     let prefill_tok_s = crate::route_log::local_prefill_tok_s().unwrap_or(DEFAULT_PREFILL_TOK_S);
 
@@ -249,7 +272,6 @@ async fn route_decision(
         cold_tokens,
         prefill_tok_s,
     };
-    let policy = *state.policy.read().unwrap();
     let raw_decision = crate::route::decide(&signals, &policy);
     // Budget cap: if enabled and today's cloud spend is over the daily limit,
     // force a cloud decision back to local (until the UTC day rolls over).
