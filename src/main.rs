@@ -80,6 +80,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Keep the `localllm` CLI symlink fresh with this running binary (after
+    // tracing init so its result is logged; after the claude/codex dispatch so
+    // the wrapper itself doesn't reinstall).
+    localllm::launch::install_cli();
+
     let args = MainArgs::parse();
 
     // --- Short-circuit flags that never start the server ---
