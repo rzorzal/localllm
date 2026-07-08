@@ -237,6 +237,41 @@ impl ModelManager {
     }
 }
 
+impl ModelManager {
+    /// Number of tokens currently resident in the KV cache.
+    /// Returns 0 if the engine is switching or unavailable (safe: server treats as fully cold).
+    pub fn prefix_len(&self) -> usize {
+        match self.engine.load_full() {
+            Some(e) => Arc::clone(&*e).prefix_len(),
+            None => 0,
+        }
+    }
+
+    /// Estimate how many tokens in `req`'s prompt are NOT currently in the KV cache.
+    /// Returns `usize::MAX` if switching/unavailable (safe: escalates to cloud).
+    pub async fn estimate_cold_tokens(&self, req: ChatRequest) -> usize {
+        if self.switching.load(Ordering::SeqCst) {
+            return usize::MAX;
+        }
+        match self.engine.load_full() {
+            Some(e) => Arc::clone(&*e).estimate_cold_tokens(req).await,
+            None => usize::MAX,
+        }
+    }
+
+    /// Prefill the KV cache with `req`'s prompt without generating output.
+    /// Returns `Ok(())` if switching/unavailable (no-op; safe).
+    pub async fn prefill(&self, req: ChatRequest) -> anyhow::Result<()> {
+        if self.switching.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match self.engine.load_full() {
+            Some(e) => Arc::clone(&*e).prefill(req).await,
+            None => Ok(()),
+        }
+    }
+}
+
 /// Decrement-on-drop: used in the non-stream path to decrement inflight.
 struct DecOnDrop(Arc<AtomicUsize>);
 impl Drop for DecOnDrop {

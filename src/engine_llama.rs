@@ -1473,6 +1473,21 @@ impl Generator for LlamaEngine {
         });
         Ok(Box::pin(stream))
     }
+
+    /// Delegates to the inherent `LlamaEngine::prefix_len`.
+    fn prefix_len(&self) -> usize {
+        LlamaEngine::prefix_len(self)
+    }
+
+    /// Delegates to the inherent `LlamaEngine::estimate_cold_tokens`.
+    async fn estimate_cold_tokens(&self, req: ChatRequest) -> usize {
+        LlamaEngine::estimate_cold_tokens(self, req).await
+    }
+
+    /// Delegates to the inherent `LlamaEngine::prefill`.
+    async fn prefill(&self, req: ChatRequest) -> anyhow::Result<()> {
+        LlamaEngine::prefill(self, req).await
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -717,6 +717,24 @@ pub trait Generator: Send + Sync {
         &self,
         req: ChatRequest,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamDelta>>>;
+
+    /// Number of tokens currently resident in the KV cache (the cached prefix length).
+    /// Returns 0 by default (safe: server treats as fully cold).
+    fn prefix_len(&self) -> usize {
+        0
+    }
+
+    /// Estimate how many tokens in `req`'s prompt are NOT currently in the KV cache.
+    /// Returns `usize::MAX` by default (safe: server escalates to cloud).
+    async fn estimate_cold_tokens(&self, _req: ChatRequest) -> usize {
+        usize::MAX
+    }
+
+    /// Prefill the KV cache with `req`'s prompt without generating any output.
+    /// Returns `Ok(())` by default (no-op).
+    async fn prefill(&self, _req: ChatRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
