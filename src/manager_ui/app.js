@@ -853,32 +853,57 @@ async function renderDashboard() {
   });
   wrap.append(cards);
 
-  // Latency by route (from post-generation outcomes)
+  // Performance panel — latency (left) and quality (right), side by side.
   const L = d.local_latency || { avg_ttft_ms: 0, avg_tok_s: 0, n: 0 };
   const C = d.cloud_latency || { avg_ttft_ms: 0, avg_tok_s: 0, n: 0 };
-  const lat = el("div", "dash-card");
-  lat.append(el("div", "dash-card-head", "LATÊNCIA (30d)"));
-  lat.append(el("div", "dash-card-alt",
-    `local: TTFT ${L.avg_ttft_ms}ms · ${(L.avg_tok_s || 0).toFixed(0)} tok/s (${L.n})`));
-  lat.append(el("div", "dash-card-alt",
-    `cloud: TTFT ${C.avg_ttft_ms}ms · ${(C.avg_tok_s || 0).toFixed(0)} tok/s (${C.n})`));
-  wrap.append(lat);
-
-  // Accuracy (feedback quality metrics)
   const fb = d.feedback || { local_total: 0, local_flagged: 0, cloud_total: 0, cloud_trivial: 0 };
-  const acc = el("div", "dash-card");
-  acc.append(el("div", "dash-card-head", "QUALIDADE (observado)"));
-  const flaggedPct = fb.local_total > 0
-    ? ((fb.local_flagged / fb.local_total) * 100).toFixed(0) + "%"
-    : "—";
-  const trivialPct = fb.cloud_total > 0
-    ? ((fb.cloud_trivial / fb.cloud_total) * 100).toFixed(0) + "%"
-    : "—";
-  acc.append(el("div", "dash-card-alt",
-    `local: ${fb.local_flagged}/${fb.local_total} com problemas (${flaggedPct})`));
-  acc.append(el("div", "dash-card-alt",
-    `cloud: ${fb.cloud_trivial}/${fb.cloud_total} trivial (${trivialPct})`));
-  wrap.append(acc);
+  const flaggedPct = fb.local_total > 0 ? Math.round((fb.local_flagged / fb.local_total) * 100) + "%" : "—";
+  const trivialPct = fb.cloud_total > 0 ? Math.round((fb.cloud_trivial / fb.cloud_total) * 100) + "%" : "—";
+
+  const perf = el("div", "perf-panel");
+  perf.append(el("div", "dash-card-head", "DESEMPENHO"));
+  const perfCols = el("div", "perf-cols");
+
+  const metricRow = (label, value) => {
+    const r = el("div", "perf-row");
+    r.append(el("span", "perf-k", label));
+    const v = el("span", "perf-v"); v.textContent = value; r.append(v);
+    return r;
+  };
+  const group = (title, rows) => {
+    const g = el("div", "perf-group");
+    g.append(el("div", "perf-group-head", title));
+    rows.forEach(r => g.append(r));
+    return g;
+  };
+
+  const latCol = el("div", "perf-col");
+  latCol.append(el("div", "perf-col-head", "LATÊNCIA"));
+  latCol.append(group("Local", [
+    metricRow("TTFT", `${L.avg_ttft_ms} ms`),
+    metricRow("velocidade", `${(L.avg_tok_s || 0).toFixed(0)} tok/s`),
+    metricRow("amostras", `${L.n}`),
+  ]));
+  latCol.append(group("Cloud", [
+    metricRow("TTFT", `${C.avg_ttft_ms} ms`),
+    metricRow("velocidade", `${(C.avg_tok_s || 0).toFixed(0)} tok/s`),
+    metricRow("amostras", `${C.n}`),
+  ]));
+
+  const qCol = el("div", "perf-col");
+  qCol.append(el("div", "perf-col-head", "QUALIDADE"));
+  qCol.append(group("Local", [
+    metricRow("problemas", flaggedPct),
+    metricRow("contagem", `${fb.local_flagged}/${fb.local_total}`),
+  ]));
+  qCol.append(group("Cloud", [
+    metricRow("trivial", trivialPct),
+    metricRow("contagem", `${fb.cloud_trivial}/${fb.cloud_total}`),
+  ]));
+
+  perfCols.append(latCol, qCol);
+  perf.append(perfCols);
+  wrap.append(perf);
 
   // Per-model effective capability (informational)
   const caps = d.model_capabilities || [];
