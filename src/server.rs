@@ -884,6 +884,10 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
             get(handle_threshold_get).post(handle_threshold_set),
         )
         .route(
+            "/admin/cold-prefill-gate",
+            get(handle_cold_gate_get).post(handle_cold_gate_set),
+        )
+        .route(
             "/admin/budget",
             get(handle_budget_get).post(handle_budget_set),
         )
@@ -1099,6 +1103,53 @@ async fn handle_threshold_set(
             .escalation_threshold = t;
     }
     Json(json!({ "percent": (t * 100.0).round() as i64, "value": t })).into_response()
+}
+
+/// GET /admin/cold-prefill-gate — the cold-prefill gate in seconds (token-guarded).
+async fn handle_cold_gate_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let secs = crate::settings::load_cold_prefill_gate();
+    Json(json!({ "secs": secs })).into_response()
+}
+
+/// POST /admin/cold-prefill-gate {"secs": <f64>} — set the cold-prefill gate.
+/// Persists and immediately updates the live policy.
+async fn handle_cold_gate_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = check_admin(&headers, &state) {
+        return resp;
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let secs = body.get("secs").and_then(|v| v.as_f64()).unwrap_or(360.0).clamp(1.0, 3600.0);
+    if let Err(e) = crate::settings::save_cold_prefill_gate(secs) {
+        tracing::warn!("failed to persist cold-prefill gate: {e}");
+    }
+    // Live-apply to the active policy regardless of profile (gate is cross-profile).
+    state
+        .policy
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .cold_prefill_gate_secs = secs;
+    Json(json!({ "secs": secs })).into_response()
 }
 
 /// GET /admin/budget — budget cap config + today's spend (token-guarded).

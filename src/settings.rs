@@ -78,6 +78,10 @@ struct Settings {
     /// `None` keeps the built-in default. Only affects the Balanced profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     balanced_threshold: Option<f64>,
+    /// User override for the cold-prefill gate (`[1.0, 3600.0]` seconds).
+    /// `None` keeps the built-in default (360 s) for all profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cold_prefill_gate_secs: Option<f64>,
     /// Whether the daily cloud-spend budget cap is enforced.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     budget_enabled: bool,
@@ -172,6 +176,23 @@ pub fn save_balanced_threshold(t: f64) -> anyhow::Result<()> {
     save_settings(&s)
 }
 
+/// The cold-prefill gate — the user override if set, else the built-in default
+/// (360 s). Always clamped to `[1.0, 3600.0]`.
+pub fn load_cold_prefill_gate() -> f64 {
+    load_settings()
+        .cold_prefill_gate_secs
+        .unwrap_or(360.0)
+        .clamp(1.0, 3600.0)
+}
+
+/// Persist the cold-prefill gate (clamped to `[1.0, 3600.0]`), preserving
+/// the rest of the settings file.
+pub fn save_cold_prefill_gate(secs: f64) -> anyhow::Result<()> {
+    let mut s = load_settings();
+    s.cold_prefill_gate_secs = Some(secs.clamp(1.0, 3600.0));
+    save_settings(&s)
+}
+
 /// Load (enabled, daily_usd) for the budget cap.
 pub fn load_budget() -> (bool, f64) {
     let s = load_settings();
@@ -187,13 +208,14 @@ pub fn save_budget(enabled: bool, daily_usd: f64) -> anyhow::Result<()> {
 }
 
 /// The concrete policy for a profile, applying any user overrides. The Balanced
-/// profile's difficulty cutoff comes from [`load_balanced_threshold`]; every
-/// other profile uses its built-in knobs unchanged.
+/// profile's difficulty cutoff comes from [`load_balanced_threshold`]; the
+/// cold-prefill gate applies to all profiles; every other knob is unchanged.
 pub fn resolve_policy(p: Profile) -> crate::route::RoutingPolicy {
     let mut pol = p.policy();
     if p == Profile::Balanced {
         pol.escalation_threshold = load_balanced_threshold();
     }
+    pol.cold_prefill_gate_secs = load_cold_prefill_gate();
     pol
 }
 
@@ -447,6 +469,28 @@ mod tests {
                 resolve_policy(Profile::MaxQuality).escalation_threshold,
                 Profile::MaxQuality.policy().escalation_threshold
             );
+        });
+    }
+
+    #[test]
+    fn cold_prefill_gate_round_trips_clamps_and_resolves() {
+        with_temp_settings(|| {
+            // Default = 360.0 (unset).
+            assert!((load_cold_prefill_gate() - 360.0).abs() < 1e-9);
+            // Save a specific value and read it back.
+            save_cold_prefill_gate(120.0).unwrap();
+            assert!((load_cold_prefill_gate() - 120.0).abs() < 1e-9);
+            // Out-of-range values clamp to [1, 3600].
+            save_cold_prefill_gate(0.0).unwrap();
+            assert!((load_cold_prefill_gate() - 1.0).abs() < 1e-9);
+            save_cold_prefill_gate(9999.0).unwrap();
+            assert!((load_cold_prefill_gate() - 3600.0).abs() < 1e-9);
+            // resolve_policy applies the override to all profiles.
+            save_cold_prefill_gate(120.0).unwrap();
+            assert!((resolve_policy(Profile::SaveTokens).cold_prefill_gate_secs - 120.0).abs() < 1e-9);
+            assert!((resolve_policy(Profile::Balanced).cold_prefill_gate_secs - 120.0).abs() < 1e-9);
+            assert!((resolve_policy(Profile::MaxQuality).cold_prefill_gate_secs - 120.0).abs() < 1e-9);
+            assert!((resolve_policy(Profile::LocalOnly).cold_prefill_gate_secs - 120.0).abs() < 1e-9);
         });
     }
 

@@ -136,6 +136,7 @@ function renderConfig() {
   view.append(shell);
   renderRoutingSelector(shell);
   renderThresholdConfig(shell);
+  renderColdGateConfig(shell);
   renderSmartHistoryToggle(shell);
   renderIntegrationToggle(shell);
 }
@@ -174,6 +175,45 @@ async function renderThresholdConfig(container) {
       paint(r.percent); toast(`Limiar em ${r.percent}%`);
     } catch (e) { toast(e.message, true); }
     finally { busy = false; range.disabled = false; }
+  };
+}
+
+// Cold-prefill gate control. GET/POST /admin/cold-prefill-gate.
+// Sets how many seconds of estimated cold prefill triggers cloud escalation.
+// The client request timeout should exceed this value.
+async function renderColdGateConfig(container) {
+  const panel = el("div", "intpanel");
+  panel.append(el("div", "intpanel-title", "Limite de prefill frio (s)"));
+  panel.append(el("div", "intpanel-sub",
+    "Acima disso, o 1º request de contexto grande vai pra cloud e o local aquece em background. O timeout do seu cliente deve ser maior que este valor."));
+
+  const row = el("div", "thresh-row");
+  const input = el("input", "thresh-range");
+  input.type = "number"; input.min = 1; input.max = 3600; input.step = 1;
+  input.style.width = "80px";
+  const unit = el("span", "thresh-unit", "s");
+  row.append(input, unit);
+  panel.append(row);
+  const status = el("div", "intpanel-status");
+  panel.append(status);
+  container.append(panel);
+
+  try { const r = await api("GET", "/admin/cold-prefill-gate"); input.value = r.secs; }
+  catch (e) { status.textContent = e.message; return; }
+
+  let busy = false;
+  input.onchange = async () => {
+    if (busy) return;
+    const secs = Number(input.value);
+    if (!Number.isFinite(secs) || secs < 1 || secs > 3600) {
+      toast("Valor deve estar entre 1 e 3600", true); return;
+    }
+    busy = true; input.disabled = true;
+    try {
+      const r = await api("POST", "/admin/cold-prefill-gate", { secs });
+      input.value = r.secs; toast(`Limite de prefill frio: ${r.secs}s`);
+    } catch (e) { toast(e.message, true); }
+    finally { busy = false; input.disabled = false; }
   };
 }
 
