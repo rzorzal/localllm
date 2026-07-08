@@ -35,6 +35,13 @@ To route a client through localllm the user must manually export env vars (READM
 
 This layer is independently usable and unit-testable (env-map construction is a pure function `launch::env_for(client, port) -> Vec<(String,String)>`).
 
+### Layer 1b — CLI install on startup
+
+The app runs from a `.app` bundle, so `localllm` is not on the user's PATH — `$ localllm claude` in their own terminal would fail. On every startup, (re)install a symlink so the CLI always matches the running app version:
+- `launch::install_cli()`: symlink `localllm` → `std::env::current_exe()` into the first writable dir among `/usr/local/bin`, `/opt/homebrew/bin`, else `~/.local/bin` (created if absent). Use `ln -sf` semantics (replace an existing link). Skip the write if the link already points at the current exe (idempotent, no churn). Best-effort — a failure never blocks boot; log the chosen path (and a hint if the fallback dir isn't on PATH).
+- Called once at boot (both tray and headless server paths), AFTER the `localllm claude|codex` dispatch (so the wrapper itself doesn't reinstall). Re-running on each launch keeps the symlink pointed at the currently-running binary.
+- On quit: leave the symlink in place (the user wants it always installed; a stale link simply points at the last-run binary). No uninstall step.
+
 ## Layer 2 — Terminal launcher (tray helper)
 
 `src/tray.rs` (or a small `src/terminal.rs`): `open_terminal(app: TerminalApp, dir: &Path, command: &str)`.
