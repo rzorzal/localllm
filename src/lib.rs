@@ -22,6 +22,7 @@ pub mod history_select;
 pub mod integrations;
 pub mod launch;
 pub mod model_manager;
+pub mod terminal;
 pub mod pricing;
 pub mod profile;
 pub mod route;
