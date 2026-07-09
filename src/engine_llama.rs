@@ -97,6 +97,11 @@ const KV_PERSIST_MIN_TOKENS: usize = 1024;
 /// Oldest files beyond this limit are deleted automatically.
 const KV_PERSIST_MAX_FILES: usize = 3;
 
+/// Prompt-prefill batch size (tokens per `ctx.decode`). Matches the context
+/// n_ubatch so chunking adds no real overhead, and lets us check for client
+/// disconnect between chunks instead of blocking on one giant decode.
+const PREFILL_CHUNK: usize = 2048;
+
 // ---------------------------------------------------------------------------
 // Job enum — requests sent to the worker thread
 // ---------------------------------------------------------------------------
@@ -817,6 +822,22 @@ fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
 /// to treat the whole prompt as cold (conservative: overestimates cold tokens).
 fn req_estimate_fallback(req: &ChatRequest) -> usize {
     crate::route::estimate_prompt_tokens(req)
+}
+
+/// Split a prefill tail of `n_tail` tokens into `(start, len, is_final)` chunks
+/// of at most `chunk` tokens. Only the last chunk is flagged final (its last
+/// token is where logits are requested).
+fn prefill_chunks(n_tail: usize, chunk: usize) -> Vec<(usize, usize, bool)> {
+    let chunk = chunk.max(1);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < n_tail {
+        let len = (n_tail - start).min(chunk);
+        let is_final = start + len >= n_tail;
+        out.push((start, len, is_final));
+        start += len;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,6 +1619,20 @@ mod tests {
         assert_eq!(common_prefix_len(&a, &[]), 0);
         assert_eq!(common_prefix_len(&[], &b), 0);
         assert_eq!(common_prefix_len(&a, &a), 3);
+    }
+
+    #[test]
+    fn prefill_chunks_covers_tail_and_marks_final() {
+        // smaller than one chunk → single final chunk
+        assert_eq!(prefill_chunks(100, 2048), vec![(0, 100, true)]);
+        // exact multiple
+        assert_eq!(prefill_chunks(4096, 2048), vec![(0, 2048, false), (2048, 2048, true)]);
+        // 2.5 chunks → 3, only last is_final, lengths sum to n_tail
+        let cs = prefill_chunks(5120, 2048);
+        assert_eq!(cs, vec![(0, 2048, false), (2048, 2048, false), (4096, 1024, true)]);
+        assert_eq!(cs.iter().map(|(_, l, _)| l).sum::<usize>(), 5120);
+        // empty
+        assert!(prefill_chunks(0, 2048).is_empty());
     }
 
     /// Integration test: prefill warms the KV prefix so a subsequent
