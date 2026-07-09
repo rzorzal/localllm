@@ -5,18 +5,9 @@
 //! is overridable via the `LOCALLLM_SETTINGS` env var (full file path), used by
 //! tests and power users.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::integrations::ClientPrior;
 use crate::route::Profile;
-
-/// Persisted toggle state for client integrations.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct IntegrationState {
-    pub enabled: bool,
-    pub priors: BTreeMap<String, ClientPrior>,
-}
 
 /// Per-model execution profile. Every field optional: `None` means "fall back
 /// to the catalog recommendation, then the global CLI default".
@@ -50,8 +41,6 @@ pub struct ActiveModel {
 struct Settings {
     #[serde(default)]
     profile: Profile,
-    #[serde(default)]
-    integrations: IntegrationState,
     /// Legacy per-model ctx map. Read-only for migration; new writes go to
     /// `model_profiles`. Kept so old files still load.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -82,10 +71,6 @@ struct Settings {
     /// `None` keeps the built-in default (360 s) for all profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cold_prefill_gate_secs: Option<f64>,
-    /// Terminal app id (`terminal`/`iterm`/`warp`/`wave`) used by the tray Launch
-    /// items. `None` → auto-pick an installed one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal: Option<String>,
     /// Whether the daily cloud-spend budget cap is enforced.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     budget_enabled: bool,
@@ -197,26 +182,6 @@ pub fn save_cold_prefill_gate(secs: f64) -> anyhow::Result<()> {
     save_settings(&s)
 }
 
-/// The terminal app for the tray Launch items — user override if set, else the
-/// first installed terminal in preference order (Apple Terminal always exists).
-pub fn load_terminal() -> crate::terminal::TerminalApp {
-    match load_settings()
-        .terminal
-        .as_deref()
-        .and_then(crate::terminal::TerminalApp::from_id)
-    {
-        Some(a) => a,
-        None => crate::terminal::pick_default(&crate::terminal::installed()),
-    }
-}
-
-/// Persist the chosen Launch terminal, preserving the rest of the settings file.
-pub fn save_terminal(app: crate::terminal::TerminalApp) -> anyhow::Result<()> {
-    let mut s = load_settings();
-    s.terminal = Some(app.id().to_string());
-    save_settings(&s)
-}
-
 /// Load (enabled, daily_usd) for the budget cap.
 pub fn load_budget() -> (bool, f64) {
     let s = load_settings();
@@ -277,18 +242,6 @@ pub fn resolve_active_model(
         Some(a) => (a.repo, vec![a.file]),
         None => (default_model.to_string(), vec![default_file.to_string()]),
     }
-}
-
-/// Load the persisted client-integration toggle state.
-pub fn load_integrations() -> IntegrationState {
-    load_settings().integrations
-}
-
-/// Persist the client-integration toggle state, preserving the profile.
-pub fn save_integrations(state: &IntegrationState) -> anyhow::Result<()> {
-    let mut s = load_settings();
-    s.integrations = state.clone();
-    save_settings(&s)
 }
 
 /// Settings key for a model's per-model ctx override: `"{repo}/{file}"`.
@@ -518,21 +471,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn terminal_round_trips_and_defaults_installed() {
-        with_temp_settings(|| {
-            // Unset → a default that is installed (or Apple Terminal fallback).
-            let d = load_terminal();
-            assert!(
-                crate::terminal::installed().contains(&d)
-                    || d == crate::terminal::TerminalApp::Terminal
-            );
-            // Explicit save round-trips.
-            save_terminal(crate::terminal::TerminalApp::ITerm).unwrap();
-            assert_eq!(load_terminal(), crate::terminal::TerminalApp::ITerm);
-        });
-    }
-
     fn with_temp_settings<F: FnOnce()>(f: F) {
         let _guard = SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("localllm-test-{}", uuid::Uuid::new_v4()));
@@ -594,58 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn integrations_round_trip() {
-        with_temp_settings(|| {
-            use crate::integrations::ClientPrior;
-            let mut priors = std::collections::BTreeMap::new();
-            let mut keys = std::collections::BTreeMap::new();
-            keys.insert("env.ANTHROPIC_BASE_URL".to_string(), None);
-            priors.insert("claude-code".to_string(), ClientPrior { keys });
-            let state = IntegrationState {
-                enabled: true,
-                priors,
-            };
-            save_integrations(&state).unwrap();
-            assert_eq!(load_integrations(), state);
-        });
-    }
-
-    #[test]
-    fn saving_profile_preserves_integrations() {
-        with_temp_settings(|| {
-            let state = IntegrationState {
-                enabled: true,
-                priors: Default::default(),
-            };
-            save_integrations(&state).unwrap();
-            save_profile(Profile::MaxQuality).unwrap();
-            // profile saved, integrations untouched
-            assert_eq!(load_profile(), Profile::MaxQuality);
-            assert!(load_integrations().enabled);
-        });
-    }
-
-    #[test]
-    fn saving_integrations_preserves_profile() {
-        with_temp_settings(|| {
-            save_profile(Profile::LocalOnly).unwrap();
-            let state = IntegrationState {
-                enabled: true,
-                priors: Default::default(),
-            };
-            save_integrations(&state).unwrap();
-            assert_eq!(load_profile(), Profile::LocalOnly);
-        });
-    }
-
-    #[test]
-    fn load_integrations_missing_returns_default() {
-        with_temp_settings(|| {
-            assert_eq!(load_integrations(), IntegrationState::default());
-        });
-    }
-
-    #[test]
     fn model_ctx_round_trip() {
         with_temp_settings(|| {
             let k = model_ctx_key("bartowski/phi-4-GGUF", "phi-4-Q4_K_M.gguf");
@@ -657,17 +543,11 @@ mod tests {
     }
 
     #[test]
-    fn saving_model_ctx_preserves_profile_and_integrations() {
+    fn saving_model_ctx_preserves_profile() {
         with_temp_settings(|| {
             save_profile(Profile::MaxQuality).unwrap();
-            let state = IntegrationState {
-                enabled: true,
-                priors: Default::default(),
-            };
-            save_integrations(&state).unwrap();
             save_model_ctx("r/f", 8192).unwrap();
             assert_eq!(load_profile(), Profile::MaxQuality);
-            assert!(load_integrations().enabled);
             assert_eq!(load_model_ctx("r/f"), Some(8192));
         });
     }
