@@ -1600,6 +1600,17 @@ fn is_safe_model_file(file: &str) -> bool {
     !file.is_empty() && std::path::Path::new(file).file_name() == Some(std::ffi::OsStr::new(file))
 }
 
+/// A model ref that could plausibly be a real GGUF model on Hugging Face: an
+/// `owner/name` repo and a bare `*.gguf` filename. Rejects fixtures like
+/// `r2`/`f2` that only break loading (and disable per-model features) if
+/// persisted as the active model.
+fn is_valid_model_ref(repo: &str, file: &str) -> bool {
+    !repo.is_empty()
+        && repo.contains('/')
+        && is_safe_model_file(file)
+        && file.to_ascii_lowercase().ends_with(".gguf")
+}
+
 /// POST /admin/model — start a model switch (token-guarded).
 async fn handle_admin_switch(
     State(state): State<Arc<AppState>>,
@@ -1620,10 +1631,10 @@ async fn handle_admin_switch(
                 .into_response()
         }
     };
-    if body.repo.is_empty() || !is_safe_model_file(&body.file) {
+    if !is_valid_model_ref(&body.repo, &body.file) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "repo and a valid (non-path) file are required"})),
+            Json(json!({"error": "repo must be owner/name and file must be a .gguf filename"})),
         )
             .into_response();
     }
@@ -3669,5 +3680,16 @@ mod tests {
         assert_eq!(super::no_engine_decision(false, true), Some(Decision::Cloud(RouteReason::LocalUnavailable)));
         // no engine + no cloud → NoModel (→ 503)
         assert_eq!(super::no_engine_decision(false, false), Some(Decision::NoModel));
+    }
+
+    #[test]
+    fn is_valid_model_ref_accepts_real_and_rejects_fixtures() {
+        assert!(super::is_valid_model_ref("owner/name", "model.gguf"));
+        assert!(super::is_valid_model_ref("owner/name", "MODEL.GGUF")); // case-insensitive ext
+        assert!(!super::is_valid_model_ref("r2", "f2")); // the poison fixture
+        assert!(!super::is_valid_model_ref("owner/name", "f2")); // no .gguf
+        assert!(!super::is_valid_model_ref("r2", "model.gguf")); // no owner/ slash
+        assert!(!super::is_valid_model_ref("", "model.gguf")); // empty repo
+        assert!(!super::is_valid_model_ref("owner/name", "../x.gguf")); // path (is_safe_model_file)
     }
 }
