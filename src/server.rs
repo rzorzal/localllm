@@ -886,10 +886,6 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         )
         .route("/admin/tools", get(handle_tools_get).post(handle_tools_set))
         .route(
-            "/admin/integrations",
-            get(handle_integrations_get).post(handle_integrations_set),
-        )
-        .route(
             "/admin/routing",
             get(handle_routing_get).post(handle_routing_set),
         )
@@ -900,10 +896,6 @@ fn build_router_inner(state: Arc<AppState>) -> Router {
         .route(
             "/admin/cold-prefill-gate",
             get(handle_cold_gate_get).post(handle_cold_gate_set),
-        )
-        .route(
-            "/admin/terminal",
-            get(handle_terminal_get).post(handle_terminal_set),
         )
         .route(
             "/admin/budget",
@@ -1170,57 +1162,6 @@ async fn handle_cold_gate_set(
     Json(json!({ "secs": secs })).into_response()
 }
 
-/// GET /admin/terminal — the Launch terminal + installed options (token-guarded).
-async fn handle_terminal_get(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if let Some(resp) = check_admin(&headers, &state) {
-        return resp;
-    }
-    let available: Vec<&str> = crate::terminal::installed().iter().map(|a| a.id()).collect();
-    Json(json!({ "terminal": crate::settings::load_terminal().id(), "available": available }))
-        .into_response()
-}
-
-/// POST /admin/terminal {"terminal": "<id>"} — set the Launch terminal.
-async fn handle_terminal_set(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    raw: Bytes,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if let Some(resp) = check_admin(&headers, &state) {
-        return resp;
-    }
-    let body: serde_json::Value = match serde_json::from_slice(&raw) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response()
-        }
-    };
-    let Some(app) = body
-        .get("terminal")
-        .and_then(|v| v.as_str())
-        .and_then(crate::terminal::TerminalApp::from_id)
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "unknown terminal"})),
-        )
-            .into_response();
-    };
-    if let Err(e) = crate::settings::save_terminal(app) {
-        tracing::warn!("failed to persist Launch terminal: {e}");
-    }
-    Json(json!({ "terminal": app.id() })).into_response()
-}
-
 /// GET /admin/budget — budget cap config + today's spend (token-guarded).
 async fn handle_budget_get(
     State(state): State<Arc<AppState>>,
@@ -1307,66 +1248,6 @@ async fn handle_breaker_reset(
     }
     state.breaker.reset(crate::route_log::now_secs() as u64);
     Json(json!({ "ok": true, "state": "closed" })).into_response()
-}
-
-/// GET /admin/integrations — current wiring state (token-guarded).
-async fn handle_integrations_get(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if let Some(resp) = check_admin(&headers, &state) {
-        return resp;
-    }
-    let st = crate::settings::load_integrations();
-    let wired: Vec<String> = st.priors.keys().cloned().collect();
-    Json(json!({ "enabled": st.enabled, "wired": wired })).into_response()
-}
-
-#[derive(serde::Deserialize)]
-struct IntegrationsSetBody {
-    enabled: bool,
-}
-
-/// POST /admin/integrations {enabled} — wire or unwire agent clients (token-guarded).
-async fn handle_integrations_set(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    raw: Bytes,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if let Some(resp) = check_admin(&headers, &state) {
-        return resp;
-    }
-    let body: IntegrationsSetBody = match serde_json::from_slice(&raw) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response()
-        }
-    };
-    let injectors = crate::integrations::injectors_default();
-    let new_state = if body.enabled {
-        let outcome = crate::integrations::enable_all(state.port, &injectors);
-        crate::settings::IntegrationState {
-            enabled: !outcome.priors.is_empty(),
-            priors: outcome.priors,
-        }
-    } else {
-        let mut st = crate::settings::load_integrations();
-        let summary = crate::integrations::disable_all(&st.priors, &injectors);
-        let failed: std::collections::HashSet<&String> =
-            summary.failed.iter().map(|(id, _)| id).collect();
-        st.priors.retain(|id, _| failed.contains(id));
-        st.enabled = !st.priors.is_empty();
-        st
-    };
-    let _ = crate::settings::save_integrations(&new_state);
-    let wired: Vec<String> = new_state.priors.keys().cloned().collect();
-    Json(json!({ "enabled": new_state.enabled, "wired": wired })).into_response()
 }
 
 /// GET /admin/dashboard — routing rollups + recent decisions (token-guarded).

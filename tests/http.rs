@@ -850,29 +850,6 @@ async fn active_model_history_turns_truncates_request() {
     );
 }
 
-// --- Integrations API (config-nav-dashboard, Task 3) ---
-
-#[tokio::test]
-async fn admin_integrations_get_requires_token() {
-    let app = localllm::router_for_test();
-    let status = localllm::axum_test_get_status(app, "/admin/integrations").await;
-    assert_eq!(status, 401);
-}
-
-#[tokio::test]
-async fn admin_integrations_get_reports_state_shape() {
-    let app = localllm::router_for_test();
-    let body = localllm::axum_test_get_with_header(
-        app,
-        "/admin/integrations",
-        "x-admin-token",
-        "test-token",
-    )
-    .await;
-    assert!(body.get("enabled").and_then(|v| v.as_bool()).is_some());
-    assert!(body.get("wired").map(|v| v.is_array()).unwrap_or(false));
-}
-
 // --- Dashboard API (config-nav-dashboard, Task 7) ---
 
 #[tokio::test]
