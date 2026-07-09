@@ -173,6 +173,30 @@ impl CircuitBreaker {
             },
         }
     }
+
+    /// Passive-read advance for the dashboard poll: if `Open` with an elapsed
+    /// cooldown, transition to `HalfOpen` (carrying `backoff` + `reason`, as
+    /// `gate` does) so recovery happens without needing a cloud request, then
+    /// return the snapshot of the resulting state. Unlike `snapshot` this may
+    /// MUTATE; unlike `gate` it grants no `Allow` to a caller. `on_failure`
+    /// still owns backoff escalation, so a failed probe after this doubles the
+    /// cooldown rather than resetting it.
+    pub fn poll(&self, now: u64) -> BreakerSnapshot {
+        {
+            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let BreakerState::Open {
+                until,
+                backoff,
+                reason,
+            } = *st
+            {
+                if now >= until {
+                    *st = BreakerState::HalfOpen { backoff, reason };
+                }
+            }
+        } // drop the lock before snapshot re-acquires it
+        self.snapshot(now)
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +337,43 @@ mod tests {
             b.on_failure(0, r);
             assert_eq!(b.snapshot(0).reason, Some(reason_label(r)));
         }
+    }
+
+    #[test]
+    fn poll_elapsed_open_transitions_to_half_open() {
+        let b = CircuitBreaker::new();
+        b.on_failure(100, DegradeReason::Quota); // Open until 130, backoff 30
+        // Not elapsed: poll leaves it Open with the correct countdown.
+        let s = b.poll(120);
+        assert_eq!(s.state, "open");
+        assert_eq!(s.next_probe_secs, Some(10));
+        // Elapsed: poll transitions to half-open and reports the reason.
+        let s = b.poll(130);
+        assert_eq!(s.state, "half-open");
+        assert_eq!(s.reason, Some("Quota"));
+        // It is a REAL transition, not just a reported label: the next gate
+        // returns Allow (the probe), which only happens from Closed/HalfOpen.
+        assert_eq!(b.gate(130), Gate::Allow);
+    }
+
+    #[test]
+    fn poll_is_noop_on_closed_and_half_open() {
+        let b = CircuitBreaker::new();
+        assert_eq!(b.poll(0).state, "closed"); // closed → no-op
+        b.on_failure(0, DegradeReason::Offline); // Open until 30
+        assert_eq!(b.gate(30), Gate::Allow); // → half-open via gate
+        assert_eq!(b.poll(30).state, "half-open"); // no-op
+        assert_eq!(b.poll(999).state, "half-open"); // still half-open, no-op
+    }
+
+    #[test]
+    fn poll_preserves_backoff_escalation() {
+        let b = CircuitBreaker::new();
+        b.on_failure(0, DegradeReason::Quota); // backoff 30, Open until 30
+        let s = b.poll(30); // half-open via poll (not gate)
+        assert_eq!(s.state, "half-open");
+        b.on_failure(30, DegradeReason::Quota); // failed probe → doubled to 60
+        // Backoff escalated, NOT reset to base 30.
+        assert_eq!(b.snapshot(30).next_probe_secs, Some(60));
     }
 }
