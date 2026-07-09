@@ -1061,7 +1061,7 @@ async function paintBreaker(host) {
   const state = b.state || "closed";
   const dot = el("span", "brk-dot brk-" + state);
   const label = state === "closed" ? "Cloud disponível"
-    : state === "half-open" ? "Testando cloud (probe)…"
+    : state === "half-open" ? "Cloud pronto — testa na próxima chamada"
     : `Cloud indisponível (${b.reason || "erro"})`;
   const line = el("div", "brk-line");
   line.append(dot);

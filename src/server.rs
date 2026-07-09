@@ -1283,7 +1283,7 @@ async fn handle_breaker_get(
     if let Some(resp) = check_admin(&headers, &state) {
         return resp;
     }
-    let s = state.breaker.snapshot(crate::route_log::now_secs() as u64);
+    let s = state.breaker.poll(crate::route_log::now_secs() as u64);
     Json(json!({
         "state": s.state,
         "reason": s.reason,
