@@ -434,6 +434,24 @@ async fn admin_status_ok_with_token() {
 
 #[tokio::test]
 async fn admin_switch_accepts_with_token() {
+    let _guard = ENV_LOCK.lock().await;
+    let _settings = IsolatedSettings::new("admin-switch-accepts");
+    let app = localllm::router_for_test();
+    let status = localllm::axum_test_request_status_with_header(
+        app,
+        "/admin/model",
+        r#"{"repo":"owner/name","file":"model.gguf"}"#,
+        "x-admin-token",
+        "test-token",
+    )
+    .await;
+    assert_eq!(status, 202);
+}
+
+#[tokio::test]
+async fn admin_switch_rejects_invalid_ref() {
+    // The `r2/f2` fixture that used to poison the real settings must now be
+    // rejected (no owner/ slash, no .gguf) BEFORE any persist.
     let app = localllm::router_for_test();
     let status = localllm::axum_test_request_status_with_header(
         app,
@@ -443,7 +461,7 @@ async fn admin_switch_accepts_with_token() {
         "test-token",
     )
     .await;
-    assert_eq!(status, 202);
+    assert_eq!(status, 400);
 }
 
 #[tokio::test]
