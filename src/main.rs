@@ -35,13 +35,6 @@ struct MainArgs {
 }
 
 fn main() -> anyhow::Result<()> {
-    // `localllm claude|codex [args]` → run the client wired to the proxy and
-    // exit; never start the server or emit logs.
-    let raw: Vec<String> = std::env::args().collect();
-    if let Some((client, rest)) = localllm::launch::detect(&raw) {
-        localllm::launch::run(client, rest); // never returns
-    }
-
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
     // Respect RUST_LOG when set; otherwise default to info for our crate plus
@@ -79,11 +72,6 @@ fn main() -> anyhow::Result<()> {
                 .init();
         }
     }
-
-    // Keep the `localllm` CLI symlink fresh with this running binary (after
-    // tracing init so its result is logged; after the claude/codex dispatch so
-    // the wrapper itself doesn't reinstall).
-    localllm::launch::install_cli();
 
     let args = MainArgs::parse();
 
