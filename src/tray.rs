@@ -399,26 +399,6 @@ fn server_failed_label(err: &str) -> String {
     format!("🔴 Server failed — {short}")
 }
 
-/// Format the tray "Wired:" sub-line from persisted integration state.
-fn wired_label(state: &crate::settings::IntegrationState) -> String {
-    if !state.enabled {
-        return "Apps: direct to provider".to_string();
-    }
-    if state.priors.is_empty() {
-        return "Wired: none (no client configs found)".to_string();
-    }
-    // Map known ids to display names for the line.
-    let names: Vec<&str> = state
-        .priors
-        .keys()
-        .map(|id| match id.as_str() {
-            "claude-code" => "Claude Code",
-            "codex" => "Codex",
-            other => other,
-        })
-        .collect();
-    format!("Wired: {}", names.join(", "))
-}
 
 // ---------------------------------------------------------------------------
 // Tray entry point
@@ -567,14 +547,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // Config submenu items each open/show it and navigate to their SPA route.
     // admin_token (function param) is captured by the closure for window injection.
     let mut config_home_id: Option<tray_icon::menu::MenuId> = None;
-    let mut launch_claude_id: Option<tray_icon::menu::MenuId> = None;
-    let mut launch_codex_id: Option<tray_icon::menu::MenuId> = None;
+    let mut copy_env_id: Option<tray_icon::menu::MenuId> = None;
     let mut manager_window: Option<window::ModelManagerWindow> = None;
-
-    // Read-only wired sub-line: reflects the integration state toggled from the
-    // Config page. last_wired avoids redundant set_text on every poll tick.
-    let mut wired_handle: Option<MenuItem> = None;
-    let mut last_wired: Option<String> = None;
 
     // Poll interval for the menu-event channel.
     let poll_interval = Duration::from_millis(100);
@@ -605,6 +579,11 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     None,
                 );
                 url_id = Some(url_line.id().clone());
+                // Copies the OS-appropriate inline env vars for pointing
+                // Claude Code / Codex at this server (user prepends to their cmd).
+                let copy_env_line = MenuItem::new("📋  Copy env vars", true, None);
+                let copy_env_id_local = copy_env_line.id().clone();
+                copy_env_id = Some(copy_env_id_local);
                 let model_line = MenuItem::new(format!("Model:  {model_short}"), false, None);
                 model_handle = Some(model_line.clone());
                 let ctx_line = MenuItem::new(format!("Context: {info_ctx} tokens"), false, None);
@@ -624,10 +603,6 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 // Budget/Dashboard.
                 let config_item = MenuItem::new("⚙  Config", true, None);
                 config_home_id = Some(config_item.id().clone());
-                let launch_claude = MenuItem::new("🚀  Launch Claude Code via LocalLLM", true, None);
-                let launch_codex = MenuItem::new("🚀  Launch Codex via LocalLLM", true, None);
-                launch_claude_id = Some(launch_claude.id().clone());
-                launch_codex_id = Some(launch_codex.id().clone());
                 let quit_item = MenuItem::new("⏻  Quit localllm", true, None);
                 quit_id = Some(quit_item.id().clone());
 
@@ -640,14 +615,11 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     MenuItem::new(format!("Routing: {}", initial_profile.label()), false, None);
                 routing_status = Some(routing_line.clone());
 
-                let init_state = crate::settings::load_integrations();
-                let wired_line = MenuItem::new(wired_label(&init_state), false, None);
-                wired_handle = Some(wired_line.clone());
-
                 menu.append(&title).expect("append title");
                 menu.append(&status).expect("append status");
                 menu.append(&PredefinedMenuItem::separator()).expect("sep");
                 menu.append(&url_line).expect("append url");
+                menu.append(&copy_env_line).expect("append copy-env");
                 menu.append(&model_line).expect("append model");
                 menu.append(&ctx_line).expect("append ctx");
                 menu.append(&kv_line).expect("append kv");
@@ -659,13 +631,8 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     .expect("append retry cloud item");
                 menu.append(&PredefinedMenuItem::separator())
                     .expect("append separator");
-                menu.append(&wired_line).expect("append wired line");
-                menu.append(&PredefinedMenuItem::separator())
-                    .expect("append separator2");
                 menu.append(&logs_item).expect("append logs item");
                 menu.append(&config_item).expect("append config item");
-                menu.append(&launch_claude).expect("append launch claude");
-                menu.append(&launch_codex).expect("append launch codex");
                 menu.append(&quit_item).expect("append quit item");
 
                 _tray_keeper.push(
@@ -733,18 +700,6 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     }
                 }
 
-                // Keep the read-only wired line in sync with the Config-page toggle.
-                {
-                    let st = crate::settings::load_integrations();
-                    let label = wired_label(&st);
-                    if last_wired.as_deref() != Some(label.as_str()) {
-                        if let Some(line) = &wired_handle {
-                            line.set_text(&label);
-                        }
-                        last_wired = Some(label);
-                    }
-                }
-
                 // Keep the read-only routing line in sync with the Config-page selector.
                 {
                     let p = crate::settings::load_profile();
@@ -758,18 +713,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
 
                 while let Ok(menu_event) = MenuEvent::receiver().try_recv() {
                     if quit_id.as_ref() == Some(&menu_event.id) {
-                        tracing::info!("quit requested via tray menu — unwiring integrations");
-                        let st = crate::settings::load_integrations();
-                        if st.enabled {
-                            let injectors = crate::integrations::injectors_default();
-                            let summary = crate::integrations::disable_all(&st.priors, &injectors);
-                            let failed: std::collections::HashSet<&String> =
-                                summary.failed.iter().map(|(id, _)| id).collect();
-                            let mut new_state = st.clone();
-                            new_state.priors.retain(|id, _| failed.contains(id));
-                            new_state.enabled = !new_state.priors.is_empty();
-                            let _ = crate::settings::save_integrations(&new_state);
-                        }
+                        tracing::info!("quit requested via tray menu");
                         hard_exit(0);
                     } else if logs_id.as_ref() == Some(&menu_event.id) {
                         platform::open_path(&log_path);
@@ -777,6 +721,10 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                     } else if url_id.as_ref() == Some(&menu_event.id) {
                         platform::copy_to_clipboard(&url_for_tray);
                         tracing::info!("copied to clipboard: {url_for_tray}");
+                    } else if copy_env_id.as_ref() == Some(&menu_event.id) {
+                        let snippet = crate::env_snippet::build(port);
+                        platform::copy_to_clipboard(&snippet);
+                        tracing::info!("copied env-var snippet to clipboard");
                     } else if retry_cloud_id.as_ref() == Some(&menu_event.id) {
                         breaker_for_menu.reset(crate::route_log::now_secs() as u64);
                         tracing::info!("circuit breaker manually reset via tray");
@@ -804,39 +752,6 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                                     Err(e) => tracing::error!(
                                         "Config window failed: {e} (needs WebView2/WebKitGTK)"
                                     ),
-                                }
-                            }
-                        }
-                    } else if launch_claude_id.as_ref() == Some(&menu_event.id)
-                        || launch_codex_id.as_ref() == Some(&menu_event.id)
-                    {
-                        let sub = if launch_claude_id.as_ref() == Some(&menu_event.id) {
-                            "claude"
-                        } else {
-                            "codex"
-                        };
-                        // Native folder picker → open the chosen terminal in that
-                        // folder running `localllm <client>`. Best-effort.
-                        let out = std::process::Command::new("osascript")
-                            .arg("-e")
-                            .arg("POSIX path of (choose folder)")
-                            .output();
-                        if let Ok(o) = out {
-                            let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                            if !dir.is_empty() {
-                                let exe = std::env::current_exe()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|_| "localllm".into());
-                                // Single-quote the binary path for the shell (it
-                                // runs inside an AppleScript double-quoted string).
-                                let command = format!("'{exe}' {sub}");
-                                let app = crate::settings::load_terminal();
-                                if let Err(e) = crate::terminal::open(
-                                    app,
-                                    std::path::Path::new(&dir),
-                                    &command,
-                                ) {
-                                    tracing::error!("launch {sub}: terminal open failed: {e}");
                                 }
                             }
                         }
