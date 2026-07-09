@@ -1283,6 +1283,10 @@ async fn handle_breaker_get(
     if let Some(resp) = check_admin(&headers, &state) {
         return resp;
     }
+    // NOTE: `poll` (not `snapshot`) intentionally MUTATES — it advances an
+    // elapsed Open breaker to HalfOpen so the dashboard's periodic GET drives
+    // recovery without a cloud request. Effect is idempotent/convergent and this
+    // endpoint is token-guarded + polled only by our own dashboard.
     let s = state.breaker.poll(crate::route_log::now_secs() as u64);
     Json(json!({
         "state": s.state,
