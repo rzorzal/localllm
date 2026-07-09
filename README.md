@@ -203,10 +203,9 @@ codex "explain this code"
 ANTHROPIC_BASE_URL=http://localhost:31415 ANTHROPIC_API_KEY=<your-key> claude
 ```
 
-Or use the **Config → "Rotear apps pelo localllm"** toggle (or the tray state
-line): it rewrites the Claude Code / Codex client configs to point at localllm,
-and **un-wires them automatically when you quit** so the tools fall back to the
-provider directly.
+The tray item **"📋 Copy env vars"** copies these same variables (OS-formatted,
+ready to prepend to your `claude` or `codex` command) straight to your
+clipboard — no manual typing needed.
 
 > Cloud escalation forwards the caller's real API key. Point tools at localllm
 > with your normal provider key and localllm decides per request whether to
@@ -308,7 +307,6 @@ Used by the Config UI; all under `/admin`:
 | `POST /admin/model/ctx`, `POST /admin/model/profile` | per-model ctx / exec profile |
 | `GET/POST /admin/tools` | per-surface discovered tools + blocklist |
 | `GET/POST /admin/routing` | routing profile |
-| `GET/POST /admin/integrations` | app wiring state / toggle |
 | `GET/POST /admin/history-filter` | smart-history toggle |
 | `GET/DELETE /admin/dashboard` | rollups + recent / clear log |
 

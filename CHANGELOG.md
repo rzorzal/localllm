@@ -1,6 +1,15 @@
 # Changelog
 
 All notable changes to localllm.
+
+## [Unreleased]
+
+### Removed
+
+- Route-apps integration, terminal chooser, `localllm claude|codex` CLI, and
+  `/admin/integrations` + `/admin/terminal` endpoints; replaced by the tray
+  **📋 Copy env vars** item.
+
 ## [0.2.0] - 2026-07-08
 
 ### Bug Fixes

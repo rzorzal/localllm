@@ -844,9 +844,6 @@ pub struct AppState {
             std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
         >,
     >,
-    /// TCP port this server listens on — needed to (re)wire agent client configs
-    /// via `POST /admin/integrations`.
-    pub port: u16,
     /// Daily cloud-spend tracker for the budget cap.
     pub budget: std::sync::Arc<crate::budget::Budget>,
     /// Global cloud circuit breaker (skip cloud during cooldown after failures).
@@ -935,7 +932,6 @@ pub fn router(
     total_ram_mb: u64,
     requested_ctx_ceiling: u32,
     kv_kind: crate::fit::KvKind,
-    port: u16,
     breaker: std::sync::Arc<crate::breaker::CircuitBreaker>,
 ) -> Router {
     let state = Arc::new(AppState {
@@ -953,7 +949,6 @@ pub fn router(
             std::sync::Mutex::new(std::collections::BTreeMap::new()),
         ),
         tool_descs: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
-        port,
         budget: {
             let b = std::sync::Arc::new(crate::budget::Budget::new());
             b.seed_from_log(&crate::route_log::read_all(), crate::route_log::now_secs());
@@ -2728,7 +2723,6 @@ fn make_seeded_test_router(
         kv_kind: crate::fit::KvKind::Q8,
         tool_registry,
         tool_descs: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
-        port: 31415,
         budget: std::sync::Arc::new(crate::budget::Budget::new()),
         breaker: std::sync::Arc::new(crate::breaker::CircuitBreaker::new()),
         recent_prompts: std::sync::Arc::new(std::sync::Mutex::new(
@@ -3274,7 +3268,6 @@ mod tests {
             tool_descs: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
-            port: 31415,
             budget: std::sync::Arc::new(crate::budget::Budget::new()),
             breaker,
             recent_prompts: std::sync::Arc::new(std::sync::Mutex::new(

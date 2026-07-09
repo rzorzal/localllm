@@ -1,4 +1,4 @@
-//! Persisted user settings: routing profile and client-integration toggle state.
+//! Persisted user settings: routing profile and related tunables.
 //!
 //! Stored as JSON at `<config-dir>/localllm/settings.json` (e.g.
 //! `~/Library/Application Support/localllm/settings.json` on macOS). The path

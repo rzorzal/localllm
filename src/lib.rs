@@ -279,7 +279,6 @@ pub async fn run_server_with_ready_policy_token(
             crate::config::KvType::Q4 => crate::fit::KvKind::Q4,
             crate::config::KvType::F16 => crate::fit::KvKind::F16,
         },
-        cfg.port,
         breaker,
     );
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
@@ -595,7 +594,6 @@ pub fn router_for_test_with(
         16384,
         32768,
         crate::fit::KvKind::Q8,
-        31415,
         Arc::new(crate::breaker::CircuitBreaker::new()),
     )
 }
