@@ -24,14 +24,9 @@ fn format_snippet(port: u16, windows: bool) -> String {
     if windows {
         let parts: Vec<String> = pairs
             .iter()
-            .map(|(k, v)| format!("$env:{k}=\"{v}\";"))
+            .map(|(k, v)| format!("$env:{k}=\"{v}\""))
             .collect();
-        let mut result = parts.join(" ");
-        // Remove trailing semicolon from the last assignment
-        if result.ends_with(';') {
-            result.pop();
-        }
-        result
+        parts.join("; ")
     } else {
         let parts: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
         parts.join(" ")
