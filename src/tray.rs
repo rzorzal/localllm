@@ -324,6 +324,13 @@ mod tests {
         // Clipped: prefix + 80 kept chars + ellipsis, well under the raw 200.
         assert!(out.chars().count() < 120);
     }
+
+    #[test]
+    fn gpu_menu_label_maps_layer_counts() {
+        assert_eq!(super::gpu_menu_label(None), "🟢 GPU: all layers");
+        assert_eq!(super::gpu_menu_label(Some(0)), "⚪ CPU only");
+        assert_eq!(super::gpu_menu_label(Some(24)), "🟢 GPU: 24 layers");
+    }
 }
 
 /// Format the tray "Model:" line from the active model spec. Mirrors the
@@ -331,6 +338,29 @@ mod tests {
 fn model_menu_label(spec: &crate::model_manager::ModelSpec) -> String {
     let short = spec.repo.rsplit('/').next().unwrap_or(&spec.repo);
     format!("Model:  {short} / {}", spec.file)
+}
+
+/// At-a-glance GPU/CPU label for the tray info block. `None` means the engine
+/// offloads all layers (`with_n_gpu_layers(u32::MAX)`); `Some(0)` is CPU-only.
+fn gpu_menu_label(gpu_layers: Option<u32>) -> String {
+    match gpu_layers {
+        None => "🟢 GPU: all layers".to_string(),
+        Some(0) => "⚪ CPU only".to_string(),
+        Some(n) => format!("🟢 GPU: {n} layers"),
+    }
+}
+
+/// Config-derived GPU-layer count the active model's engine was built with: the
+/// saved per-model exec profile's `gpu_layers`, falling back to the catalog
+/// recommendation (`None` → full offload). `gpu_layers` is independent of the
+/// ctx/kv globals, so inert placeholders are passed for those `resolve` args.
+fn active_gpu_layers(repo: &str, file: &str) -> Option<u32> {
+    let key = crate::settings::model_ctx_key(repo, file);
+    let saved = crate::settings::load_model_profile(&key);
+    let catalog = crate::catalog::CATALOG
+        .iter()
+        .find(|e| e.repo == repo && e.file == file);
+    crate::profile::resolve(&saved, catalog, 0, crate::config::KvType::Q8).gpu_layers
 }
 
 /// Format the tray status line from live manager state: green Running when idle,
