@@ -581,6 +581,7 @@ fn worker_thread(
                             output.push_str(&piece);
                             true
                         },
+                        || reply.is_closed(),
                     )
                 }));
                 let result: Result<(usize, usize, bool)> = match panic_result {
@@ -652,6 +653,7 @@ fn worker_thread(
                             // blocking_send blocks if channel is full, returns Err if receiver dropped.
                             reply.blocking_send(delta).is_ok()
                         },
+                        || reply.is_closed(),
                     )
                 }));
                 let result: Result<(usize, usize, bool)> = match panic_result {
@@ -736,6 +738,7 @@ fn worker_thread(
                             kv_cache_dir.as_deref(),
                             &provenance_prefix,
                             |_piece| false, // stop after first non-empty piece → prefill only
+                            || false,
                         )
                     }));
                 let out: Result<()> = match panic_result {
@@ -862,6 +865,7 @@ fn prefill_chunks(n_tail: usize, chunk: usize) -> Vec<(usize, usize, bool)> {
 /// generation hit the max-token limit.
 ///
 /// `on_piece` is called for each decoded non-empty piece. Return `false` to abort.
+/// `cancelled` is polled between prefill chunks; return `true` to abort a prefill whose client has gone away.
 fn run_decode_loop(
     model: &LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
@@ -870,6 +874,7 @@ fn run_decode_loop(
     kv_cache_dir: Option<&std::path::Path>,
     provenance_prefix: &str,
     mut on_piece: impl FnMut(String) -> bool,
+    cancelled: impl Fn() -> bool,
 ) -> Result<(
     usize, /*prompt_tokens*/
     usize, /*generated*/
@@ -933,23 +938,38 @@ fn run_decode_loop(
         }
     };
 
-    // --- Prefill: only new_tokens[effective_common..] starting at that position ---
+    // --- Prefill new_tokens[effective_common..] in chunks, checking for a
+    // disconnected client between chunks so a timed-out request stops pinning
+    // the engine mid-prefill. ---
     let tail = &new_tokens[effective_common..];
     let n_tail = tail.len();
-    // Batch capacity must be >= n_tail so all tail tokens fit in a single
-    // decode call. We also ensure a minimum of 1 to avoid zero-capacity batches.
-    let mut batch = LlamaBatch::new(n_tail.max(1), 1);
-    // Add each tail token with its absolute position, logits=true only on last.
-    for (i, &tok) in tail.iter().enumerate() {
-        let pos = (effective_common + i) as i32;
-        let is_last = i == n_tail - 1;
-        batch
-            .add(tok, pos, &[0_i32], is_last)
-            .context("batch.add (prefill) failed")?;
+    let mut prefilled = 0usize;
+    let mut final_len = 0usize;
+    for (start, len, is_final) in prefill_chunks(n_tail, PREFILL_CHUNK) {
+        if cancelled() {
+            tracing::info!(
+                target: "localllm::llama",
+                "aborted: client disconnected during prefill ({prefilled}/{n_tail} tail tokens)"
+            );
+            // Keep the partial prefix warm for a retry, then bail cleanly.
+            *cached_tokens = new_tokens[..effective_common + prefilled].to_vec();
+            return Ok((prompt_len, 0, false));
+        }
+        let mut batch = LlamaBatch::new(len.max(1), 1);
+        for j in 0..len {
+            let idx = start + j;
+            let pos = (effective_common + idx) as i32;
+            // Logits only on the very last token of the final chunk.
+            let is_last = is_final && j == len - 1;
+            batch
+                .add(tail[idx], pos, &[0_i32], is_last)
+                .context("batch.add (prefill) failed")?;
+        }
+        ctx.decode(&mut batch).context("ctx.decode (prefill) failed")?;
+        batch.clear();
+        prefilled += len;
+        final_len = len;
     }
-    ctx.decode(&mut batch)
-        .context("ctx.decode (prefill) failed")?;
-    batch.clear();
 
     // --- Save prefix KV state to disk (if persistence is enabled) ---
     // Save after prefill so we capture the full prompt KV. We save the FULL
@@ -991,7 +1011,9 @@ fn run_decode_loop(
     // For the first sample we use idx = n_tail-1 within the batch we just ran
     // (which had n_tail tokens); since we only set logits=true on the last token
     // of that batch, we sample at index n_tail-1.
-    let mut last_idx = (n_tail as i32) - 1;
+    let mut last_idx = (final_len as i32) - 1;
+    // Reusable single-token batch for the generation steps.
+    let mut batch = LlamaBatch::new(1, 1);
 
     loop {
         let tok = sampler.sample(ctx, last_idx);
