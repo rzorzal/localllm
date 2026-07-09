@@ -122,7 +122,7 @@ fn save_settings(s: &Settings) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(s)?;
-    crate::integrations::atomic_write(&path, json.as_bytes())?;
+    crate::fsutil::atomic_write(&path, json.as_bytes())?;
     Ok(())
 }
 

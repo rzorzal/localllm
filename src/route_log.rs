@@ -201,7 +201,7 @@ pub fn prune_file(now: i64, max_age_secs: i64) {
             buf.push('\n');
         }
     }
-    let _ = crate::integrations::atomic_write(&path, buf.as_bytes());
+    let _ = crate::fsutil::atomic_write(&path, buf.as_bytes());
 }
 
 /// Best-effort: cap the route log at `max_lines`, keeping the newest lines.
@@ -214,7 +214,7 @@ pub fn cap_lines_file(max_lines: usize) {
         return;
     }
     let tail = lines[lines.len() - max_lines..].join("\n");
-    let _ = crate::integrations::atomic_write(&path, format!("{tail}\n").as_bytes());
+    let _ = crate::fsutil::atomic_write(&path, format!("{tail}\n").as_bytes());
 }
 
 /// Best-effort app-log rotation: cap the plain-text app log at a line budget so
@@ -233,7 +233,7 @@ pub fn rotate_app_log(_now: i64, _max_age_secs: i64) {
         return;
     }
     let tail = lines[lines.len() - MAX_LINES..].join("\n");
-    let _ = crate::integrations::atomic_write(
+    let _ = crate::fsutil::atomic_write(
         std::path::Path::new(&path),
         format!("{tail}\n").as_bytes(),
     );
@@ -244,7 +244,7 @@ pub fn rotate_app_log(_now: i64, _max_age_secs: i64) {
 pub fn clear() -> bool {
     let Some(path) = log_path() else { return false };
     let existed = path.exists();
-    let _ = crate::integrations::atomic_write(&path, b"");
+    let _ = crate::fsutil::atomic_write(&path, b"");
     existed
 }
 
