@@ -137,9 +137,7 @@ function renderConfig() {
   renderRoutingSelector(shell);
   renderThresholdConfig(shell);
   renderColdGateConfig(shell);
-  renderTerminalConfig(shell);
   renderSmartHistoryToggle(shell);
-  renderIntegrationToggle(shell);
 }
 
 // Balanced-profile difficulty cutoff, as a percentage. GET/POST /admin/threshold.
@@ -217,45 +215,6 @@ async function renderColdGateConfig(container) {
   };
 }
 
-// Launch-terminal picker. GET/POST /admin/terminal.
-const TERMINAL_LABELS = { terminal: "Terminal", iterm: "iTerm", warp: "Warp", wave: "Wave" };
-async function renderTerminalConfig(container) {
-  const panel = el("div", "intpanel");
-  panel.append(el("div", "intpanel-title", "Terminal do Launch"));
-  panel.append(el("div", "intpanel-sub",
-    "Terminal usado pelo botão Launch do tray (abre o cliente já apontado pro localllm)."));
-
-  const row = el("div", "thresh-row");
-  const select = el("select", "ctxinput gate-input");
-  row.append(select);
-  panel.append(row);
-  const status = el("div", "intpanel-status");
-  panel.append(status);
-  container.append(panel);
-
-  let data;
-  try { data = await api("GET", "/admin/terminal"); }
-  catch (e) { status.textContent = e.message; return; }
-  (data.available || []).forEach((id) => {
-    const opt = el("option");
-    opt.value = id;
-    opt.textContent = TERMINAL_LABELS[id] || id;
-    select.append(opt);
-  });
-  if (data.terminal) select.value = data.terminal;
-
-  let busy = false;
-  select.onchange = async () => {
-    if (busy) return;
-    busy = true; select.disabled = true;
-    try {
-      const r = await api("POST", "/admin/terminal", { terminal: select.value });
-      toast(`Terminal: ${TERMINAL_LABELS[r.terminal] || r.terminal}`);
-    } catch (e) { toast(e.message, true); }
-    finally { busy = false; select.disabled = false; }
-  };
-}
-
 // Global smart-history filter toggle. GET/POST /admin/history-filter.
 async function renderSmartHistoryToggle(container) {
   const panel = el("div", "intpanel");
@@ -320,53 +279,6 @@ async function renderRoutingSelector(container) {
     });
   };
   paint(data.current);
-}
-
-// Route-apps integration toggle (moved from the tray). Reads GET /admin/integrations,
-// flips via POST. The tray shows the same state read-only.
-async function renderIntegrationToggle(container) {
-  const panel = el("div", "intpanel");
-  const head = el("div", "intpanel-head");
-  const txt = el("div", "intpanel-txt");
-  txt.append(el("div", "intpanel-title", "Rotear apps pelo localllm"));
-  txt.append(el("div", "intpanel-sub",
-    "Clientes (Claude Code, Codex) passam por este servidor. Ao sair do localllm, o roteamento é removido automaticamente."));
-  head.append(txt);
-
-  const sw = el("button", "switch");
-  sw.setAttribute("role", "switch");
-  sw.append(el("span", "switch-knob"));
-  head.append(sw);
-  panel.append(head);
-
-  const status = el("div", "intpanel-status", "carregando…");
-  panel.append(status);
-
-  let enabled = false;
-  let busy = false;
-  const paint = (st) => {
-    enabled = !!st.enabled;
-    sw.classList.toggle("on", enabled);
-    sw.setAttribute("aria-checked", enabled ? "true" : "false");
-    const wired = (st.wired || []).join(", ");
-    status.className = "intpanel-status" + (enabled ? " on" : "");
-    status.textContent = enabled
-      ? `Ligado — wired: ${wired || "nenhum cliente encontrado"}`
-      : "Desligado — apps vão direto ao provider";
-  };
-
-  try { paint(await api("GET", "/admin/integrations")); }
-  catch (e) { status.textContent = e.message; }
-
-  sw.onclick = async () => {
-    if (busy) return;
-    busy = true; sw.classList.add("busy");
-    try { paint(await api("POST", "/admin/integrations", { enabled: !enabled })); toast("Integração atualizada"); }
-    catch (e) { toast(e.message, true); }
-    finally { busy = false; sw.classList.remove("busy"); }
-  };
-
-  container.append(panel);
 }
 
 // Firestore-style drilldown selection, preserved across background refreshes.
