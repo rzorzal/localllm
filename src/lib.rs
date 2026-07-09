@@ -17,6 +17,7 @@ pub mod cloud;
 pub mod config;
 pub mod download;
 pub mod engine_llama;
+pub mod env_snippet;
 pub mod fit;
 pub mod history_select;
 pub mod integrations;
