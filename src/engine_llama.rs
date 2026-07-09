@@ -1006,11 +1006,10 @@ fn run_decode_loop(
     let mut generated_tokens = 0usize;
     // Single stateful UTF-8 decoder reused across all tokens (multi-byte safe).
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    // After prefill, logits live at index 0 of the single-batch decode (n_tail-1
-    // relative, but we used a single batch so it's always the last entry).
-    // For the first sample we use idx = n_tail-1 within the batch we just ran
-    // (which had n_tail tokens); since we only set logits=true on the last token
-    // of that batch, we sample at index n_tail-1.
+    // Logits were requested only on the last token of the FINAL prefill chunk
+    // (the last `ctx.decode` we ran), so the first sample reads that batch at
+    // index `final_len - 1` — the position of that flagged token within the
+    // final chunk.
     let mut last_idx = (final_len as i32) - 1;
     // Reusable single-token batch for the generation steps.
     let mut batch = LlamaBatch::new(1, 1);
