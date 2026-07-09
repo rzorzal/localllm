@@ -552,6 +552,10 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
     // avoids redundant set_text on every poll tick.
     let mut model_handle: Option<MenuItem> = None;
     let mut last_model: Option<crate::model_manager::ModelSpec> = None;
+    // Kept so we can live-update the "GPU:" line after a hot-swap; last_gpu
+    // avoids redundant set_text on every poll tick.
+    let mut gpu_handle: Option<MenuItem> = None;
+    let mut last_gpu: Option<String> = None;
     // Read-only routing sub-line: reflects the profile now chosen from the
     // Config page. last_routing avoids redundant set_text on every poll tick.
     let mut routing_status: Option<MenuItem> = None;
@@ -606,6 +610,12 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 let ctx_line = MenuItem::new(format!("Context: {info_ctx} tokens"), false, None);
                 let kv_line = MenuItem::new(format!("KV cache: {info_kv}"), false, None);
                 let backend_line = MenuItem::new(format!("Backend: {info_backend}"), false, None);
+                // GPU/CPU offload indicator. Initial text is a neutral
+                // placeholder; the first status-poll tick fills the real
+                // label (the model-changed branch runs on tick 1 because
+                // last_gpu/last_model start None).
+                let gpu_line = MenuItem::new("GPU: …", false, None);
+                gpu_handle = Some(gpu_line.clone());
                 let logs_item = MenuItem::new("🗎  Open Logs", true, None);
                 logs_id = Some(logs_item.id().clone());
                 // Single top-level Config item (no submenu — tray_icon submenus
@@ -642,6 +652,7 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                 menu.append(&ctx_line).expect("append ctx");
                 menu.append(&kv_line).expect("append kv");
                 menu.append(&backend_line).expect("append backend");
+                menu.append(&gpu_line).expect("append gpu");
                 menu.append(&PredefinedMenuItem::separator()).expect("sep2");
                 menu.append(&routing_line).expect("append routing line");
                 menu.append(&retry_cloud_item)
@@ -691,6 +702,16 @@ pub fn run_tray(cfg: Config, admin_token: std::sync::Arc<str>) -> ! {
                         if last_model.as_ref() != Some(&st.current) {
                             if let Some(m) = &model_handle {
                                 m.set_text(model_menu_label(&st.current));
+                            }
+                            let gpu = gpu_menu_label(active_gpu_layers(
+                                &st.current.repo,
+                                &st.current.file,
+                            ));
+                            if last_gpu.as_deref() != Some(gpu.as_str()) {
+                                if let Some(g) = &gpu_handle {
+                                    g.set_text(&gpu);
+                                }
+                                last_gpu = Some(gpu);
                             }
                             last_model = Some(st.current);
                         }
