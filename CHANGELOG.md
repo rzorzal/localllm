@@ -1,14 +1,87 @@
 # Changelog
 
 All notable changes to localllm.
+## [0.3.0] - 2026-07-09
 
-## [Unreleased]
+### Bug Fixes
 
-### Removed
+- Dashboard never rendered — const shadowed global pctLocal
+- Stop hiding manager window on focus loss
+- Render prompt snippet via textContent (untrusted, was innerHTML)
+- Prefix_len returns 0 while switching (safe default)
+- Skip cold estimate when cloud unavailable; timeout the engine round-trip
+- Focus the Config window on first open (accessory app)
+- Readable cold-prefill gate number input (was slider-styled)
+- Replace Config submenu with a single top-level item
+- Shell-quote dir + binary path for the Launch command
+- Guard try_initial_load against concurrent switch; stop retry once loaded
+- Report loading (not "ready") while no engine is present
 
-- Route-apps integration, terminal chooser, `localllm claude|codex` CLI, and
-  `/admin/integrations` + `/admin/terminal` endpoints; replaced by the tray
-  **📋 Copy env vars** item.
+### Documentation
+
+- Dashboard response text + performance panel design
+- Implementation plan — dashboard response text + perf panel
+- Cold-prefill-aware routing design (sub-1)
+- Cold-prefill routing implementation plan (sub-1)
+- Client launcher design (sub-3)
+- Client launcher plan + CLI install-on-startup
+- Model-load resilience design (bind-first + retry + notify)
+- Model-load resilience implementation plan
+- Prefill abort on client disconnect design (sub-2)
+- Prefill abort on disconnect implementation plan (sub-2)
+- Fix stale last_idx comment for chunked prefill
+- Circuit-breaker passive self-heal design
+- Circuit-breaker passive self-heal implementation plan
+- Note /admin/breaker GET intentionally mutates via poll
+- Tray GPU indicator design
+- Tray GPU indicator implementation plan
+- Settings-poison fix design (handler validation + test isolation)
+- Settings-poison fix implementation plan
+- Copy-env-vars tray item + launch/routing removal design
+- Copy-env-vars implementation plan
+- Remove stale route-apps/CLI references; note Copy-env-vars item
+
+### Features
+
+- Optional GITHUB_TOKEN auth for the private repo
+- Output_text on OutcomeEntry + RecentRow join
+- Record output_text for local result + streaming paths
+- Cap line count so stored responses don't grow unbounded
+- Capture relayed response text into output_text
+- Show response text next to prompt in recent decisions
+- Two-column Desempenho panel replacing latency/quality cards
+- ColdPrefill decision branch (pure, gated on estimated prefill secs)
+- PrefixState + estimate_cold_tokens + prefill-only job
+- Expose prefix_len, estimate_cold_tokens, prefill
+- Log + show warm/cold prefill state per decision
+- Measure cold prefill, route ColdPrefill, warm local in background, log
+- Cold-prefill gate endpoint + Config page control
+- Localllm claude|codex CLI wrapper (proxy env + exec)
+- TerminalApp enum, install detection, open helper
+- Persist + pick the Launch terminal (/admin/terminal + UI)
+- Launch Claude Code / Codex via LocalLLM items
+- (re)install localllm CLI symlink on startup
+- New_loading + has_engine + try_initial_load (empty-engine state)
+- No-engine requests route to cloud or clean 503
+- Bind before load; background initial-load retry + notify
+- Prefill_chunks helper + PREFILL_CHUNK const
+- Cancellable chunked prefill; abort on client disconnect
+- Poll() advances elapsed Open to HalfOpen on read
+- Dashboard poll drives self-heal; half-open banner copy
+- Gpu_menu_label + active_gpu_layers helpers
+- Live GPU/CPU indicator line after Backend
+- Validate model ref (owner/name + .gguf) before switch/persist
+- OS-formatted inline env-var snippet for clients
+- Copy env vars item; drop launch/wired items
+
+### Refactor
+
+- Join windows assignments with "; " (drop pop)
+- Remove localllm claude|codex dispatch + symlink install
+- Drop /admin/integrations and /admin/terminal
+- Remove terminal chooser + route-apps toggle panels
+- Drop IntegrationState + terminal field/accessors
+- Relocate atomic_write to fsutil; delete launch/terminal/integrations
 
 ## [0.2.0] - 2026-07-08
 
